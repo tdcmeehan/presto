@@ -415,8 +415,13 @@ public class LocalQueryRunner
 
     public static LocalQueryRunner queryRunnerWithInitialTransaction(Session defaultSession)
     {
+        return queryRunnerWithInitialTransaction(defaultSession, new FeaturesConfig());
+    }
+
+    public static LocalQueryRunner queryRunnerWithInitialTransaction(Session defaultSession, FeaturesConfig featuresConfig)
+    {
         checkArgument(!defaultSession.getTransactionId().isPresent(), "Already in transaction!");
-        return new LocalQueryRunner(defaultSession, new FeaturesConfig(), new NodeSpillConfig(), true, false);
+        return new LocalQueryRunner(defaultSession, featuresConfig, new NodeSpillConfig(), true, false);
     }
 
     public static LocalQueryRunner queryRunnerWithFakeNodeCountForStats(Session defaultSession, int nodeCount)
