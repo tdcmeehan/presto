@@ -30,7 +30,6 @@ import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.VerboseMode;
-import org.testng.annotations.Test;
 
 import java.util.List;
 
@@ -39,12 +38,11 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.openjdk.jmh.annotations.Mode.AverageTime;
 import static org.openjdk.jmh.annotations.Scope.Thread;
 
-@State(Thread)
 @OutputTimeUnit(MILLISECONDS)
 @BenchmarkMode(AverageTime)
 @Fork(3)
-@Warmup(iterations = 10)
-@Measurement(iterations = 10)
+@Warmup(iterations = 1)
+@Measurement(iterations = 1)
 public class BenchmarkMultimapAggregation
 {
     @State(Thread)
@@ -70,7 +68,7 @@ public class BenchmarkMultimapAggregation
         public void createMultimapTable()
         {
             int rows = (int) Math.sqrt(rowCount);
-            queryRunner.execute(format("CREATE TABLE memory.default.multimap_agg_test AS SELECT T.A + U.A AS A, T.A+1+U.A AS B " +
+            queryRunner.execute(format("CREATE TABLE memory.default.multimap_agg_test AS SELECT RAND(100000000) AS A, T.A+1+U.A AS B " +
                     "FROM UNNEST ( SEQUENCE (1, %d) ) AS T(A) " +
                     "CROSS JOIN UNNEST ( SEQUENCE (1, %d) ) AS U(A)",
                     rows, rows));
@@ -91,20 +89,32 @@ public class BenchmarkMultimapAggregation
     }
 
     @Benchmark
-    public List<Page> benchmarkGroupBy(Context context)
+    public List<Page> benchmarkGroupByWithSingletonGroups(Context context)
     {
         return context.getQueryRunner()
                 .execute("SELECT multimap_agg(T.A, T.B) FROM multimap_agg_test T GROUP BY T.A");
     }
-
     @Benchmark
-    public List<Page> benchmarkSingle(Context context)
+    public List<Page> benchmarkGroupByWithLargeGroups(Context context)
     {
         return context.getQueryRunner()
-                .execute("SELECT multimap_agg(T.A, T.B) FROM multimap_agg_test T");
+                .execute("SELECT multimap_agg(T.A, T.B) FROM multimap_agg_test T GROUP BY MOD(T.A, 1000)");
     }
 
-    @Test
+    @Benchmark
+    public List<Page> benchmarkGroupByWithSmallGroups(Context context)
+    {
+        return context.getQueryRunner()
+                .execute("SELECT multimap_agg(T.A, T.B) FROM multimap_agg_test T GROUP BY MOD(T.A, 10)");
+    }
+
+    @Benchmark
+    public List<Page> benchmarkNoGrouping(Context context)
+    {
+        return context.getQueryRunner()
+                .execute("SELECT multimap_agg(MOD(T.A, 1000), T.B) FROM multimap_agg_test T");
+    }
+
     public void verify()
     {
         Context context = new Context();
@@ -113,7 +123,10 @@ public class BenchmarkMultimapAggregation
             context.createMultimapTable();
 
             BenchmarkMultimapAggregation benchmark = new BenchmarkMultimapAggregation();
-            benchmark.benchmarkGroupBy(context);
+            benchmark.benchmarkNoGrouping(context);
+            benchmark.benchmarkGroupByWithSingletonGroups(context);
+            benchmark.benchmarkGroupByWithSmallGroups(context);
+            benchmark.benchmarkGroupByWithLargeGroups(context);
         }
         finally {
             context.queryRunner.close();
