@@ -75,7 +75,10 @@ public class LegacyGroupedMultimapAggregationState
     {
         BlockBuilder keyBlockBuilder = keyBlockBuilders.get(getGroupId());
         BlockBuilder valueBlockBuilder = valueBlockBuilders.get(getGroupId());
-        for (int i = 0; !isEmpty() && keyBlockBuilder != null && i < keyBlockBuilder.getPositionCount(); i++) {
+        if (keyBlockBuilder == null) {
+            return;
+        }
+        for (int i = 0; i < keyBlockBuilder.getPositionCount(); i++) {
             consumer.accept(keyBlockBuilder, valueBlockBuilder, i);
         }
     }
@@ -89,7 +92,7 @@ public class LegacyGroupedMultimapAggregationState
     @Override
     public long getEstimatedSize()
     {
-        return INSTANCE_SIZE + size;
+        return INSTANCE_SIZE + keyBlockBuilders.sizeOf() + valueBlockBuilders.sizeOf() + size;
     }
 
     @Override

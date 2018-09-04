@@ -27,7 +27,7 @@ import java.util.List;
 
 import static com.google.common.base.Verify.verify;
 /**
- * state object that uses a single BlockBuilder for all groups.
+ * Instances of this state use a single PageBuilder for all groups.
  */
 public abstract class AbstractGroupCollectionAggregationState<T>
         extends AbstractGroupedAccumulatorState

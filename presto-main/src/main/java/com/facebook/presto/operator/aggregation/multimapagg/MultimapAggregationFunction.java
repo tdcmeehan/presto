@@ -131,15 +131,14 @@ public class MultimapAggregationFunction
             out.appendNull();
         }
         else {
-            // TODO: this behavior is adopted from the now defunct MultiKeyValuePairs.java
-            // Investigate utilizing the behavior found in multimap_from_entries which avoids rewriting the values in valueArrayBlockBuilders
+            // TODO: Avoid copy value block associated with the same key by using strategy similar to multimap_from_entries
             ObjectBigArray<BlockBuilder> valueArrayBlockBuilders = new ObjectBigArray<>();
+            valueArrayBlockBuilders.ensureCapacity(state.getEntryCount());
             BlockBuilder distinctKeyBlockBuilder = keyType.createBlockBuilder(null, state.getEntryCount(), expectedValueSize(keyType, 100));
             TypedSet keySet = new TypedSet(keyType, state.getEntryCount(), MultimapAggregationFunction.NAME);
 
             state.forEach((key, value, keyValueIndex) -> {
-                // If the the key is not present in the keyset, add it, and note its position in the keyset.  Its position in the
-                // keyset will also be used to determine the position of its corresponding value block builder
+                // Merge values of the same key into an array
                 if (!keySet.contains(key, keyValueIndex)) {
                     keySet.add(key, keyValueIndex);
                     keyType.appendTo(key, keyValueIndex, distinctKeyBlockBuilder);
@@ -149,6 +148,7 @@ public class MultimapAggregationFunction
                 valueType.appendTo(value, keyValueIndex, valueArrayBlockBuilders.get(keySet.positionOf(key, keyValueIndex)));
             });
 
+            // Write keys and value arrays into one Block
             Type valueArrayType = new ArrayType(valueType);
             BlockBuilder multimapBlockBuilder = out.beginBlockEntry();
             for (int i = 0; i < distinctKeyBlockBuilder.getPositionCount(); i++) {

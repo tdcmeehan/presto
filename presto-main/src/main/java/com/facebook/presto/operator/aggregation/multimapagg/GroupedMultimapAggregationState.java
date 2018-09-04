@@ -24,8 +24,8 @@ public final class GroupedMultimapAggregationState
         implements MultimapAggregationState
 {
     private static final int MAX_BLOCK_SIZE = 1024 * 1024;
-    private static final int VALUE_CHANNEL = 0;
-    private static final int KEY_CHANNEL = 1;
+    static final int VALUE_CHANNEL = 0;
+    static final int KEY_CHANNEL = 1;
 
     public GroupedMultimapAggregationState(Type keyType, Type valueType)
     {

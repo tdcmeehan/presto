@@ -19,6 +19,7 @@ import com.facebook.presto.spi.type.Type;
 import org.openjdk.jol.info.ClassLayout;
 
 import static com.facebook.presto.type.TypeUtils.expectedValueSize;
+import static java.util.Objects.requireNonNull;
 
 public class SingleMultimapAggregationState
         implements MultimapAggregationState
@@ -33,8 +34,8 @@ public class SingleMultimapAggregationState
 
     public SingleMultimapAggregationState(Type keyType, Type valueType)
     {
-        this.keyType = keyType;
-        this.valueType = valueType;
+        this.keyType = requireNonNull(keyType);
+        this.valueType = requireNonNull(valueType);
         keyBlockBuilder = this.keyType.createBlockBuilder(null, EXPECTED_ENTRIES, expectedValueSize(keyType, EXPECTED_ENTRY_SIZE));
         valueBlockBuilder = this.valueType.createBlockBuilder(null, EXPECTED_ENTRIES, expectedValueSize(valueType, EXPECTED_ENTRY_SIZE));
     }
@@ -63,7 +64,7 @@ public class SingleMultimapAggregationState
     @Override
     public int getEntryCount()
     {
-        return valueBlockBuilder.getPositionCount();
+        return keyBlockBuilder.getPositionCount();
     }
 
     @Override
@@ -75,7 +76,7 @@ public class SingleMultimapAggregationState
     @Override
     public void reset()
     {
-        keyBlockBuilder = this.keyType.createBlockBuilder(null, EXPECTED_ENTRIES, expectedValueSize(keyType, EXPECTED_ENTRY_SIZE));
-        valueBlockBuilder = this.valueType.createBlockBuilder(null, EXPECTED_ENTRIES, expectedValueSize(valueType, EXPECTED_ENTRY_SIZE));
+        keyBlockBuilder = keyBlockBuilder.newBlockBuilderLike(null);
+        valueBlockBuilder = valueBlockBuilder.newBlockBuilderLike(null);
     }
 }

@@ -22,7 +22,10 @@ import com.facebook.presto.spi.type.RowType;
 import com.facebook.presto.spi.type.Type;
 import com.google.common.collect.ImmutableList;
 
+import static com.facebook.presto.operator.aggregation.multimapagg.GroupedMultimapAggregationState.KEY_CHANNEL;
+import static com.facebook.presto.operator.aggregation.multimapagg.GroupedMultimapAggregationState.VALUE_CHANNEL;
 import static com.facebook.presto.spi.block.ColumnarRow.toColumnarRow;
+import static java.util.Objects.requireNonNull;
 
 public class MultimapAggregationStateSerializer
         implements AccumulatorStateSerializer<MultimapAggregationState>
@@ -33,8 +36,8 @@ public class MultimapAggregationStateSerializer
 
     public MultimapAggregationStateSerializer(Type keyType, Type valueType)
     {
-        this.keyType = keyType;
-        this.valueType = valueType;
+        this.keyType = requireNonNull(keyType);
+        this.valueType = requireNonNull(valueType);
         this.arrayType = new ArrayType(RowType.anonymous(ImmutableList.of(valueType, keyType)));
     }
 
@@ -49,17 +52,16 @@ public class MultimapAggregationStateSerializer
     {
         if (state.isEmpty()) {
             out.appendNull();
+            return;
         }
-        else {
-            BlockBuilder entryBuilder = out.beginBlockEntry();
-            state.forEach((keyBlock, valueBlock, position) -> {
-                BlockBuilder rowBlockBuilder = entryBuilder.beginBlockEntry();
-                valueType.appendTo(valueBlock, position, rowBlockBuilder);
-                keyType.appendTo(keyBlock, position, rowBlockBuilder);
-                entryBuilder.closeEntry();
-            });
-            out.closeEntry();
-        }
+        BlockBuilder entryBuilder = out.beginBlockEntry();
+        state.forEach((keyBlock, valueBlock, position) -> {
+            BlockBuilder rowBlockBuilder = entryBuilder.beginBlockEntry();
+            valueType.appendTo(valueBlock, position, rowBlockBuilder);
+            keyType.appendTo(keyBlock, position, rowBlockBuilder);
+            entryBuilder.closeEntry();
+        });
+        out.closeEntry();
     }
 
     @Override
@@ -67,8 +69,8 @@ public class MultimapAggregationStateSerializer
     {
         state.reset();
         ColumnarRow columnarRow = toColumnarRow(arrayType.getObject(block, index));
-        Block keys = columnarRow.getField(1);
-        Block values = columnarRow.getField(0);
+        Block keys = columnarRow.getField(KEY_CHANNEL);
+        Block values = columnarRow.getField(VALUE_CHANNEL);
         for (int i = 0; i < columnarRow.getPositionCount(); i++) {
             state.add(keys, values, i);
         }

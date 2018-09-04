@@ -167,8 +167,8 @@ public class TestMultimapAggAggregation
     @Test
     public void testEmptyStateOutputIsNull()
     {
-        InternalAggregationFunction aggFunction = getInternalAggregationFunction(BIGINT, BIGINT);
-        GroupedAccumulator groupedAccumulator = aggFunction.bind(Ints.asList(), Optional.empty()).createGroupedAccumulator();
+        InternalAggregationFunction aggregationFunction = getInternalAggregationFunction(BIGINT, BIGINT);
+        GroupedAccumulator groupedAccumulator = aggregationFunction.bind(Ints.asList(), Optional.empty()).createGroupedAccumulator();
         BlockBuilder blockBuilder = groupedAccumulator.getFinalType().createBlockBuilder(null, 1);
         groupedAccumulator.evaluateFinal(0, blockBuilder);
         assertTrue(blockBuilder.isNull(0));
@@ -206,7 +206,14 @@ public class TestMultimapAggAggregation
         assertAggregation(aggFunc, map.isEmpty() ? null : map, builder.build());
     }
 
-    private static <K, V> void testMultimapAggWithGroupBy(InternalAggregationFunction aggFunction, GroupedAccumulator groupedAccumulator, int groupId, Type keyType, List<K> expectedKeys, Type valueType, List<V> expectedValues)
+    private static <K, V> void testMultimapAggWithGroupBy(
+            InternalAggregationFunction aggregationFunction,
+            GroupedAccumulator groupedAccumulator,
+            int groupId,
+            Type keyType,
+            List<K> expectedKeys,
+            Type valueType,
+            List<V> expectedValues)
     {
         // Flatten out the expected output into two blocks which represent the keys and values to be aggregated
         RowPageBuilder pageBuilder = RowPageBuilder.rowPageBuilder(keyType, valueType);
@@ -219,7 +226,7 @@ public class TestMultimapAggAggregation
 
         AggregationTestInput input = new AggregationTestInputBuilder(
                 new Block[]{page.getBlock(0), page.getBlock(1)},
-                aggFunction
+                aggregationFunction
         ).build();
 
         AggregationTestOutput testOutput2 = new AggregationTestOutput(outputBuilder.build().asMap());

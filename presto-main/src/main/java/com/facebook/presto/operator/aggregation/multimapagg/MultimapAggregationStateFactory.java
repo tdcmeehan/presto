@@ -13,8 +13,13 @@
  */
 package com.facebook.presto.operator.aggregation.multimapagg;
 
+import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.function.AccumulatorStateFactory;
 import com.facebook.presto.spi.type.Type;
+
+import static com.facebook.presto.spi.StandardErrorCode.FUNCTION_IMPLEMENTATION_ERROR;
+import static java.lang.String.format;
+import static java.util.Objects.requireNonNull;
 
 public class MultimapAggregationStateFactory
         implements AccumulatorStateFactory<MultimapAggregationState>
@@ -25,9 +30,9 @@ public class MultimapAggregationStateFactory
 
     public MultimapAggregationStateFactory(Type keyType, Type valueType, MultimapAggGroupImplementation implementation)
     {
-        this.keyType = keyType;
-        this.valueType = valueType;
-        this.implementation = implementation;
+        this.keyType = requireNonNull(keyType);
+        this.valueType = requireNonNull(valueType);
+        this.implementation = requireNonNull(implementation);
     }
 
     @Override
@@ -49,8 +54,9 @@ public class MultimapAggregationStateFactory
             case NEW:
                 return new GroupedMultimapAggregationState(keyType, valueType);
             case LEGACY:
-            default:
                 return new LegacyGroupedMultimapAggregationState(keyType, valueType);
+            default:
+                throw new PrestoException(FUNCTION_IMPLEMENTATION_ERROR, format("Unexpected group enum type %s", implementation));
         }
     }
 
@@ -61,8 +67,9 @@ public class MultimapAggregationStateFactory
             case NEW:
                 return GroupedMultimapAggregationState.class;
             case LEGACY:
-            default:
                 return LegacyGroupedMultimapAggregationState.class;
+            default:
+                throw new PrestoException(FUNCTION_IMPLEMENTATION_ERROR, format("Unexpected group enum type %s", implementation));
         }
     }
 }
