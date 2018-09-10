@@ -33,10 +33,10 @@ import static com.facebook.presto.plugin.geospatial.GeometryType.GEOMETRY_TYPE_N
  * regions.  The output may be a multi-geometry, a single geometry or a geometry collection.
  */
 @Description("Returns a geometry that represents the point set union of the input geometries.")
-@AggregationFunction("geometry_union_agg")
-public class GeometryUnionAgg
+@AggregationFunction("geometry_mem_union_agg")
+public class GeometryMemUnionAgg
 {
-    private GeometryUnionAgg() {}
+    private GeometryMemUnionAgg() {}
 
     @InputFunction
     public static void input(@AggregationState GeometryState state, @SqlType(GEOMETRY_TYPE_NAME) Slice input)

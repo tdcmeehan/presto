@@ -16,7 +16,7 @@ package com.facebook.presto.plugin.geospatial.aggregation;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
-public class TestGeometryUnionGeoAggregation
+public class TestGeometryMemUnionGeoAggregation
         extends AbstractTestGeoAggregationFunctions
 {
     @DataProvider(name = "point")
@@ -333,6 +333,6 @@ public class TestGeometryUnionGeoAggregation
     @Override
     protected String getFunctionName()
     {
-        return "geometry_union_agg";
+        return "geometry_mem_union_agg";
     }
 }
