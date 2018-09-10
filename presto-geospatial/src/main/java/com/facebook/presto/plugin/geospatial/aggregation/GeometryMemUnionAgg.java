@@ -31,6 +31,10 @@ import static com.facebook.presto.plugin.geospatial.GeometryType.GEOMETRY_TYPE_N
 /**
  * Aggregate form of ST_Union which takes a set of geometries and unions them into a single geometry, resulting in no intersecting
  * regions.  The output may be a multi-geometry, a single geometry or a geometry collection.
+ *
+ * This function differs from geometry_union_agg in that the algorithm here is iterative (geometries are unioned one at a time
+ * without the aid of an index).  This results in less memory usage than geometry_union_agg, but it also has the potential to be
+ * slower.
  */
 @Description("Returns a geometry that represents the point set union of the input geometries.")
 @AggregationFunction("geometry_mem_union_agg")

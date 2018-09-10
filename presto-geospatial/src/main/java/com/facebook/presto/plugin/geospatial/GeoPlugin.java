@@ -15,6 +15,7 @@ package com.facebook.presto.plugin.geospatial;
 
 import com.facebook.presto.plugin.geospatial.BingTileFunctions.BingTileCoordinatesFunction;
 import com.facebook.presto.plugin.geospatial.aggregation.ConvexHullAggregation;
+import com.facebook.presto.plugin.geospatial.aggregation.GeometryMemUnionAgg;
 import com.facebook.presto.plugin.geospatial.aggregation.GeometryUnionAgg;
 import com.facebook.presto.spi.Plugin;
 import com.facebook.presto.spi.type.Type;
@@ -44,6 +45,7 @@ public class GeoPlugin
                 .add(BingTileFunctions.class)
                 .add(BingTileCoordinatesFunction.class)
                 .add(ConvexHullAggregation.class)
+                .add(GeometryMemUnionAgg.class)
                 .add(GeometryUnionAgg.class)
                 .build();
     }

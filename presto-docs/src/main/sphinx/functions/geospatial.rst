@@ -331,6 +331,12 @@ Aggregations
 
     Returns a geometry that represents the point set union of all input geometries.
 
+.. function:: geometry_mem_union_agg(Geometry) -> Geometry
+
+    Returns a geometry that represents the point set union of all input geometries.  The result
+    is the same as geometry_union_agg, but will use less memory (at the cost of potentially more
+    CPU execution time).
+
 Bing Tiles
 ----------
 

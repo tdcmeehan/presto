@@ -17,18 +17,35 @@ import com.esri.core.geometry.Envelope;
 import com.esri.core.geometry.Geometry;
 import com.esri.core.geometry.GeometryCursor;
 import com.esri.core.geometry.GeometryEngine;
+import com.esri.core.geometry.ListeningGeometryCursor;
 import com.esri.core.geometry.MultiVertexGeometry;
+import com.esri.core.geometry.OperatorUnion;
 import com.esri.core.geometry.Point;
 import com.esri.core.geometry.Polygon;
+import com.esri.core.geometry.ogc.OGCConcreteGeometryCollection;
 import com.esri.core.geometry.ogc.OGCGeometry;
+import com.esri.core.geometry.ogc.OGCGeometryCollection;
 import com.esri.core.geometry.ogc.OGCPoint;
 import com.esri.core.geometry.ogc.OGCPolygon;
+import it.unimi.dsi.fastutil.ints.Int2ObjectArrayMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import org.openjdk.jol.info.ClassLayout;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Queue;
 import java.util.Set;
+
+import static java.util.Objects.requireNonNull;
 
 public final class GeometryUtils
 {
+    private static final long OGC_GEOMETRY_BASE_INSTANCE_SIZE = ClassLayout.parseClass(OGCGeometry.class).instanceSize();
+
     private GeometryUtils() {}
 
     /**
@@ -159,5 +176,84 @@ public final class GeometryUtils
         }
 
         return true;
+    }
+
+    public static OGCGeometry union(Collection<OGCGeometry> inputGeometries)
+    {
+        requireNonNull(inputGeometries, "inputGeometries was null");
+        Int2ObjectMap<List<OGCGeometry>> geometriesByDimension = new Int2ObjectArrayMap<>(
+                new int[] {0, 1, 2, 3}, // Only 4 possible dimensions
+                new List[] {new ArrayList<>(), new ArrayList<>(), new ArrayList<>(), new ArrayList<>()});
+
+        for (OGCGeometry collected : inputGeometries) {
+            geometriesByDimension.get(collected.dimension()).add(collected);
+        }
+
+        List<OGCGeometry> outputs = new ArrayList<>();
+        for (List<OGCGeometry> bufferedShapes : geometriesByDimension.values()) {
+            if (!bufferedShapes.isEmpty()) {
+                outputs.add(unionBatch(bufferedShapes));
+            }
+        }
+
+        if (outputs.isEmpty()) {
+            return null;
+        }
+        else if (outputs.size() == 1) {
+            return outputs.get(0);
+        }
+        else {
+            return new OGCConcreteGeometryCollection(outputs, null).flattenAndRemoveOverlaps().reduceFromMulti();
+        }
+    }
+
+    private static OGCGeometry unionBatch(Collection<OGCGeometry> geometries)
+    {
+        ListeningGeometryCursor inputCursor = new ListeningGeometryCursor();
+        GeometryCursor operator = OperatorUnion.local().execute(inputCursor, null, null);
+        for (OGCGeometry item : geometries) {
+            inputCursor.tick(item.getEsriGeometry());
+            operator.tock();
+        }
+        return OGCGeometry.createFromEsriGeometry(operator.next(), null);
+    }
+
+    public static List<OGCGeometry> flatten(OGCGeometry geometry)
+    {
+        if (!(geometry instanceof OGCGeometryCollection)) {
+            return Collections.singletonList(geometry);
+        }
+        List<OGCGeometry> output = new ArrayList<>();
+        Queue<OGCGeometry> geometriesQueue = new ArrayDeque<>();
+        geometriesQueue.offer(geometry);
+        while (!geometriesQueue.isEmpty()) {
+            OGCGeometryCollection geometryCollection = (OGCGeometryCollection) geometriesQueue.poll();
+            for (int i = 0; i < geometryCollection.numGeometries(); i++) {
+                OGCGeometry geometryN = geometryCollection.geometryN(i);
+                if (!(geometryN instanceof OGCGeometryCollection)) {
+                    output.add(geometryN);
+                }
+                else {
+                    geometriesQueue.offer(geometryN);
+                }
+            }
+        }
+        return output;
+    }
+
+    // Do a best-effort attempt to estimate the memory size
+    public static long getGeometryMemorySize(OGCGeometry geometry)
+    {
+        if (geometry == null) {
+            return 0;
+        }
+        // Due to the following issue:
+        // https://github.com/Esri/geometry-api-java/issues/192
+        // We must check if the geometry is empty before calculating its size.  Once the issue is resolved
+        // and we bring the fix into our codebase, we can remove this check.
+        if (geometry.isEmpty()) {
+            return OGC_GEOMETRY_BASE_INSTANCE_SIZE;
+        }
+        return geometry.estimateMemorySize();
     }
 }

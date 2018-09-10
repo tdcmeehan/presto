@@ -17,13 +17,12 @@ import com.esri.core.geometry.ogc.OGCGeometry;
 import com.facebook.presto.array.ObjectBigArray;
 import com.facebook.presto.spi.function.AccumulatorStateFactory;
 import com.facebook.presto.spi.function.GroupedAccumulatorState;
-import org.openjdk.jol.info.ClassLayout;
+
+import static com.facebook.presto.geospatial.GeometryUtils.getGeometryMemorySize;
 
 public class GeometryStateFactory
         implements AccumulatorStateFactory<GeometryState>
 {
-    private static final long OGC_GEOMETRY_BASE_INSTANCE_SIZE = ClassLayout.parseClass(OGCGeometry.class).instanceSize();
-
     @Override
     public GeometryState createSingleState()
     {
@@ -87,22 +86,6 @@ public class GeometryStateFactory
         {
             this.groupId = groupId;
         }
-    }
-
-    // Do a best-effort attempt to estimate the memory size
-    private static long getGeometryMemorySize(OGCGeometry geometry)
-    {
-        if (geometry == null) {
-            return 0;
-        }
-        // Due to the following issue:
-        // https://github.com/Esri/geometry-api-java/issues/192
-        // We must check if the geometry is empty before calculating its size.  Once the issue is resolved
-        // and we bring the fix into our codebase, we can remove this check.
-        if (geometry.isEmpty()) {
-            return OGC_GEOMETRY_BASE_INSTANCE_SIZE;
-        }
-        return geometry.estimateMemorySize();
     }
 
     public static class SingleGeometryState

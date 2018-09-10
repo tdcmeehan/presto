@@ -20,7 +20,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import static java.lang.String.format;
 
@@ -406,9 +408,9 @@ public class TestGeometryConvexHullGeoAggregation
     }
 
     @Override
-    protected String getFunctionName()
+    protected Set<String> getFunctionName()
     {
-        return "convex_hull_agg";
+        return Collections.singleton("convex_hull_agg");
     }
 
     private void assertConvexHullInvalidFunction(String inputWKT, String errorMessage)

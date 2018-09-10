@@ -13,8 +13,11 @@
  */
 package com.facebook.presto.plugin.geospatial.aggregation;
 
+import com.google.common.collect.ImmutableSet;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
+
+import java.util.Set;
 
 public class TestGeometryMemUnionGeoAggregation
         extends AbstractTestGeoAggregationFunctions
@@ -331,8 +334,8 @@ public class TestGeometryMemUnionGeoAggregation
     }
 
     @Override
-    protected String getFunctionName()
+    protected Set<String> getFunctionName()
     {
-        return "geometry_mem_union_agg";
+        return ImmutableSet.of("geometry_mem_union_agg", "geometry_union_agg");
     }
 }

@@ -28,35 +28,41 @@ import com.facebook.presto.spi.type.TypeSignature;
 import io.airlift.slice.Slice;
 import org.testng.annotations.BeforeClass;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
 import static com.facebook.presto.metadata.FunctionExtractor.extractFunctions;
 import static com.facebook.presto.operator.aggregation.AggregationTestUtils.assertAggregation;
+import static java.lang.String.format;
 
 public abstract class AbstractTestGeoAggregationFunctions
         extends AbstractTestFunctions
 {
-    private InternalAggregationFunction function;
+    private List<InternalAggregationFunction> functions;
 
     @BeforeClass
     public void registerFunctions()
     {
+        functions = new ArrayList<>();
         GeoPlugin plugin = new GeoPlugin();
         for (Type type : plugin.getTypes()) {
             functionAssertions.getTypeRegistry().addType(type);
         }
         functionAssertions.getMetadata().addFunctions(extractFunctions(plugin.getFunctions()));
-        function = functionAssertions
-                .getMetadata()
-                .getFunctionRegistry()
-                .getAggregateFunctionImplementation(new Signature(getFunctionName(),
-                                                    FunctionKind.AGGREGATE,
-                TypeSignature.parseTypeSignature(GeometryType.GEOMETRY_TYPE_NAME),
-                TypeSignature.parseTypeSignature(GeometryType.GEOMETRY_TYPE_NAME)));
+        for (String function : getFunctionName()) {
+            functions.add(functionAssertions
+                    .getMetadata()
+                    .getFunctionRegistry()
+                    .getAggregateFunctionImplementation(new Signature(function,
+                            FunctionKind.AGGREGATE,
+                            TypeSignature.parseTypeSignature(GeometryType.GEOMETRY_TYPE_NAME),
+                            TypeSignature.parseTypeSignature(GeometryType.GEOMETRY_TYPE_NAME))));
+        }
     }
 
     protected void assertAggregatedGeometries(String testDescription, String expectedWkt, String... wkts)
@@ -82,12 +88,15 @@ public abstract class AbstractTestGeoAggregationFunctions
                     rightGeometry.difference(leftGeometry).isEmpty();
         };
         // Test in forward and reverse order to verify that ordering doesn't affect the output
-        assertAggregation(function, equalityFunction, testDescription,
-                new Page(BlockAssertions.createSlicesBlock(geometrySlices)), expectedWkt);
-        Collections.reverse(geometrySlices);
-        assertAggregation(function, equalityFunction, testDescription,
-                new Page(BlockAssertions.createSlicesBlock(geometrySlices)), expectedWkt);
+        for (InternalAggregationFunction function : functions) {
+            String testDescriptionWithFunction = format("%s: %s", function.name(), testDescription);
+            assertAggregation(function, equalityFunction, testDescriptionWithFunction,
+                    new Page(BlockAssertions.createSlicesBlock(geometrySlices)), expectedWkt);
+            Collections.reverse(geometrySlices);
+            assertAggregation(function, equalityFunction, testDescriptionWithFunction,
+                    new Page(BlockAssertions.createSlicesBlock(geometrySlices)), expectedWkt);
+        }
     }
 
-    protected abstract String getFunctionName();
+    protected abstract Set<String> getFunctionName();
 }
