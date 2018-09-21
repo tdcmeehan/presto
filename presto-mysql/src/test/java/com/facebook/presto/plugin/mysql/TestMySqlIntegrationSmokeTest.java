@@ -158,14 +158,18 @@ public class TestMySqlIntegrationSmokeTest
     {
         assertUpdate("CREATE TABLE tpch.mysql_test_show_table_with_default (" +
                 "column_a DATE DEFAULT '2011-01-01'," +
-                "column_b DATE DEFAULT DATE '2011-01-01'" +
+                "column_b DATE DEFAULT DATE '2011-01-01' NOT NULL" +
                 ")");
         MaterializedResult materializedRows = computeActual("SHOW CREATE TABLE tpch.mysql_test_show_table_with_default");
         assertNotNull(materializedRows);
         assertEquals(materializedRows.getMaterializedRows().get(0).getFields().get(0),
                 "CREATE TABLE mysql.tpch.mysql_test_show_table_with_default (\n" +
-                "   column_a date DEFAULT DATE '2011-01-01'\n" +
+                        "   column_a date DEFAULT DATE '2011-01-01',\n" +
+                        "   column_b date DEFAULT DATE '2011-01-01' NOT NULL\n" +
                 ")");
+
+        assertUpdate("INSERT INTO tpch.mysql_test_show_table_with_default(column_b) VALUES (date '2012-12-31')", 1);
+        assertQuery("SELECT * FROM tpch.mysql_test_show_table_with_default", "SELECT CAST ('2012-12-31' AS DATE), CAST ('2012-12-31' AS DATE);");
     }
 
     private void execute(String sql)

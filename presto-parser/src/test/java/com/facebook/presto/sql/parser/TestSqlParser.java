@@ -1151,6 +1151,7 @@ public class TestSqlParser
                         Optional.empty()));
     }
 
+    // TODO: though we don't currently allow functions as the default value for columns in create DDLs, this feature may be implemented in the future
     @Test(expectedExceptions = ParsingException.class)
     public void testDefaultValueWithFunctionFails()
     {

@@ -221,7 +221,7 @@ public class BaseJdbcClient
                     if (columnMapping.isPresent()) {
                         String columnName = resultSet.getString("COLUMN_NAME");
                         boolean nullable = resultSet.getBoolean("NULLABLE");
-                        // Per https://docs.oracle.com/javase/7/docs/api/java/sql/DatabaseMetaData.html COLUMN_DEF is a String value
+                        // Per https://docs.oracle.com/javase/8/docs/api/java/sql/DatabaseMetaData.html COLUMN_DEF is a String value
                         String defaultValue = getColumnDefaultValue(resultSet, columnMapping.get().getType());
                         columns.add(new JdbcColumnHandle(connectorId, columnName, typeHandle, columnMapping.get().getType(), nullable, defaultValue));
                     }
@@ -238,6 +238,17 @@ public class BaseJdbcClient
         }
     }
 
+    /**
+     * Per definition in {@link java.sql.DatabaseMetaData}, COLUMN_DEF is returned as a String.  This method should format the default
+     * column such that it can be parsed as a varchar literal and cast to the desired type in Presto.
+     *
+     * This method is protected to allow implementing connectors to customize this behavior for their database.
+     * @param resultSet the resultset returned from {@link DatabaseMetaData#getColumns(String, String, String, String)}
+     * @param type the Presto stack type associated with the default value
+     * @return
+     * @throws SQLException
+     * @see <a href="https://docs.oracle.com/javase/8/docs/api/java/sql/DatabaseMetaData.html">DatabaseMetaData</a>
+     */
     protected String getColumnDefaultValue(ResultSet resultSet, Type type)
             throws SQLException
     {
@@ -417,6 +428,9 @@ public class BaseJdbcClient
             if (type instanceof BooleanType) {
                 return ((Boolean) value).toString().toUpperCase(ENGLISH);
             }
+        }
+        if (value instanceof String) {
+            return varcharLiteral((String) value);
         }
         throw new PrestoException(NOT_SUPPORTED, format("Error: unknown type and object combination: %s, %s", type, value.getClass()));
     }

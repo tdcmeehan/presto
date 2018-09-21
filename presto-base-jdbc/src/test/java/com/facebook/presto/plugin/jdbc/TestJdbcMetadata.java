@@ -181,10 +181,7 @@ public class TestJdbcMetadata
     public void testCreateTable()
     {
         SchemaTableName table = new SchemaTableName("example", "foo");
-        metadata.createTable(SESSION, new ConnectorTableMetadata(
-                        table,
-                ImmutableList.of(new ColumnMetadata("text", VARCHAR))),
-                false);
+        metadata.createTable(SESSION, new ConnectorTableMetadata(table, ImmutableList.of(new ColumnMetadata("text", VARCHAR))), false);
 
         JdbcTableHandle handle = metadata.getTableHandle(SESSION, table);
         ConnectorTableMetadata layout = metadata.getTableMetadata(SESSION, handle);
