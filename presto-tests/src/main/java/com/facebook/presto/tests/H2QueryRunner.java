@@ -193,7 +193,7 @@ public class H2QueryRunner
                     throws SQLException
             {
                 int count = resultSet.getMetaData().getColumnCount();
-                checkArgument(types.size() == count, "type does not match result");
+                checkArgument(types.size() == count, format("number of types expected (%d) does not match actual number in result (%d)", types.size(), count));
                 List<Object> row = new ArrayList<>(count);
                 for (int i = 1; i <= count; i++) {
                     Type type = types.get(i - 1);
