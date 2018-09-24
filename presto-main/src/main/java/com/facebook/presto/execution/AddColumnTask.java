@@ -15,6 +15,7 @@ package com.facebook.presto.execution;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.connector.ConnectorId;
+import com.facebook.presto.metadata.CatalogMetadata;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.QualifiedObjectName;
 import com.facebook.presto.metadata.TableHandle;
@@ -22,6 +23,7 @@ import com.facebook.presto.security.AccessControl;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.analyzer.SemanticException;
 import com.facebook.presto.sql.tree.AddColumn;
@@ -40,9 +42,11 @@ import static com.facebook.presto.spi.type.TypeSignature.parseTypeSignature;
 import static com.facebook.presto.sql.NodeUtils.mapFromProperties;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.COLUMN_ALREADY_EXISTS;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MISSING_TABLE;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.TYPE_MISMATCH;
 import static com.facebook.presto.type.UnknownType.UNKNOWN;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static java.lang.String.format;
 import static java.util.Locale.ENGLISH;
 
 public class AddColumnTask
@@ -66,6 +70,10 @@ public class AddColumnTask
 
         ConnectorId connectorId = metadata.getCatalogHandle(session, tableName.getCatalogName())
                 .orElseThrow(() -> new PrestoException(NOT_FOUND, "Catalog does not exist: " + tableName.getCatalogName()));
+        ConnectorMetadata connectorMetadata = transactionManager
+                .getOptionalCatalogMetadata(session.getRequiredTransactionId(), tableName.getCatalogName())
+                .map(CatalogMetadata::getMetadata)
+                .orElseThrow(() -> new PrestoException(NOT_FOUND, format("Connector metadata for catalog '%s' does not exist", tableName.getCatalogName())));
 
         accessControl.checkCanAddColumns(session.getRequiredTransactionId(), session.getIdentity(), tableName);
 
@@ -85,6 +93,10 @@ public class AddColumnTask
         if (columnHandles.containsKey(element.getName().getValue().toLowerCase(ENGLISH))) {
             throw new SemanticException(COLUMN_ALREADY_EXISTS, statement, "Column '%s' already exists", element.getName());
         }
+        if (!(element.isNullable() || connectorMetadata.supportsNotNullColumns())) {
+            throw new SemanticException(NOT_SUPPORTED, element,
+                    "Catalog '%s' does not support non-null column for column name '%s'", connectorId.getCatalogName(), element.getName());
+        }
 
         Map<String, Expression> sqlProperties = mapFromProperties(element.getProperties());
         Map<String, Object> columnProperties = metadata.getColumnPropertyManager().getProperties(
@@ -95,7 +107,14 @@ public class AddColumnTask
                 metadata,
                 parameters);
 
-        ColumnMetadata column = new ColumnMetadata(element.getName().getValue(), type, element.getComment().orElse(null), null, false, columnProperties);
+        ColumnMetadata column = new ColumnMetadata(
+                element.getName().getValue(),
+                type,
+                element.getComment().orElse(null),
+                null,
+                false,
+                columnProperties,
+                element.isNullable());
 
         metadata.addColumn(session, tableHandle.get(), column);
 

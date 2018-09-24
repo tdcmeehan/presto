@@ -31,23 +31,29 @@ public class ColumnMetadata
     private final String extraInfo;
     private final boolean hidden;
     private final Map<String, Object> properties;
+    private final boolean nullable;
 
     public ColumnMetadata(String name, Type type)
     {
-        this(name, type, null, null, false, emptyMap());
+        this(name, type, null, null, false, emptyMap(), true);
     }
 
     public ColumnMetadata(String name, Type type, String comment, boolean hidden)
     {
-        this(name, type, comment, null, hidden, emptyMap());
+        this(name, type, comment, null, hidden, emptyMap(), true);
     }
 
     public ColumnMetadata(String name, Type type, String comment, String extraInfo, boolean hidden)
     {
-        this(name, type, comment, extraInfo, hidden, emptyMap());
+        this(name, type, comment, extraInfo, hidden, emptyMap(), true);
     }
 
     public ColumnMetadata(String name, Type type, String comment, String extraInfo, boolean hidden, Map<String, Object> properties)
+    {
+        this(name, type, comment, extraInfo, hidden, properties, true);
+    }
+
+    public ColumnMetadata(String name, Type type, String comment, String extraInfo, boolean hidden, Map<String, Object> properties, boolean nullable)
     {
         if (name == null || name.isEmpty()) {
             throw new NullPointerException("name is null or empty");
@@ -65,6 +71,7 @@ public class ColumnMetadata
         this.extraInfo = extraInfo;
         this.hidden = hidden;
         this.properties = properties.isEmpty() ? emptyMap() : unmodifiableMap(new LinkedHashMap<>(properties));
+        this.nullable = nullable;
     }
 
     public String getName()
@@ -97,6 +104,11 @@ public class ColumnMetadata
         return properties;
     }
 
+    public boolean isNullable()
+    {
+        return nullable;
+    }
+
     @Override
     public String toString()
     {
@@ -115,6 +127,7 @@ public class ColumnMetadata
         if (!properties.isEmpty()) {
             sb.append(", properties=").append(properties);
         }
+        sb.append(", nullable=").append(nullable);
         sb.append('}');
         return sb.toString();
     }
@@ -122,7 +135,7 @@ public class ColumnMetadata
     @Override
     public int hashCode()
     {
-        return Objects.hash(name, type, comment, extraInfo, hidden);
+        return Objects.hash(name, type, comment, extraInfo, hidden, nullable);
     }
 
     @Override
@@ -139,6 +152,7 @@ public class ColumnMetadata
                 Objects.equals(this.type, other.type) &&
                 Objects.equals(this.comment, other.comment) &&
                 Objects.equals(this.extraInfo, other.extraInfo) &&
-                Objects.equals(this.hidden, other.hidden);
+                Objects.equals(this.hidden, other.hidden) &&
+                this.nullable == other.nullable;
     }
 }
