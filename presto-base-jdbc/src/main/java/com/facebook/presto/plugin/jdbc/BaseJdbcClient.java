@@ -205,7 +205,8 @@ public class BaseJdbcClient
                     // skip unsupported column types
                     if (columnMapping.isPresent()) {
                         String columnName = resultSet.getString("COLUMN_NAME");
-                        columns.add(new JdbcColumnHandle(connectorId, columnName, typeHandle, columnMapping.get().getType()));
+                        boolean nullable = resultSet.getBoolean("NULLABLE");
+                        columns.add(new JdbcColumnHandle(connectorId, columnName, typeHandle, columnMapping.get().getType(), nullable));
                     }
                 }
                 if (columns.isEmpty()) {
@@ -307,17 +308,7 @@ public class BaseJdbcClient
             ImmutableList.Builder<Type> columnTypes = ImmutableList.builder();
             ImmutableList.Builder<String> columnList = ImmutableList.builder();
             for (ColumnMetadata column : tableMetadata.getColumns()) {
-                String columnName = column.getName();
-                if (uppercase) {
-                    columnName = columnName.toUpperCase(ENGLISH);
-                }
-                columnNames.add(columnName);
-                columnTypes.add(column.getType());
-                columnList.add(new StringBuilder()
-                        .append(quoted(columnName))
-                        .append(" ")
-                        .append(toSqlType(column.getType()))
-                        .toString());
+                columnList.add(getColumnString(uppercase, columnNames, columnTypes, column));
             }
             Joiner.on(", ").appendTo(sql, columnList.build());
             sql.append(")");
@@ -336,6 +327,24 @@ public class BaseJdbcClient
         catch (SQLException e) {
             throw new PrestoException(JDBC_ERROR, e);
         }
+    }
+
+    private String getColumnString(boolean uppercase, ImmutableList.Builder<String> columnNames, ImmutableList.Builder<Type> columnTypes, ColumnMetadata column)
+    {
+        String columnName = column.getName();
+        if (uppercase) {
+            columnName = columnName.toUpperCase(ENGLISH);
+        }
+        columnNames.add(columnName);
+        columnTypes.add(column.getType());
+        StringBuilder sb = new StringBuilder()
+                .append(quoted(columnName))
+                .append(" ")
+                .append(toSqlType(column.getType()));
+        if (!column.isNullable()) {
+            sb.append(" NOT NULL");
+        }
+        return sb.toString();
     }
 
     protected String generateTemporaryTableName()
