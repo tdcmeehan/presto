@@ -275,7 +275,7 @@ public class TpchMetadata
     {
         ImmutableList.Builder<ColumnMetadata> columns = ImmutableList.builder();
         for (TpchColumn<? extends TpchEntity> column : tpchTable.getColumns()) {
-            columns.add(new ColumnMetadata(columnNaming.getName(column), getPrestoType(column)));
+            columns.add(new ColumnMetadata(columnNaming.getName(column), getPrestoType(column), null, null, false, emptyMap(), false));
         }
         columns.add(new ColumnMetadata(ROW_NUMBER_COLUMN_NAME, BIGINT, null, true));
 
@@ -509,5 +509,11 @@ public class TpchMetadata
             throw new IllegalArgumentException("Total rows is larger than 2^64");
         }
         return (long) totalRows;
+    }
+
+    @Override
+    public boolean supportsNotNullColumns()
+    {
+        return true;
     }
 }

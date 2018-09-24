@@ -433,4 +433,10 @@ public class ClassLoaderSafeConnectorMetadata
             return delegate.listTablePrivileges(session, prefix);
         }
     }
+
+    @Override
+    public boolean supportsNotNullColumns()
+    {
+        return delegate.supportsNotNullColumns();
+    }
 }

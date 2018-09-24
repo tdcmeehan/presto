@@ -21,6 +21,17 @@ import com.facebook.presto.connector.system.SystemTablesMetadata;
 import com.facebook.presto.execution.QueryIdGenerator;
 import com.facebook.presto.metadata.Catalog;
 import com.facebook.presto.metadata.SessionPropertyManager;
+import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.ColumnMetadata;
+import com.facebook.presto.spi.ConnectorSession;
+import com.facebook.presto.spi.ConnectorTableHandle;
+import com.facebook.presto.spi.ConnectorTableLayout;
+import com.facebook.presto.spi.ConnectorTableLayoutHandle;
+import com.facebook.presto.spi.ConnectorTableLayoutResult;
+import com.facebook.presto.spi.ConnectorTableMetadata;
+import com.facebook.presto.spi.Constraint;
+import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.SchemaTablePrefix;
 import com.facebook.presto.spi.connector.Connector;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.connector.ConnectorSplitManager;
@@ -30,7 +41,10 @@ import com.facebook.presto.spi.transaction.IsolationLevel;
 import com.facebook.presto.sql.SqlPath;
 import com.google.common.collect.ImmutableSet;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static com.facebook.presto.connector.ConnectorId.createInformationSchemaConnectorId;
 import static com.facebook.presto.connector.ConnectorId.createSystemTablesConnectorId;
@@ -66,18 +80,23 @@ public final class TestingSession
 
     public static Catalog createBogusTestingCatalog(String catalogName)
     {
+        return createBogusTestingCatalog(catalogName, false);
+    }
+
+    public static Catalog createBogusTestingCatalog(String catalogName, boolean supportsNotNullColumns)
+    {
         ConnectorId connectorId = new ConnectorId(catalogName);
         return new Catalog(
                 catalogName,
                 connectorId,
-                createTestSessionConnector(),
+                createTestSessionConnector(supportsNotNullColumns),
                 createInformationSchemaConnectorId(connectorId),
-                createTestSessionConnector(),
+                createTestSessionConnector(supportsNotNullColumns),
                 createSystemTablesConnectorId(connectorId),
-                createTestSessionConnector());
+                createTestSessionConnector(supportsNotNullColumns));
     }
 
-    private static Connector createTestSessionConnector()
+    private static Connector createTestSessionConnector(boolean supportsNotNullColumns)
     {
         return new Connector()
         {
@@ -90,7 +109,8 @@ public final class TestingSession
             @Override
             public ConnectorMetadata getMetadata(ConnectorTransactionHandle transaction)
             {
-                return new SystemTablesMetadata(new ConnectorId("test_session_connector"), new StaticSystemTablesProvider(ImmutableSet.of()));
+                return new TestingConnectorMetadata(new SystemTablesMetadata(new ConnectorId("test_session_connector"),
+                        new StaticSystemTablesProvider(ImmutableSet.of())), supportsNotNullColumns);
             }
 
             @Override
@@ -99,5 +119,72 @@ public final class TestingSession
                 throw new UnsupportedOperationException();
             }
         };
+    }
+
+    private static final class TestingConnectorMetadata
+            implements ConnectorMetadata
+    {
+        private final ConnectorMetadata connectorMetadata;
+        private final boolean supportsNotNullColumns;
+
+        TestingConnectorMetadata(ConnectorMetadata connectorMetadata, boolean supportsNotNullColumns)
+        {
+            this.connectorMetadata = connectorMetadata;
+            this.supportsNotNullColumns = supportsNotNullColumns;
+        }
+
+        @Override
+        public List<String> listSchemaNames(ConnectorSession session)
+        {
+            return connectorMetadata.listSchemaNames(session);
+        }
+
+        @Override
+        public ConnectorTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName)
+        {
+            return connectorMetadata.getTableHandle(session, tableName);
+        }
+
+        @Override
+        public List<ConnectorTableLayoutResult> getTableLayouts(ConnectorSession session, ConnectorTableHandle table, Constraint<ColumnHandle> constraint, Optional<Set<ColumnHandle>> desiredColumns)
+        {
+            return connectorMetadata.getTableLayouts(session, table, constraint, desiredColumns);
+        }
+
+        @Override
+        public ConnectorTableLayout getTableLayout(ConnectorSession session, ConnectorTableLayoutHandle handle)
+        {
+            return connectorMetadata.getTableLayout(session, handle);
+        }
+
+        @Override
+        public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle table)
+        {
+            return connectorMetadata.getTableMetadata(session, table);
+        }
+
+        @Override
+        public Map<String, ColumnHandle> getColumnHandles(ConnectorSession session, ConnectorTableHandle tableHandle)
+        {
+            return connectorMetadata.getColumnHandles(session, tableHandle);
+        }
+
+        @Override
+        public ColumnMetadata getColumnMetadata(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle columnHandle)
+        {
+            return connectorMetadata.getColumnMetadata(session, tableHandle, columnHandle);
+        }
+
+        @Override
+        public Map<SchemaTableName, List<ColumnMetadata>> listTableColumns(ConnectorSession session, SchemaTablePrefix prefix)
+        {
+            return connectorMetadata.listTableColumns(session, prefix);
+        }
+
+        @Override
+        public boolean supportsNotNullColumns()
+        {
+            return supportsNotNullColumns;
+        }
     }
 }

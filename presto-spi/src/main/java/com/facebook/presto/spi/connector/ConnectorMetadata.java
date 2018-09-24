@@ -444,4 +444,13 @@ public interface ConnectorMetadata
     {
         return emptyList();
     }
+
+    /**
+     * @return whether the connector supports not null semantics in columns
+     * @see ColumnMetadata#isNullable
+     */
+    default boolean supportsNotNullColumns()
+    {
+        return false;
+    }
 }

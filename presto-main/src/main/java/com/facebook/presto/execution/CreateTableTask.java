@@ -15,6 +15,7 @@ package com.facebook.presto.execution;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.connector.ConnectorId;
+import com.facebook.presto.metadata.CatalogMetadata;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.QualifiedObjectName;
 import com.facebook.presto.metadata.TableHandle;
@@ -23,6 +24,7 @@ import com.facebook.presto.security.AccessControl;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorTableMetadata;
 import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.analyzer.SemanticException;
 import com.facebook.presto.sql.tree.ColumnDefinition;
@@ -59,6 +61,7 @@ import static com.facebook.presto.sql.analyzer.SemanticErrorCode.TYPE_MISMATCH;
 import static com.facebook.presto.type.UnknownType.UNKNOWN;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static java.lang.String.format;
 
 public class CreateTableTask
         implements DataDefinitionTask<CreateTable>
@@ -78,11 +81,11 @@ public class CreateTableTask
     @Override
     public ListenableFuture<?> execute(CreateTable statement, TransactionManager transactionManager, Metadata metadata, AccessControl accessControl, QueryStateMachine stateMachine, List<Expression> parameters)
     {
-        return internalExecute(statement, metadata, accessControl, stateMachine.getSession(), parameters);
+        return internalExecute(statement, transactionManager, metadata, accessControl, stateMachine.getSession(), parameters);
     }
 
     @VisibleForTesting
-    public ListenableFuture<?> internalExecute(CreateTable statement, Metadata metadata, AccessControl accessControl, Session session, List<Expression> parameters)
+    ListenableFuture<?> internalExecute(CreateTable statement, TransactionManager transactionManager, Metadata metadata, AccessControl accessControl, Session session, List<Expression> parameters)
     {
         checkArgument(!statement.getElements().isEmpty(), "no columns for table");
 
@@ -97,6 +100,10 @@ public class CreateTableTask
 
         ConnectorId connectorId = metadata.getCatalogHandle(session, tableName.getCatalogName())
                 .orElseThrow(() -> new PrestoException(NOT_FOUND, "Catalog does not exist: " + tableName.getCatalogName()));
+        ConnectorMetadata connectorMetadata = transactionManager
+                .getOptionalCatalogMetadata(session.getRequiredTransactionId(), tableName.getCatalogName())
+                .map(CatalogMetadata::getMetadata)
+                .orElseThrow(() -> new PrestoException(NOT_FOUND, format("Connector metadata for catalog '%s' does not exist", tableName.getCatalogName())));
 
         LinkedHashMap<String, ColumnMetadata> columns = new LinkedHashMap<>();
         Map<String, Object> inheritedProperties = ImmutableMap.of();
@@ -118,6 +125,10 @@ public class CreateTableTask
                 if (columns.containsKey(name)) {
                     throw new SemanticException(DUPLICATE_COLUMN_NAME, column, "Column name '%s' specified more than once", column.getName());
                 }
+                if (!(column.isNullable() || connectorMetadata.supportsNotNullColumns())) {
+                    throw new SemanticException(NOT_SUPPORTED, column,
+                            "Catalog '%s' does not support non-null column for column name '%s'", connectorId.getCatalogName(), column.getName());
+                }
 
                 Map<String, Expression> sqlProperties = mapFromProperties(column.getProperties());
                 Map<String, Object> columnProperties = metadata.getColumnPropertyManager().getProperties(
@@ -128,7 +139,14 @@ public class CreateTableTask
                         metadata,
                         parameters);
 
-                columns.put(name, new ColumnMetadata(name, type, column.getComment().orElse(null), null, false, columnProperties));
+                columns.put(name, new ColumnMetadata(
+                        name,
+                        type,
+                        column.getComment().orElse(null),
+                        null,
+                        false,
+                        columnProperties,
+                        column.isNullable()));
             }
             else if (element instanceof LikeClause) {
                 LikeClause likeClause = (LikeClause) element;
