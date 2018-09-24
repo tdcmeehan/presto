@@ -33,6 +33,7 @@ import static com.facebook.presto.testing.assertions.Assert.assertEquals;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static io.airlift.tpch.TpchTable.ORDERS;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 
 @Test
@@ -149,6 +150,45 @@ public class TestMySqlIntegrationSmokeTest
         assertEquals(row.getField(0), (byte) 127);
 
         assertUpdate("DROP TABLE mysql_test_tinyint1");
+    }
+
+    @Test
+    public void testShowCreateTableAndInsertWithNonNull()
+            throws SQLException
+    {
+        assertUpdate("CREATE TABLE tpch.mysql_test_nonnull (" +
+                "column_a DATE," +
+                "column_b DATE NOT NULL" +
+                ")");
+        MaterializedResult materializedRows = computeActual("SHOW CREATE TABLE tpch.mysql_test_nonnull");
+        assertNotNull(materializedRows);
+        assertEquals(materializedRows.getMaterializedRows().get(0).getFields().get(0),
+                "CREATE TABLE mysql.tpch.mysql_test_nonnull (\n" +
+                        "   column_a date,\n" +
+                        "   column_b date NOT NULL\n" +
+                        ")");
+
+        assertUpdate("INSERT INTO tpch.mysql_test_nonnull(column_b) VALUES (date '2012-12-31')", 1);
+        assertQuery("SELECT * FROM tpch.mysql_test_nonnull", "SELECT NULL, CAST ('2012-12-31' AS DATE);");
+    }
+
+    @Test(expectedExceptions = Exception.class)
+    public void testFailsWhenAttemptToInsertNullIntoNonnullColumn()
+            throws SQLException
+    {
+        assertUpdate("CREATE TABLE tpch.nonnull_error (" +
+                "column_a DATE," +
+                "column_b DATE NOT NULL" +
+                ")");
+        MaterializedResult materializedRows = computeActual("SHOW CREATE TABLE tpch.nonnull_error");
+        assertNotNull(materializedRows);
+        assertEquals(materializedRows.getMaterializedRows().get(0).getFields().get(0),
+                "CREATE TABLE mysql.tpch.nonnull_error (\n" +
+                        "   column_a date,\n" +
+                        "   column_b date NOT NULL\n" +
+                        ")");
+
+        assertUpdate("INSERT INTO tpch.nonnull_error(column_a) VALUES (date '2012-12-31')", 1);
     }
 
     private void execute(String sql)

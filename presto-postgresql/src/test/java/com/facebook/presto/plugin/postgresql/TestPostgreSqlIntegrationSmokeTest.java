@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.plugin.postgresql;
 
+import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.tests.AbstractTestIntegrationSmokeTest;
 import io.airlift.testing.postgresql.TestingPostgreSqlServer;
 import org.testng.annotations.AfterClass;
@@ -27,7 +28,9 @@ import java.sql.Statement;
 import static io.airlift.tpch.TpchTable.ORDERS;
 import static java.lang.String.format;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 
 @Test
@@ -146,6 +149,45 @@ public class TestPostgreSqlIntegrationSmokeTest
             // Listing columns in all tables should not fail due to tables with no columns
             computeActual("SELECT column_name FROM information_schema.columns WHERE table_schema = 'tpch'");
         }
+    }
+
+    @Test
+    public void testShowCreateTableAndInsertWithNonNull()
+            throws SQLException
+    {
+        assertUpdate("CREATE TABLE postgres_nonnull (" +
+                "column_a DATE," +
+                "column_b DATE NOT NULL" +
+                ")");
+        MaterializedResult materializedRows = computeActual("SHOW CREATE TABLE tpch.postgres_nonnull");
+        assertNotNull(materializedRows);
+        assertEquals(materializedRows.getMaterializedRows().get(0).getFields().get(0),
+                "CREATE TABLE postgresql.tpch.postgres_nonnull (\n" +
+                        "   column_a date,\n" +
+                        "   column_b date NOT NULL\n" +
+                        ")");
+
+        assertUpdate("INSERT INTO tpch.postgres_nonnull(column_b) VALUES (date '2012-12-31')", 1);
+        assertQuery("SELECT * FROM tpch.postgres_nonnull", "SELECT NULL, CAST ('2012-12-31' AS DATE);");
+    }
+
+    @Test(expectedExceptions = Exception.class)
+    public void testFailsWhenAttemptToInsertNullIntoNonnullColumn()
+            throws SQLException
+    {
+        assertUpdate("CREATE TABLE postgres_test_show_table_with_default (" +
+                "column_a DATE," +
+                "column_b DATE NOT NULL" +
+                ")");
+        MaterializedResult materializedRows = computeActual("SHOW CREATE TABLE tpch.postgres_nonnull_error");
+        assertNotNull(materializedRows);
+        assertEquals(materializedRows.getMaterializedRows().get(0).getFields().get(0),
+                "CREATE TABLE postgresql.tpch.postgres_nonnull_error (\n" +
+                        "   column_a date,\n" +
+                        "   column_b date NOT NULL\n" +
+                        ")");
+
+        assertUpdate("INSERT INTO tpch.postgres_nonnull_error(column_a) VALUES (date '2012-12-31')", 1);
     }
 
     private AutoCloseable withTable(String tableName, String tableDefinition)
