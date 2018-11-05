@@ -71,6 +71,7 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 import static com.facebook.presto.execution.BasicStageExecutionStats.EMPTY_STAGE_STATS;
+import static com.facebook.presto.execution.QueryState.FAILED;
 import static com.facebook.presto.execution.QueryState.FINISHED;
 import static com.facebook.presto.execution.QueryState.FINISHING;
 import static com.facebook.presto.execution.QueryState.PLANNING;
@@ -329,7 +330,7 @@ public class QueryStateMachine
         QueryState state = queryState.get();
 
         ErrorCode errorCode = null;
-        if (state == QueryState.FAILED) {
+        if (state == FAILED) {
             ExecutionFailureInfo failureCause = this.failureCause.get();
             if (failureCause != null) {
                 errorCode = failureCause.getErrorCode();
@@ -391,7 +392,7 @@ public class QueryStateMachine
 
         ExecutionFailureInfo failureCause = null;
         ErrorCode errorCode = null;
-        if (state == QueryState.FAILED) {
+        if (state == FAILED) {
             failureCause = this.failureCause.get();
             if (failureCause != null) {
                 errorCode = failureCause.getErrorCode();
@@ -561,6 +562,7 @@ public class QueryStateMachine
                 queryStateTimer.getElapsedTime(),
                 queryStateTimer.getQueuedTime(),
                 queryStateTimer.getResourceWaitingTime(),
+                queryStateTimer.getDispatchingTime(),
                 queryStateTimer.getExecutionTime(),
                 queryStateTimer.getAnalysisTime(),
                 queryStateTimer.getPlanningTime(),
@@ -742,6 +744,12 @@ public class QueryStateMachine
     {
         queryStateTimer.beginWaitingForResources();
         return queryState.setIf(WAITING_FOR_RESOURCES, currentState -> currentState.ordinal() < WAITING_FOR_RESOURCES.ordinal());
+    }
+
+    public boolean transitionToDispatching()
+    {
+        queryStateTimer.beginDispatching();
+        return queryState.setIf(DISPATCHING, currentState -> currentState.ordinal() < DISPATCHING.ordinal());
     }
 
     public boolean transitionToPlanning()
@@ -962,7 +970,7 @@ public class QueryStateMachine
 
     public Optional<ExecutionFailureInfo> getFailureInfo()
     {
-        if (queryState.get() != QueryState.FAILED) {
+        if (queryState.get() != FAILED) {
             return Optional.empty();
         }
         return Optional.ofNullable(this.failureCause.get());
@@ -1052,6 +1060,7 @@ public class QueryStateMachine
                 queryStats.getElapsedTime(),
                 queryStats.getQueuedTime(),
                 queryStats.getResourceWaitingTime(),
+                queryStats.getDispatchingTime(),
                 queryStats.getExecutionTime(),
                 queryStats.getAnalysisTime(),
                 queryStats.getTotalPlanningTime(),
