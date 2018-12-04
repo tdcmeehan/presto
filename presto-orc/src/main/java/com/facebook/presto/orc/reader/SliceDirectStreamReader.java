@@ -14,9 +14,9 @@
 package com.facebook.presto.orc.reader;
 
 import com.facebook.presto.orc.OrcCorruptionException;
+import com.facebook.presto.orc.QualifyingSet;
 import com.facebook.presto.orc.StreamDescriptor;
 import com.facebook.presto.orc.metadata.ColumnEncoding;
-import com.facebook.presto.orc.QualifyingSet;
 import com.facebook.presto.orc.stream.BooleanInputStream;
 import com.facebook.presto.orc.stream.ByteArrayInputStream;
 import com.facebook.presto.orc.stream.InputStreamSource;
@@ -56,8 +56,8 @@ import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 public class SliceDirectStreamReader
-    extends ColumnReader
-    implements StreamReader
+        extends ColumnReader
+        implements StreamReader
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(SliceDirectStreamReader.class).instanceSize();
     private static final int ONE_GIGABYTE = toIntExact(new DataSize(1, GIGABYTE).toBytes());
@@ -82,7 +82,7 @@ public class SliceDirectStreamReader
     private boolean rowGroupOpen;
 
     // Number of values in bytes, resultOffsets, valueIsNull before scan().
-    int numValues = 0;
+    int numValues;
     // Number of result rows in scan() so far.
     private int numResults;
     // Content bytes to be returned in Block.
@@ -104,14 +104,12 @@ public class SliceDirectStreamReader
     // Result arrays from outputQualifyingSet.
     int[] outputRows;
     int[] resultInputNumbers;
-    
+
     public SliceDirectStreamReader(StreamDescriptor streamDescriptor)
     {
         this.streamDescriptor = requireNonNull(streamDescriptor, "stream is null");
     }
 
-    
-    
     @Override
     public void prepareNextRead(int batchSize)
     {
@@ -280,7 +278,7 @@ public class SliceDirectStreamReader
         rowGroupOpen = false;
     }
 
-        @Override
+    @Override
     public int erase(int begin, int end, int numResultsBeforeRowGroup, int numErasedFromInput)
     {
         if (block != null) {
@@ -289,14 +287,14 @@ public class SliceDirectStreamReader
         if (resultOffsets != null) {
             resultOffsets[0] = 0;
             resultOffsets[1] = 0;
-                                    }
+        }
         if (valueIsNull != null) {
             Arrays.fill(valueIsNull, false);
         }
         numValues = 0;
         return 0;
     }
-    
+
     @Override
     public int scan(int maxBytes)
             throws IOException
@@ -323,7 +321,8 @@ public class SliceDirectStreamReader
         int rowsInRange = end - posInRowGroup;
         if (presentStream == null) {
             numLengths = end;
-        } else {
+        }
+        else {
             if (nonNullRows == null || nonNullRows.length < end) {
                 nonNullRows = new int[end];
             }
@@ -360,9 +359,9 @@ public class SliceDirectStreamReader
                         addNullResult(i + posInRowGroup, activeIdx);
                     }
                 }
-                    else {
-                        // Non-null row in qualifying set.
-                        if (toSkip > 0) {
+                else {
+                    // Non-null row in qualifying set.
+                    if (toSkip > 0) {
                         dataStream.skip(toSkip);
                         toSkip = 0;
                     }
@@ -373,7 +372,7 @@ public class SliceDirectStreamReader
                         if (buffer == null) {
                             // The value to test is not fully contained in the buffer. Read it to tempBytes.
                             if (tempBytes == null || tempBytes.length < length) {
-                                tempBytes = new byte[(int)(length * 1.2)];
+                                tempBytes = new byte[(int) (length * 1.2)];
                             }
                             buffer = tempBytes;
                             dataStream.next(tempBytes, 0, length);
@@ -398,7 +397,7 @@ public class SliceDirectStreamReader
                         numResults++;
                     }
                     lengthIdx++;
-                    }
+                }
                 if (++activeIdx == numActive) {
                     for (int i2 = lengthIdx; i2 < numLengths; i2++) {
                         toSkip += lengths[i2];
@@ -414,7 +413,7 @@ public class SliceDirectStreamReader
                     toSkip += lengths[lengthIdx++];
                 }
             }
-        }   
+        }
         if (toSkip > 0) {
             dataStream.skip(toSkip);
         }
@@ -457,9 +456,9 @@ public class SliceDirectStreamReader
         System.arraycopy(buffer, pos, bytes, endOffset, length);
         resultOffsets[numValues + numResults + 2] = endOffset + length;
     }
-    
+
     void addResultFromStream(int length)
-        throws IOException
+            throws IOException
     {
         ensureResultBytes(length);
         ensureResultRows();
@@ -475,7 +474,7 @@ public class SliceDirectStreamReader
             bytes = Arrays.copyOf(bytes, Math.max(bytes.length * 2, bytes.length + length));
             block = null;
         }
-        }
+    }
 
     void ensureResultRows()
     {
@@ -487,7 +486,7 @@ public class SliceDirectStreamReader
             block = null;
         }
     }
-   
+
     @Override
     public Block getBlock(boolean mayReuse)
     {

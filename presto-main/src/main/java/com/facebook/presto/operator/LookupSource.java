@@ -57,7 +57,7 @@ public interface LookupSource
     {
         return false;
     }
-    
+
     default void addInput(Page page)
     {
         throw new UnsupportedOperationException();
@@ -67,5 +67,4 @@ public interface LookupSource
     {
         throw new UnsupportedOperationException();
     }
-
 }

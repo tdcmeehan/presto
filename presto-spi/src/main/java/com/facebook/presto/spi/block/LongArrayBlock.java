@@ -32,13 +32,13 @@ public class LongArrayBlock
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(LongArrayBlock.class).instanceSize();
 
     private int arrayOffset;
-    private  int positionCount;
+    private int positionCount;
     @Nullable
-    private  boolean[] valueIsNull;
-    private  long[] values;
+    private boolean[] valueIsNull;
+    private long[] values;
 
-    private  long sizeInBytes;
-    private  long retainedSizeInBytes;
+    private long sizeInBytes;
+    private long retainedSizeInBytes;
 
     public LongArrayBlock(int positionCount, Optional<boolean[]> valueIsNull, long[] values)
     {
@@ -69,7 +69,8 @@ public class LongArrayBlock
         sizeInBytes = (Long.BYTES + Byte.BYTES) * (long) positionCount;
         retainedSizeInBytes = INSTANCE_SIZE + sizeOf(valueIsNull) + sizeOf(values);
     }
-  public void Reset(int arrayOffset, int positionCount, boolean[] valueIsNull, long[] values)
+
+    public void Reset(int arrayOffset, int positionCount, boolean[] valueIsNull, long[] values)
     {
         if (arrayOffset < 0) {
             throw new IllegalArgumentException("arrayOffset is negative");
@@ -93,7 +94,6 @@ public class LongArrayBlock
         sizeInBytes = (Long.BYTES + Byte.BYTES) * (long) positionCount;
         retainedSizeInBytes = INSTANCE_SIZE + sizeOf(valueIsNull) + sizeOf(values);
     }
-
 
     @Override
     public long getSizeInBytes()
@@ -296,9 +296,10 @@ public class LongArrayBlock
     }
 
     @Override
-    public void getContents(BlockDecoder contents) {
-	contents.longs = values;
-	contents.valueIsNull = valueIsNull;
+    public void getContents(BlockDecoder contents)
+    {
+        contents.longs = values;
+        contents.valueIsNull = valueIsNull;
         contents.arrayOffset = arrayOffset;
     }
 
@@ -314,7 +315,7 @@ public class LongArrayBlock
             }
         }
         positionCount = base + numPositions;
-        }
+    }
 
     @Override
     public void erase(int begin, int end)
@@ -322,7 +323,7 @@ public class LongArrayBlock
         if (end > positionCount || begin < 0 || begin > end || arrayOffset != 0) {
             throw new IllegalArgumentException("begin, end not valid");
         }
-                    int numMove = positionCount - end;
+        int numMove = positionCount - end;
         for (int i = end; i < numMove; i++) {
             values[begin + i] = values[end + i];
             if (valueIsNull != null) {

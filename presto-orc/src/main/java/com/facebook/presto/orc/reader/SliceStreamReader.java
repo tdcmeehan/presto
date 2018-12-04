@@ -113,15 +113,15 @@ public class SliceStreamReader
     {
         return currentReader.getInputQualifyingSet();
     }
-    
+
     @Override
     public QualifyingSet getOutputQualifyingSet()
     {
         return currentReader.getOutputQualifyingSet();
     }
-    
+
     @Override
-public void setFilterAndChannel(Filter filter, int channel)
+    public void setFilterAndChannel(Filter filter, int channel)
     {
         directReader.setFilterAndChannel(filter, channel);
     }
@@ -143,7 +143,7 @@ public void setFilterAndChannel(Filter filter, int channel)
     {
         return directReader.getFilter();
     }
-    
+
     @Override
     public int erase(int begin, int end, int numValuesBeforeRowGroup, int numErasedFromInput)
     {
@@ -152,9 +152,9 @@ public void setFilterAndChannel(Filter filter, int channel)
         }
         return currentReader.erase(begin, end, numValuesBeforeRowGroup, numErasedFromInput);
     }
-    
+
     public int scan(int maxResultBytes)
-        throws IOException
+            throws IOException
     {
         return currentReader.scan(maxResultBytes);
     }

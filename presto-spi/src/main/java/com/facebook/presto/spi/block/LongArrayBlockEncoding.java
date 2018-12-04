@@ -80,27 +80,27 @@ public class LongArrayBlockEncoding
     @Override
     public void addValues(BlockDecoder contents, int[] rows, int firstRow, int numRows, EncodingState state)
     {
-                long[] longs = contents.longs;
-                int[] map = contents.rowNumberMap;
-                int longsOffset = state.valueOffset + 5 + state.numValues * 8;
-                        for (int i = 0; i < numRows; i++) {
-                            state.topLevelBuffer.setLong(longsOffset + i *8, longs[map[rows[i + firstRow]]]);
-                        }
-                        state.numValues += numRows;
+        long[] longs = contents.longs;
+        int[] map = contents.rowNumberMap;
+        int longsOffset = state.valueOffset + 5 + state.numValues * 8;
+        for (int i = 0; i < numRows; i++) {
+            state.topLevelBuffer.setLong(longsOffset + i * 8, longs[map[rows[i + firstRow]]]);
+        }
+        state.numValues += numRows;
     }
 
-    
     @Override
     public int prepareFinish(EncodingState state, int newStartInBuffer)
     {
         state.newStartInBuffer = newStartInBuffer;
         return finalSize(state);
     }
+
     int finalSize(EncodingState state)
     {
-        return         8 * state.numValues + (state.valueOffset - state.startInBuffer) + 5;
+        return 8 * state.numValues + (state.valueOffset - state.startInBuffer) + 5;
     }
-    
+
     @Override
     public void finish(EncodingState state, Slice buffer)
     {
@@ -110,10 +110,10 @@ public class LongArrayBlockEncoding
             return;
         }
         int size = finalSize(state);
-        System.arraycopy((byte[])state.topLevelBuffer.getBase(),
-                         state.startInBuffer,
-                         (byte[])buffer.getBase(),
-                         state.newStartInBuffer,
-                         size);
+        System.arraycopy((byte[]) state.topLevelBuffer.getBase(),
+                state.startInBuffer,
+                (byte[]) buffer.getBase(),
+                state.newStartInBuffer,
+                size);
     }
 }

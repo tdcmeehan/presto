@@ -78,8 +78,8 @@ public final class HiveQueryRunner
     {
         assertEquals(DateTimeZone.getDefault(), TIME_ZONE, "Timezone not configured correctly. Add -Duser.timezone=America/Bahia_Banderas to your JVM arguments");
 
-	// One worker, single threaded.
-	DistributedQueryRunner queryRunner = new DistributedQueryRunner(createSession(), 1, extraProperties);
+        // One worker, single threaded.
+        DistributedQueryRunner queryRunner = new DistributedQueryRunner(createSession(), 1, extraProperties);
 
         try {
             queryRunner.installPlugin(new TpchPlugin());
@@ -102,8 +102,8 @@ public final class HiveQueryRunner
                     .put("hive.assume-canonical-partition-keys", "true")
                     .put("hive.collect-column-statistics-on-write", "true")
                     .put("hive.storage-format", "ORC") // so that there's no minimum split size for the file
-		.put("hive.orc.optimized-writer.enabled", "true")
-		.put("hive.orc.writer.validation-percentage", "0.0")
+                    .put("hive.orc.optimized-writer.enabled", "true")
+                    .put("hive.orc.writer.validation-percentage", "0.0")
                     .build();
             Map<String, String> hiveBucketedProperties = ImmutableMap.<String, String>builder()
                     .putAll(hiveProperties)

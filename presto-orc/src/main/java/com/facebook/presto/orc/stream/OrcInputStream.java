@@ -49,7 +49,7 @@ public final class OrcInputStream
 
     private byte[] buffer;
     private final LocalMemoryContext bufferMemoryUsage;
-    private boolean isUncompressed = false;
+    private boolean isUncompressed;
 
     public OrcInputStream(
             OrcDataSourceId orcDataSourceId,
@@ -112,9 +112,9 @@ public final class OrcInputStream
 
     public int getOffsetInBuffer()
     {
-        return (int)current.position();
+        return (int) current.position();
     }
-    
+
     @Override
     public int read()
             throws IOException

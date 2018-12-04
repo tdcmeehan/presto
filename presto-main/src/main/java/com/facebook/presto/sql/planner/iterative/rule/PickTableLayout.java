@@ -336,7 +336,7 @@ public class PickTableLayout
                     Expression predicateWithoutTupleDomain = combineConjuncts(
                             decomposedPredicate.getRemainingExpression(),
                             filterNonDeterministicConjuncts(predicate));
-                    
+
                     if (!TRUE_LITERAL.equals(resultingPredicate)) {
                         return new FilterNode(idAllocator.getNextId(), tableScan, resultingPredicate, predicateWithoutTupleDomain);
                     }

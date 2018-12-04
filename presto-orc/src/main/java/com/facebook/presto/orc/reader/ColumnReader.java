@@ -18,7 +18,7 @@ import com.facebook.presto.orc.QualifyingSet;
 import com.facebook.presto.spi.block.Block;
 
 abstract class ColumnReader
-    implements StreamReader
+        implements StreamReader
 {
     QualifyingSet inputQualifyingSet;
     QualifyingSet outputQualifyingSet;
@@ -37,12 +37,10 @@ abstract class ColumnReader
         inputQualifyingSet = qualifyingSet;
     }
 
-    
     public QualifyingSet getOutputQualifyingSet()
     {
         return outputQualifyingSet;
     }
-
 
     @Override
     public void setFilterAndChannel(Filter filter, int channel)

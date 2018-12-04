@@ -194,6 +194,6 @@ public class MergingPageOutput
 
     public int getMinPageSizeInBytes()
     {
-        return (int)minPageSizeInBytes;
+        return (int) minPageSizeInBytes;
     }
 }

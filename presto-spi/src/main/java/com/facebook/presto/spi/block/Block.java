@@ -162,7 +162,8 @@ public interface Block
      */
     int getPositionCount();
 
-        default void setPositionCount(int newPositionCount) {
+    default void setPositionCount(int newPositionCount)
+    {
         throw new UnsupportedOperationException(getClass().getName());
     }
 
@@ -296,15 +297,15 @@ public interface Block
     /* Initializes @code contents to reference the values of the block.
      * @code contents will point to null indicators, and value arrays or
      * Slice/offsets, depending on the block.
-     * This is defined only for blocks that directly hold data, e.g. are not 
-     * Dictionaries or RunLengthEncodedBlocks. This is used when flattening 
+     * This is defined only for blocks that directly hold data, e.g. are not
+     * Dictionaries or RunLengthEncodedBlocks. This is used when flattening
      * dictionaries and run length encodings. */
     default void getContents(BlockDecoder contents)
     {
         throw new UnsupportedOperationException(getClass().getName());
     }
 
-    /* Writes the elements at positions to consecutive positions starting at 
+    /* Writes the elements at positions to consecutive positions starting at
      * base. E.g. value[base] = value[positions[0]]. */
     default void compact(int[] positions, int offset, int numPositions)
     {
@@ -321,10 +322,8 @@ public interface Block
      * works as if offsets were {0, 1, ... positionCount}. This adds
      * the pairwise corresponding element's size to each element in
      * sizes[].*/
-    default void addElementSizes(int offsets[], int[] sizes, IntArrayAllocator intArrayAllocator)
+    default void addElementSizes(int[] offsets, int[] sizes, IntArrayAllocator intArrayAllocator)
     {
         throw new UnsupportedOperationException(getClass().getName());
     }
 }
-
-

@@ -39,17 +39,18 @@ public interface StreamReader
     {
         return null;
     }
-    
+
     default QualifyingSet getOutputQualifyingSet()
     {
         return null;
     }
-    
+
     /* If filter is non-null, sets the output QualifyingSet by
      * applying filter to the rows in the input QualifyingSet. If
      * channel is not -1, appends the values in the post-filter rows
      * to a Block. The Block can be retrieved by getBlock(). */
-    default void setFilterAndChannel(Filter filter, int channel)    {
+    default void setFilterAndChannel(Filter filter, int channel)
+    {
         throw new UnsupportedOperationException();
     }
 
@@ -60,7 +61,7 @@ public interface StreamReader
     {
         return false;
     }
-    
+
     default int getChannel()
     {
         return -1;
@@ -75,8 +76,9 @@ public interface StreamReader
     {
         return null;
     }
-    
-    default int getValueSize() {
+
+    default int getValueSize()
+    {
         return 8;
     }
 
@@ -84,13 +86,13 @@ public interface StreamReader
     {
         throw new UnsupportedOperationException();
     }
-    
+
     default int scan(int maxResultBytes)
-        throws IOException
+            throws IOException
     {
         throw new UnsupportedOperationException();
     }
-    
+
     Block readBlock(Type type)
             throws IOException;
 

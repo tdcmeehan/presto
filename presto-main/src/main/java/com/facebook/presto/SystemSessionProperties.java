@@ -528,8 +528,10 @@ public final class SystemSessionProperties
                                 true,
                                 false),
                 booleanProperty(
-                                ARIA_REUSE_PAGES,                                                                                     "Enable Aria Presto! reuse of Pages",
-                                true,                                                                                     false),
+                                ARIA_REUSE_PAGES,
+                                "Enable Aria Presto! reuse of Pages",
+                                true,
+                                false),
                 booleanProperty(
                                 ARIA_REORDER,
                                 "Enable Aria Presto! reorder of filters",
@@ -931,16 +933,14 @@ public final class SystemSessionProperties
         return session.getSystemProperty(ARIA_REUSE_PAGES, Boolean.class);
     }
 
-        public static boolean ariaReorderFilters(Session session)
+    public static boolean ariaReorderFilters(Session session)
     {
         return session.getSystemProperty(ARIA_REORDER, Boolean.class);
     }
-        public static int ariaFlags(Session session)
+    public static int ariaFlags(Session session)
     {
         return session.getSystemProperty(ARIA_FLAGS, Integer.class);
     }
-
-    
     public static boolean isIgnoreStatsCalculatorFailures(Session session)
     {
         return session.getSystemProperty(IGNORE_STATS_CALCULATOR_FAILURES, Boolean.class);

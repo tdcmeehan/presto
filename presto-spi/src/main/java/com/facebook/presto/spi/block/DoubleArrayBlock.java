@@ -32,13 +32,13 @@ public class DoubleArrayBlock
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(DoubleArrayBlock.class).instanceSize();
 
     private int arrayOffset;
-    private  int positionCount;
+    private int positionCount;
     @Nullable
-    private  boolean[] valueIsNull;
-    private  double[] values;
+    private boolean[] valueIsNull;
+    private double[] values;
 
-    private  long sizeInBytes;
-    private  long retainedSizeInBytes;
+    private long sizeInBytes;
+    private long retainedSizeInBytes;
 
     public DoubleArrayBlock(int positionCount, Optional<boolean[]> valueIsNull, double[] values)
     {
@@ -69,7 +69,8 @@ public class DoubleArrayBlock
         sizeInBytes = (Long.BYTES + Byte.BYTES) * (long) positionCount;
         retainedSizeInBytes = INSTANCE_SIZE + sizeOf(valueIsNull) + sizeOf(values);
     }
-  public void Reset(int arrayOffset, int positionCount, boolean[] valueIsNull, double[] values)
+
+    public void Reset(int arrayOffset, int positionCount, boolean[] valueIsNull, double[] values)
     {
         if (arrayOffset < 0) {
             throw new IllegalArgumentException("arrayOffset is negative");
@@ -93,7 +94,6 @@ public class DoubleArrayBlock
         sizeInBytes = (Long.BYTES + Byte.BYTES) * (long) positionCount;
         retainedSizeInBytes = INSTANCE_SIZE + sizeOf(valueIsNull) + sizeOf(values);
     }
-
 
     @Override
     public long getSizeInBytes()
@@ -142,10 +142,10 @@ public class DoubleArrayBlock
         if (offset != 0) {
             throw new IllegalArgumentException("offset must be zero");
         }
-        return (long)values[position + arrayOffset];
+        return (long) values[position + arrayOffset];
     }
 
-        public double getDouble(int position, int offset)
+    public double getDouble(int position, int offset)
     {
         checkReadablePosition(position);
         if (offset != 0) {
@@ -163,7 +163,7 @@ public class DoubleArrayBlock
         if (offset != 0) {
             throw new IllegalArgumentException("offset must be zero");
         }
-        return toIntExact((long)values[position + arrayOffset]);
+        return toIntExact((long) values[position + arrayOffset]);
     }
 
     @Override
@@ -217,7 +217,7 @@ public class DoubleArrayBlock
     public void writePositionTo(int position, BlockBuilder blockBuilder)
     {
         checkReadablePosition(position);
-        blockBuilder.writeLong((long)values[position + arrayOffset]);
+        blockBuilder.writeLong((long) values[position + arrayOffset]);
         blockBuilder.closeEntry();
     }
 
@@ -299,8 +299,9 @@ public class DoubleArrayBlock
     }
 
     @Override
-    public void getContents(BlockDecoder contents) {
-	contents.doubles = values;
-	contents.valueIsNull = valueIsNull;
+    public void getContents(BlockDecoder contents)
+    {
+        contents.doubles = values;
+        contents.valueIsNull = valueIsNull;
     }
 }

@@ -320,7 +320,7 @@ public class TupleDomainOrcPredicate<C>
             }
             ValueSet values = predicateDomain.getValues();
             if (values instanceof SortedRangeSet) {
-                List<Range> ranges = ((SortedRangeSet)values).getOrderedRanges();
+                List<Range> ranges = ((SortedRangeSet) values).getOrderedRanges();
                 Range range = ranges.get(0);
                 Type type = predicateDomain.getType();
                 Filter filter = null;
@@ -335,7 +335,6 @@ public class TupleDomainOrcPredicate<C>
                     return null;
                 }
                 filters.put(columnReference.getOrdinal(), filter);
-
             }
             else {
                 return null;
@@ -344,7 +343,7 @@ public class TupleDomainOrcPredicate<C>
         return filters;
     }
 
-    static private Filter BigintRangesToFilter(List<Range> ranges)
+    private static Filter BigintRangesToFilter(List<Range> ranges)
     {
         if (ranges.size() != 1) {
             return null;
@@ -353,9 +352,9 @@ public class TupleDomainOrcPredicate<C>
         Marker low = range.getLow();
         Marker high = range.getHigh();
         long lowerLong = low.isLowerUnbounded() ? Long.MIN_VALUE
-            : ((Long)low.getValue()).longValue();
+                : ((Long) low.getValue()).longValue();
         long upperLong = high.isUpperUnbounded() ? Long.MAX_VALUE
-            : ((Long)high.getValue()).longValue();
+                : ((Long) high.getValue()).longValue();
         if (high.getBound() == Marker.Bound.BELOW) {
             --upperLong;
         }
@@ -365,7 +364,7 @@ public class TupleDomainOrcPredicate<C>
         return new Filters.BigintRange(lowerLong, upperLong);
     }
 
-    static private Filter VarcharRangesToFilter(List<Range> ranges)
+    private static Filter VarcharRangesToFilter(List<Range> ranges)
     {
         if (ranges.size() != 1) {
             return null;
@@ -375,11 +374,11 @@ public class TupleDomainOrcPredicate<C>
         Marker high = range.getHigh();
         Marker.Bound lowerBound = low.getBound();
         Marker.Bound upperBound = high.getBound();
-        Slice lowerValue = low.isLowerUnbounded() ? null : (Slice)low.getValue(); 
-        Slice upperValue = high.isUpperUnbounded() ? null : (Slice)high.getValue();
+        Slice lowerValue = low.isLowerUnbounded() ? null : (Slice) low.getValue();
+        Slice upperValue = high.isUpperUnbounded() ? null : (Slice) high.getValue();
         return new Filters.BytesRange(lowerValue == null ? null : lowerValue.getBytes(),
-                                      lowerBound == Marker.Bound.EXACTLY,
-                                      upperValue == null ? null : upperValue.getBytes(),
-                                      upperBound == Marker.Bound.EXACTLY);
+                lowerBound == Marker.Bound.EXACTLY,
+                upperValue == null ? null : upperValue.getBytes(),
+                upperBound == Marker.Bound.EXACTLY);
     }
-    }
+}

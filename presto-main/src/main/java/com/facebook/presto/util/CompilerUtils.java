@@ -58,9 +58,6 @@ public final class CompilerUtils
         return defineClass(classDefinition, superType, new DynamicClassLoader(parentClassLoader, callSiteBindings));
     }
 
-
-
-
     public static <T> Class<? extends T> defineClass(ClassDefinition classDefinition, Class<T> superType, DynamicClassLoader classLoader)
     {
         log.debug("Defining class: %s", classDefinition.getName());

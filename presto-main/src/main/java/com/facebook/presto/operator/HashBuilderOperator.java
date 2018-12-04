@@ -599,7 +599,6 @@ public class HashBuilderOperator
 
     private LookupSourceSupplier buildLookupSource()
     {
-
         LookupSourceSupplier partition;
         if (ariaBuild != null) {
             partition = ariaBuild.createLookupSourceSupplier(operatorContext.getSession(), hashChannels, preComputedHashChannel, filterFunctionFactory, sortChannel, searchFunctionFactories, Optional.of(outputChannels));
@@ -610,7 +609,7 @@ public class HashBuilderOperator
             checkState(lookupSourceSupplier == null, "lookupSourceSupplier is already set");
             this.lookupSourceSupplier = partition;
         }
-            return partition;
+        return partition;
     }
 
     @Override

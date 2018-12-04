@@ -20,14 +20,18 @@ public class PageSourceOptions
     private final FilterFunction[] filterFunctions;
     private final boolean reorderFilters;
     private final int targetBytes;
-    
+
     public class FilterFunction
     {
         private int[] inputChannels;
         private int initialCost = 1;
-        public FilterFunction(int[] inputChannels, int initialCost) {
+
+        public FilterFunction(int[] inputChannels, int initialCost)
+        {
         }
-        public int filter(Page page,int[] inputRows, int[] outputRows) {
+
+        public int filter(Page page, int[] inputRows, int[] outputRows)
+        {
             return 0;
         }
     }

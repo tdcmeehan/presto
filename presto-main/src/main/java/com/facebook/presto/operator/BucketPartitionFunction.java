@@ -50,6 +50,6 @@ public class BucketPartitionFunction
 
     public void getPartitions(int partitionCount, Page page, int[] partitionsOut)
     {
-        bucketFunction.getBuckets(        partitionCount, page, partitionsOut);
+        bucketFunction.getBuckets(partitionCount, page, partitionsOut);
     }
 }

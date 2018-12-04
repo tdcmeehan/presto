@@ -62,7 +62,7 @@ public class OrcPageSource
 
     private final AggregatedMemoryContext systemMemoryContext;
 
-    private boolean useAriaScan = false;
+    private boolean useAriaScan;
 
     private final FileFormatDataSourceStats stats;
 
@@ -117,7 +117,7 @@ public class OrcPageSource
     // if inputToOutputChannel[i[ == -1. If inputToOutputChannel is
     // null, the output Page layout is unaffected.
     @Override
-    public boolean pushdownFilterAndProjection(PageSourceOptions options) 
+    public boolean pushdownFilterAndProjection(PageSourceOptions options)
     {
         useAriaScan = recordReader.pushdownFilterAndProjection(options, hiveColumnIndexes);
         return useAriaScan;

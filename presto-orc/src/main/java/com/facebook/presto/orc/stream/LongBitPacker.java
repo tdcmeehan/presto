@@ -130,11 +130,10 @@ public final class LongBitPacker
                 unpackGeneric(buffer, offset, len, bitSize, input);
         }
         for (int i = 0; i < numOffsets; i++) {
-            buffer[i] = buffer[offsets[firstOffset + i] - offsetBias]; 
+            buffer[i] = buffer[offsets[firstOffset + i] - offsetBias];
         }
     }
 
-    
     private static void unpackGeneric(long[] buffer, int offset, int len, int bitSize, InputStream input)
             throws IOException
     {
@@ -370,7 +369,7 @@ public final class LongBitPacker
             input.skipFully(len);
         }
     }
-    
+
     private void unpack32(long[] buffer, int offset, int len, InputStream input)
             throws IOException
     {

@@ -30,23 +30,23 @@ public class EncodingState
     int bytesInBuffer;
     int valueOffset;
     Slice contentBuffer;
-    long totalValues = 0;
-    long totalBytes = 0;
+    long totalValues;
+    long totalBytes;
     String encodingName;
 
     public int getBytesInBuffer()
     {
         return bytesInBuffer;
     }
-    
+
     public void setBuffer(Slice buffer)
     {
         numValues = 0;
         anyNulls = false;
         topLevelBuffer = buffer;
-                byte[] nameBytes = encodingName.getBytes(UTF_8);
-                buffer.setInt(startInBuffer, nameBytes.length);
-                buffer.setBytes(startInBuffer + 4, Slices.wrappedBuffer(nameBytes));
-                valueOffset = startInBuffer + 4 + nameBytes.length;
+        byte[] nameBytes = encodingName.getBytes(UTF_8);
+        buffer.setInt(startInBuffer, nameBytes.length);
+        buffer.setBytes(startInBuffer + 4, Slices.wrappedBuffer(nameBytes));
+        valueOffset = startInBuffer + 4 + nameBytes.length;
     }
 }

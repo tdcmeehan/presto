@@ -162,7 +162,7 @@ public class TaskExecutor
         // config.minDriversPerTask = 1;
         // config.maxDriversPerTask = 1;
         // config.taskConcurrency = 1;
-        // Single threaded 
+        // Single threaded
         this(1 /*requireNonNull(config, "config is null").getMaxWorkerThreads() */,
                             1 /*config.getMinDrivers() */,
                             1 /*config.getMinDriversPerTask() */,

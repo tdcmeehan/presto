@@ -17,8 +17,8 @@ import com.facebook.presto.operator.scalar.CombineHashFunction;
 import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockDecoder;
-import com.facebook.presto.spi.block.LongArrayBlock;
 import com.facebook.presto.spi.block.IntArrayAllocator;
+import com.facebook.presto.spi.block.LongArrayBlock;
 import com.facebook.presto.spi.type.AbstractLongType;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.planner.optimizations.HashGenerationOptimizer;
@@ -40,12 +40,12 @@ public class InterpretedHashGenerator
     private long[] hashes;
     private BlockDecoder contents;
     private IntArrayAllocator intArrayAllocator;
-    
+
     public InterpretedHashGenerator(List<Type> hashChannelTypes, List<Integer> hashChannels)
     {
         this(hashChannelTypes, requireNonNull(hashChannels).stream().mapToInt(i -> i).toArray());
     }
-    
+
     public InterpretedHashGenerator(List<Type> hashChannelTypes, int[] hashChannels)
     {
         this.hashChannels = requireNonNull(hashChannels, "hashChannels is null");
@@ -76,12 +76,11 @@ public class InterpretedHashGenerator
         if (hashes == null || hashes.length < positionCount) {
             hashes = new long[positionCount];
         }
-        long result ;
+        long result;
         for (int position = 0; position < positionCount; position++) {
-            hashes[position] =         HashGenerationOptimizer.INITIAL_HASH_VALUE;
+            hashes[position] = HashGenerationOptimizer.INITIAL_HASH_VALUE;
         }
         for (int i = 0; i < hashChannels.length; i++) {
-
             Type type = hashChannelTypes.get(i);
             Block block = page.getBlock(i);
             contents.decodeBlock(block, intArrayAllocator);
@@ -92,11 +91,11 @@ public class InterpretedHashGenerator
                 boolean[] nulls = contents.valueIsNull;
                 for (int position = 0; position < positionCount; position++) {
                     int valueIdx = longsMap[position];
-                    hashes[position] = 
-                        CombineHashFunction.getHash(hashes[position],
-                                                    (nulls == null || !nulls[valueIdx])
-                                                    ?  AbstractLongType.hash(longs[valueIdx])
-                                                    : TypeUtils.NULL_HASH_CODE);
+                    hashes[position] =
+                            CombineHashFunction.getHash(hashes[position],
+                                    (nulls == null || !nulls[valueIdx])
+                                            ? AbstractLongType.hash(longs[valueIdx])
+                                            : TypeUtils.NULL_HASH_CODE);
                 }
             }
             else {
@@ -104,9 +103,9 @@ public class InterpretedHashGenerator
                     hashes[position] = CombineHashFunction.getHash(hashes[position], TypeUtils.hashPosition(type, block, position));
                 }
             }
-        }   
+        }
     }
-    
+
     @Override
     public String toString()
     {

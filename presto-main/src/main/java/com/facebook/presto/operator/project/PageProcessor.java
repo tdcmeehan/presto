@@ -28,12 +28,11 @@ import io.airlift.slice.SizeOf;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
-import static java.lang.Math.max;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Collectors;import java.util.HashMap;
 import java.util.function.Function;
 
 import static com.facebook.presto.operator.project.PageProcessorOutput.EMPTY_PAGE_PROCESSOR_OUTPUT;
@@ -89,9 +88,10 @@ public class PageProcessor
             }
             List<Integer> inputs = projection.getInputChannels().getInputChannels();
             if (!inputToOutput.containsKey(inputs.get(0))) {
-                inputToOutput.put(inputs.get(0), new Integer(i));
-                maxInputChannel = Math.max(maxInputChannel, inputs.get(0).intValue());
-            } else {
+                inputToOutput.put(inputs.get(0), i);
+                maxInputChannel = Math.max(maxInputChannel, inputs.get(0));
+            }
+            else {
                 allAreInputPageProjections = false;
                 break;
             }
@@ -100,7 +100,7 @@ public class PageProcessor
             inputToOutputChannel = new int[maxInputChannel + 1];
             Arrays.fill(inputToOutputChannel, -1);
             for (Map.Entry<Integer, Integer> entry : inputToOutput.entrySet()) {
-                inputToOutputChannel[entry.getKey().intValue()] = entry.getValue().intValue();
+                inputToOutputChannel[entry.getKey()] = entry.getValue();
             }
         }
         else {

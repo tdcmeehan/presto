@@ -111,7 +111,7 @@ public class VariableWidthBlock
         return positionCount;
     }
 
-        @Override
+    @Override
     public void setPositionCount(int positionCount)
     {
         this.positionCount = positionCount;
@@ -205,11 +205,12 @@ public class VariableWidthBlock
         return new VariableWidthBlock(0, length, newSlice, newOffsets, newValueIsNull);
     }
 
-        @Override
-    public void getContents(BlockDecoder contents) {
-	contents.slice = slice;
+    @Override
+    public void getContents(BlockDecoder contents)
+    {
+        contents.slice = slice;
         contents.offsets = offsets;
-	contents.valueIsNull = valueIsNull;
+        contents.valueIsNull = valueIsNull;
         contents.arrayOffset = arrayOffset;
     }
 
@@ -229,21 +230,21 @@ public class VariableWidthBlock
             }
         }
         positionCount = base + numPositions;
-        }
+    }
 
     public void erase(int begin, int end)
     {
         if (end > positionCount || begin < 0 || begin > end || arrayOffset != 0) {
             throw new IllegalArgumentException("begin, end not valid");
         }
-                    int numMove = positionCount - end;
-                    int toOffset = offsets[begin];
-                    
-                    for (int i = end; i < numMove; i++) {
-                        int len = offsets[i + 1] - offsets[i];
-                        offsets[begin + i] = toOffset;
-                        slice.getBytes(toOffset, slice, offsets[i], len);
-                        toOffset += len;
+        int numMove = positionCount - end;
+        int toOffset = offsets[begin];
+
+        for (int i = end; i < numMove; i++) {
+            int len = offsets[i + 1] - offsets[i];
+            offsets[begin + i] = toOffset;
+            slice.getBytes(toOffset, slice, offsets[i], len);
+            toOffset += len;
             if (valueIsNull != null) {
                 valueIsNull[begin + i] = valueIsNull[end + i];
             }

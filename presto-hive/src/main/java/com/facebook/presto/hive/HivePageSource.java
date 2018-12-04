@@ -110,8 +110,8 @@ public class HivePageSource
     private final Function<Block, Block>[] coercers;
 
     private final ConnectorPageSource delegate;
-    private boolean filterAndProjectPushedDown = false;
-    
+    private boolean filterAndProjectPushedDown;
+
     public HivePageSource(
             List<ColumnMapping> columnMappings,
             Optional<BucketAdaptation> bucketAdaptation,
@@ -709,10 +709,10 @@ public class HivePageSource
     }
 
     @Override
-    public boolean pushdownFilterAndProjection(PageSourceOptions options) 
+    public boolean pushdownFilterAndProjection(PageSourceOptions options)
     {
         if (delegate != null) {
-            filterAndProjectPushedDown =  delegate.pushdownFilterAndProjection(options);
+            filterAndProjectPushedDown = delegate.pushdownFilterAndProjection(options);
             return filterAndProjectPushedDown;
         }
         return false;

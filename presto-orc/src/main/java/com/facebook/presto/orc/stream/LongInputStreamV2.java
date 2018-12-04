@@ -62,13 +62,12 @@ public class LongInputStreamV2
     private long[] valuesOut;
     private int valuesFill;
     private int numResults;
-    
+
     // readValues sets this to true to indicate that all operations
     // needed by scan() where performed inside readValues. If false,
     // scan() must look at the literals.
-    private boolean scanDone = false;
-    
-        
+    private boolean scanDone;
+
     public LongInputStreamV2(OrcInputStream input, boolean signed, boolean skipCorrupt)
     {
         this.input = input;
@@ -103,8 +102,9 @@ public class LongInputStreamV2
             readDeltaValues(firstByte);
         }
     }
+
     int trapOffsetIdx = 100000;
-    
+
     // Applies filter to values at numOffsets first positions in
     // offsets. If the filter is true for the value at offsets[i][,
     // appends inputNumbers[i] to inputNumbersOut and rowNumbers[i] to
@@ -113,8 +113,8 @@ public class LongInputStreamV2
     // value at offsets[i] is used instead. If inputNumbers is null, i
     // is used instead of inputNumbers[i]. valuesOut may be null, in
     // which case the value is discarded after the filter. Returns the number of values written into the output arrays.
-    public int scan(Filter filter, int[]offsets, int numOffsets, int endOffset, int[] rowNumbers, int[] inputNumbers, int[] rowNumbersOut, int[] inputNumbersOut, long[] valuesOut, int valuesFill)
-        throws IOException
+    public int scan(Filter filter, int[] offsets, int numOffsets, int endOffset, int[] rowNumbers, int[] inputNumbers, int[] rowNumbersOut, int[] inputNumbersOut, long[] valuesOut, int valuesFill)
+            throws IOException
     {
         this.filter = filter;
         this.offsets = offsets;
@@ -150,7 +150,7 @@ public class LongInputStreamV2
     // Apply filter to values materialized in literals.
     private void scanLiterals()
     {
-        for (;;) {
+        for (; ; ) {
             if (offsetIdx >= numOffsets) {
                 return;
             }
@@ -173,8 +173,8 @@ public class LongInputStreamV2
     {
         if (rowNumbersOut != null) {
             rowNumbersOut[numResults] = inputRowNumbers == null
-                ? offsets[offsetIdx] 
-                : inputRowNumbers[offsetIdx];
+                    ? offsets[offsetIdx]
+                    : inputRowNumbers[offsetIdx];
             inputNumbersOut[numResults] = inputNumbers == null ? offsetIdx : inputNumbers[offsetIdx];
         }
         if (valuesOut != null) {
@@ -183,7 +183,6 @@ public class LongInputStreamV2
         ++numResults;
     }
 
-    
     // This comes from the Apache Hive ORC code
     private void readDeltaValues(int firstByte)
             throws IOException
@@ -380,7 +379,7 @@ public class LongInputStreamV2
                 packer.unpackAtOffsets(literals, numLiterals, length, fixedBits, offsets, offsetIdx, numInRange, currentRunOffset, input);
                 if (signed) {
                     for (int i = 0; i < numInRange; i++) {
-                    literals[numLiterals + i] = LongDecode.zigzagDecode(literals[numLiterals + i]);
+                        literals[numLiterals + i] = LongDecode.zigzagDecode(literals[numLiterals + i]);
                     }
                 }
                 for (int i = 0; i < numInRange; i++) {
@@ -451,7 +450,7 @@ public class LongInputStreamV2
                 return;
             }
         }
-            // repeat the value for length times
+        // repeat the value for length times
         for (int i = 0; i < length; i++) {
             literals[numLiterals++] = val;
         }
@@ -475,7 +474,7 @@ public class LongInputStreamV2
         int position = Arrays.binarySearch(offsets, offsetIdx, last, limit);
         return position > 0 ? position - offsetIdx : (-position - 1) - offsetIdx;
     }
-    
+
     /**
      * Read n bytes in big endian order and convert to long.
      */
@@ -511,8 +510,8 @@ public class LongInputStreamV2
         return LongStreamV2Checkpoint.class;
     }
 
-    static boolean enableSeekInBuffer = true; 
-    
+    static boolean enableSeekInBuffer = true;
+
     @Override
     public void seekToCheckpoint(LongStreamCheckpoint checkpoint)
             throws IOException
@@ -551,7 +550,7 @@ public class LongInputStreamV2
                 // A skip of multiple runs can take place at seeking
                 // to checkpoint. Keep track of the start of the run
                 // in literals for use by next scan().
-                currentRunOffset += (int)consume;
+                currentRunOffset += (int) consume;
             }
         }
     }

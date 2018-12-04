@@ -70,6 +70,8 @@
         <air.test.jvmsize>2g</air.test.jvmsize>
 
         <air.javadoc.lint>-missing</air.javadoc.lint>
+
+        <air.check.fail-duplicate-finder>false</air.check.fail-duplicate-finder>
     </properties>
 
     <modules>

@@ -55,16 +55,14 @@ public class FilterNode
         this.predicate = predicate;
         this.predicateWithoutTupleDomain = null;
     }
-        
 
-    
     @JsonProperty("predicate")
     public Expression getPredicate()
     {
         return predicate;
     }
 
-        @JsonProperty("predicateWithoutTupleDomain")
+    @JsonProperty("predicateWithoutTupleDomain")
     public Expression getPredicateWithoutTupleDomain()
     {
         return predicateWithoutTupleDomain;

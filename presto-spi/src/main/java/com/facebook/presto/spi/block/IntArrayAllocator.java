@@ -15,26 +15,25 @@ package com.facebook.presto.spi.block;
 
 import java.util.ArrayList;
 
-public class IntArrayAllocator {
+public class IntArrayAllocator
+{
     ArrayList arrays = new ArrayList();
-
 
     public int[] getIntArray(int size)
     {
-	if (arrays.isEmpty())
-	    {
-		return new int[size];
-	    }
-	int[] array = (int[])arrays.get(arrays.size() - 1);
+        if (arrays.isEmpty()) {
+            return new int[size];
+        }
+        int[] array = (int[]) arrays.get(arrays.size() - 1);
         arrays.remove(arrays.size() - 1);
-	if (array.length >= size) {
-		return array;
-	    }
-	return new int[size];
+        if (array.length >= size) {
+            return array;
+        }
+        return new int[size];
     }
 
     public void store(int[] array)
     {
-	arrays.add(array);
+        arrays.add(array);
     }
 }

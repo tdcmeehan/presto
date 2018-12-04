@@ -44,14 +44,14 @@ public interface BlockEncoding
     {
         return Optional.empty();
     }
-    
+
     default int reserveBytesInBuffer(BlockDecoder contents, int numValues, int startInBuffer, EncodingState state)
     {
         throw new UnsupportedOperationException();
     }
 
     default void addValues(BlockDecoder contents, int[] rows, int firstRow, int numRows, EncodingState state)
-            {
+    {
         throw new UnsupportedOperationException();
     }
 
@@ -68,4 +68,3 @@ public interface BlockEncoding
         throw new UnsupportedOperationException();
     }
 }
-

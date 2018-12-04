@@ -116,7 +116,7 @@ public class OrcRecordReader
     private final Optional<StatisticsValidation> stripeStatisticsValidation;
     private final Optional<StatisticsValidation> fileStatisticsValidation;
     private OrcPredicate predicate;
-    
+
     // Number of complete rows in result Blocks in StreamReaders.
     int numRowsInResult;
 
@@ -124,18 +124,18 @@ public class OrcRecordReader
 
     QualifyingSet initialQualifyingSet = new QualifyingSet();
     QualifyingSet tempQualifyingSet;
-    
-    boolean reusePages = false;
-    boolean reorderFilters = false;
+
+    boolean reusePages;
+    boolean reorderFilters;
     Page reusedPage;
     Block[] reusedPageBlocks;
 
-        int lastTruncatedStreamIdx = -1;
+    int lastTruncatedStreamIdx = -1;
     int maxOutputChannel = -1;
     int targetNumRows = 10000;
     // The number of leading elements in streamOredr that is subject to reordering.
-    int numFilters = 0;
-    
+    int numFilters;
+
     public OrcRecordReader(
             Map<Integer, Type> includedColumns,
             OrcPredicate predicate,
@@ -179,7 +179,7 @@ public class OrcRecordReader
         this.fileStatisticsValidation = writeValidation.map(validation -> validation.createWriteStatisticsBuilder(includedColumns));
         this.systemMemoryUsage = systemMemoryUsage.newAggregatedMemoryContext();
         this.predicate = predicate;
-        
+
         // reduce the included columns to the set that is also present
         ImmutableSet.Builder<Integer> presentColumns = ImmutableSet.builder();
         ImmutableMap.Builder<Integer, Type> presentColumnsAndTypes = ImmutableMap.builder();
@@ -769,28 +769,28 @@ public class OrcRecordReader
     }
 
     static int compareReaders(StreamReader a, StreamReader b)
-        {
-            // A stream with filter goes before one without.
-            Filter aFilter = a.getFilter();
-            Filter bFilter = b.getFilter();
-            if (aFilter != null && bFilter == null) {
-                return -1;
-            }
-            if (aFilter == null && bFilter != null) {
-                return 1;
-            }
-            if (aFilter != null) {
-                double aScore = aFilter.getTimePerDroppedValue();
-                double bScore = bFilter.getTimePerDroppedValue();
-                if (aScore != bScore) {
-                    return aScore < bScore ? -1 : 1;
-                }
-                // If the score is a draw, e.g., at start of scan, the shorter data type/stricter comparison goes first.
-                return aFilter.staticScore() - bFilter.staticScore();
-            }
-            // Streans that have no filters go longer data type first. This hits maximum batch size sooner.
-            return b.getValueSize() - a.getValueSize();
+    {
+        // A stream with filter goes before one without.
+        Filter aFilter = a.getFilter();
+        Filter bFilter = b.getFilter();
+        if (aFilter != null && bFilter == null) {
+            return -1;
         }
+        if (aFilter == null && bFilter != null) {
+            return 1;
+        }
+        if (aFilter != null) {
+            double aScore = aFilter.getTimePerDroppedValue();
+            double bScore = bFilter.getTimePerDroppedValue();
+            if (aScore != bScore) {
+                return aScore < bScore ? -1 : 1;
+            }
+            // If the score is a draw, e.g., at start of scan, the shorter data type/stricter comparison goes first.
+            return aFilter.staticScore() - bFilter.staticScore();
+        }
+        // Streans that have no filters go longer data type first. This hits maximum batch size sooner.
+        return b.getValueSize() - a.getValueSize();
+    }
 
     void setupStreamOrder()
     {
@@ -802,7 +802,7 @@ public class OrcRecordReader
                     numFilters++;
                 }
             }
-            }
+        }
         streamOrder = new StreamReader[numReaders];
         int fill = 0;
         for (StreamReader reader : streamReaders) {
@@ -834,7 +834,7 @@ public class OrcRecordReader
         }
         Arrays.sort(streamOrder, 0, numFilters, (StreamReader a, StreamReader b) -> compareReaders(a, b));
     }
-    
+
     /* Sets up all new Blocks if returning new Blocks or removes the
      * previously returned data from Blocks if reusing Blocks. May
      * alter filter order if we have no column values from prior
@@ -844,7 +844,6 @@ public class OrcRecordReader
         discardBatch(numRowsInResult);
         numRowsInResult = 0;
     }
-
 
     // Makes a Page based the Blocks in StreamReaders.
     Page resultPage()
@@ -874,12 +873,12 @@ public class OrcRecordReader
                 int channel = reader.getChannel();
                 if (channel != -1) {
                     blocks[channel] = reader.getBlock(false);
-        }
-    }
+                }
+            }
             return new Page(numRowsInResult, blocks);
         }
     }
-    
+
     // Removes the first numValues values from all Blocks and
     // QualifyingSets. This is called at the start of a batch when
     // reusing Blocks. */
@@ -895,14 +894,14 @@ public class OrcRecordReader
     }
 
     int trapRowGroup = 10000000;
-    
+
     public Page getNextPage()
-        throws IOException
+            throws IOException
     {
         QualifyingSet qualifyingSet = null;
         newBatch();
         nextRowGroup:
-        for (;;) {
+        for (; ; ) {
             if (currentRowGroup == -1 || currentGroupRowCount == nextRowInGroup) {
                 if (currentPosition == totalRowCount) {
                     return null;
@@ -916,14 +915,14 @@ public class OrcRecordReader
             if (currentRowGroup >= trapRowGroup) {
                 System.out.println("***");
             }
-            if (reorderFilters && (currentRowGroup & 0x3) != 0  && currentRowGroup != 0) {
+            if (reorderFilters && (currentRowGroup & 0x3) != 0 && currentRowGroup != 0) {
                 // Reconsider filter order Every 4 row groups.
                 maybeReorderFilters();
             }
             qualifyingSet = initialQualifyingSet;
-            initialQualifyingSet.setRange((int)nextRowInGroup, (int)currentGroupRowCount);
+            initialQualifyingSet.setRange((int) nextRowInGroup, (int) currentGroupRowCount);
             resumeTruncated:
-            for (;;) {
+            for (; ; ) {
                 int firstStreamIdx;
                 int endRowInGroup = 0;
                 if (lastTruncatedStreamIdx == -1) {
@@ -944,7 +943,7 @@ public class OrcRecordReader
                     if (reorderFilters && filter != null) {
                         startTime = System.nanoTime();
                     }
-                    endRowInGroup =                     reader.scan(0);
+                    endRowInGroup = reader.scan(0);
                     if (filter != null) {
                         QualifyingSet input = qualifyingSet;
                         qualifyingSet = reader.getOutputQualifyingSet();
@@ -960,7 +959,7 @@ public class OrcRecordReader
                             }
                             continue resumeTruncated;
                         }
-                }
+                    }
                     lastTruncatedStreamIdx = findLastTruncatedStreamIdx(numStreams - 1);
                 }
                 compactSparseBlocks(streamOrder.length - 1);
@@ -974,18 +973,17 @@ public class OrcRecordReader
         }
     }
 
-    // 
     private void discardBatchSoFar(int streamIdx)
     {
         for (int i = 0; i < streamIdx; i++) {
-            streamOrder[i].erase(0, (int)currentGroupRowCount, numRowsInResult, 0);
+            streamOrder[i].erase(0, (int) currentGroupRowCount, numRowsInResult, 0);
         }
     }
 
     /* Compacts Blocks that contain values on rows that subsequent
-         * filters have dropped. lastStreamIdx is the position in
-         * streamOrder for the rightmost stream that has values for
-         * this batch. */
+     * filters have dropped. lastStreamIdx is the position in
+     * streamOrder for the rightmost stream that has values for
+     * this batch. */
     void compactSparseBlocks(int lastStreamIdx)
     {
         // The first row number in the row group that is above the
@@ -1038,5 +1036,4 @@ public class OrcRecordReader
     {
         return -1;
     }
-
 }

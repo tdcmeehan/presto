@@ -86,9 +86,9 @@ public class PartitionedLookupSource
 
     private boolean closed;
 
-    // The index in partitions for the AriaLookupSource whose output is being consumed. 
-    private int currentSource = 0;
-    
+    // The index in partitions for the AriaLookupSource whose output is being consumed.
+    private int currentSource;
+
     private PartitionedLookupSource(List<? extends LookupSource> lookupSources, List<Type> hashChannelTypes, Optional<OuterPositionTracker> outerPositionTracker)
     {
         this.lookupSources = lookupSources.toArray(new LookupSource[lookupSources.size()]);
@@ -355,5 +355,4 @@ public class PartitionedLookupSource
     public void addInput(Page page)
     {
     }
-
 }

@@ -134,7 +134,7 @@ public final class BlockEncodingManager
     {
         return blockEncodings.get(block.getEncodingName());
     }
-    
+
     private static String readLengthPrefixedString(SliceInput input)
     {
         int length = input.readInt();

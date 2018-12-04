@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.operator;
 
+import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.memory.context.LocalMemoryContext;
 import com.facebook.presto.metadata.Split;
 import com.facebook.presto.operator.project.CursorProcessor;
@@ -20,7 +21,6 @@ import com.facebook.presto.operator.project.CursorProcessorOutput;
 import com.facebook.presto.operator.project.MergingPageOutput;
 import com.facebook.presto.operator.project.PageProcessor;
 import com.facebook.presto.operator.project.PageProcessorOutput;
-import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorPageSource;
 import com.facebook.presto.spi.Page;
@@ -78,8 +78,8 @@ public class ScanFilterAndProjectOperator
     private long completedBytes;
     private long readTimeNanos;
 
-    private boolean filterAndProjectPushedDown = false;
-    
+    private boolean filterAndProjectPushedDown;
+
     protected ScanFilterAndProjectOperator(
             OperatorContext operatorContext,
             PlanNodeId sourceId,
@@ -225,7 +225,7 @@ public class ScanFilterAndProjectOperator
             }
             else {
                 pageSource = source;
-                boolean enableAria = SystemSessionProperties.enableAria(operatorContext.getSession()); 
+                boolean enableAria = SystemSessionProperties.enableAria(operatorContext.getSession());
                 if (enableAria) {
                     int[] channels = pageProcessor.getIdentityInputToOutputChannel();
                     boolean reusePages = SystemSessionProperties.enableAriaReusePages(operatorContext.getSession());

@@ -72,5 +72,4 @@ public class ByteArrayInputStream
     {
         return inputStream.getOffsetInBuffer();
     }
-    }
-
+}

@@ -467,7 +467,7 @@ public class LookupJoinOperator
                 if (!joinCurrentPosition(lookupSource, yieldSignal)) {
                     break;
                 }
-                 if (!currentProbePositionProducedRow) {
+                if (!currentProbePositionProducedRow) {
                     currentProbePositionProducedRow = true;
                     if (!outerJoinCurrentPosition()) {
                         break;
