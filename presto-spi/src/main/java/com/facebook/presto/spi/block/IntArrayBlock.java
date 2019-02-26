@@ -35,7 +35,7 @@ public class IntArrayBlock
     private final int positionCount;
     @Nullable
     private final boolean[] valueIsNull;
-    private final int[] values;
+    public final int[] values;
 
     private final long sizeInBytes;
     private final long retainedSizeInBytes;
@@ -124,6 +124,11 @@ public class IntArrayBlock
             throw new IllegalArgumentException("offset must be zero");
         }
         return values[position + arrayOffset];
+    }
+
+    public int getIntUnsafe(int position)
+    {
+        return values[position];
     }
 
     @Override
@@ -222,5 +227,16 @@ public class IntArrayBlock
         if (position < 0 || position >= getPositionCount()) {
             throw new IllegalArgumentException("position is not valid");
         }
+    }
+
+    public static int retrieve(IntArrayBlock intArrayBlock, int i)
+    {
+        if (i < 0 || i >= intArrayBlock.getPositionCount()) {
+            throw new IllegalArgumentException("position is not valid");
+        }
+        if (intArrayBlock.arrayOffset == 0) {
+            return intArrayBlock.values[i];
+        }
+        return intArrayBlock.values[i + intArrayBlock.arrayOffset];
     }
 }
