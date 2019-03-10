@@ -13,12 +13,12 @@
  */
 package com.facebook.presto.dispatcher;
 
+import com.facebook.airlift.log.Logger;
 import com.facebook.presto.client.QueryError;
 import com.facebook.presto.client.QueryResults;
 import com.facebook.presto.client.StatementStats;
 import com.facebook.presto.execution.ExecutionFailureInfo;
 import com.facebook.presto.execution.QueryState;
-import com.facebook.presto.server.ForStatementResource;
 import com.facebook.presto.server.HttpRequestSessionContext;
 import com.facebook.presto.server.SessionContext;
 import com.facebook.presto.spi.ErrorCode;
@@ -28,8 +28,6 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Ordering;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
-import io.airlift.concurrent.BoundedExecutor;
-import io.airlift.log.Logger;
 import io.airlift.units.Duration;
 
 import javax.annotation.PreDestroy;
@@ -57,9 +55,14 @@ import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static com.facebook.airlift.concurrent.MoreFutures.addTimeout;
+import static com.facebook.airlift.concurrent.Threads.threadsNamed;
+import static com.facebook.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
+import static com.facebook.airlift.http.server.AsyncResponseHandler.bindAsyncResponse;
 import static com.facebook.presto.execution.QueryState.FAILED;
 import static com.facebook.presto.execution.QueryState.QUEUED;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
@@ -67,10 +70,6 @@ import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.net.HttpHeaders.X_FORWARDED_PROTO;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
-import static io.airlift.concurrent.MoreFutures.addTimeout;
-import static io.airlift.concurrent.Threads.threadsNamed;
-import static io.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
-import static io.airlift.http.server.AsyncResponseHandler.bindAsyncResponse;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.UUID.randomUUID;
@@ -92,7 +91,7 @@ public class QueuedStatementResource
 
     private final DispatchManager dispatchManager;
 
-    private final BoundedExecutor responseExecutor;
+    private final Executor responseExecutor;
     private final ScheduledExecutorService timeoutExecutor;
 
     private final ConcurrentMap<QueryId, Query> queries = new ConcurrentHashMap<>();
@@ -101,13 +100,13 @@ public class QueuedStatementResource
     @Inject
     public QueuedStatementResource(
             DispatchManager dispatchManager,
-            @ForStatementResource BoundedExecutor responseExecutor,
-            @ForStatementResource ScheduledExecutorService timeoutExecutor)
+            DispatchExecutor executor)
     {
         this.dispatchManager = requireNonNull(dispatchManager, "dispatchManager is null");
 
-        this.responseExecutor = requireNonNull(responseExecutor, "responseExecutor is null");
-        this.timeoutExecutor = requireNonNull(timeoutExecutor, "timeoutExecutor is null");
+        requireNonNull(dispatchManager, "dispatchManager is null");
+        this.responseExecutor = requireNonNull(executor, "responseExecutor is null").getExecutor();
+        this.timeoutExecutor = requireNonNull(executor, "timeoutExecutor is null").getScheduledExecutor();
 
         queryPurger.scheduleWithFixedDelay(
                 () -> {
