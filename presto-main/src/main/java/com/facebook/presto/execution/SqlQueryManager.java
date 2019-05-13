@@ -325,8 +325,6 @@ public class SqlQueryManager
         PreparedQuery preparedQuery;
         Optional<QueryType> queryType = Optional.empty();
         try {
-            clusterSizeMonitor.verifyInitialMinimumWorkersRequirement();
-
             if (query.length() > maxQueryLength) {
                 int queryLength = query.length();
                 query = query.substring(0, maxQueryLength);
