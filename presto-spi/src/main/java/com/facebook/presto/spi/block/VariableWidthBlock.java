@@ -16,6 +16,7 @@ package com.facebook.presto.spi.block;
 import io.airlift.slice.Slice;
 import io.airlift.slice.SliceOutput;
 import io.airlift.slice.Slices;
+import io.airlift.slice.UnsafeSlice;
 import org.openjdk.jol.info.ClassLayout;
 
 import javax.annotation.Nullable;
@@ -28,10 +29,12 @@ import static com.facebook.presto.spi.block.BlockUtil.checkValidRegion;
 import static com.facebook.presto.spi.block.BlockUtil.compactArray;
 import static com.facebook.presto.spi.block.BlockUtil.compactOffsets;
 import static com.facebook.presto.spi.block.BlockUtil.compactSlice;
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static io.airlift.slice.SizeOf.sizeOf;
 
 public class VariableWidthBlock
         extends AbstractVariableWidthBlock
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(VariableWidthBlock.class).instanceSize();
 
@@ -90,7 +93,7 @@ public class VariableWidthBlock
     public int getSliceLength(int position)
     {
         checkReadablePosition(position);
-        return getPositionOffset(position + 1) - getPositionOffset(position);
+        return getSliceLengthUnchecked(position + arrayOffset);
     }
 
     @Override
@@ -230,5 +233,68 @@ public class VariableWidthBlock
         sb.append(", slice=").append(slice);
         sb.append('}');
         return sb.toString();
+    }
+
+    @Override
+    public byte getByteUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return UnsafeSlice.getByteUnchecked(getRawSlice(position), offsets[position]);
+    }
+
+    @Override
+    public short getShortUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return UnsafeSlice.getShortUnchecked(getRawSlice(position), offsets[position]);
+    }
+
+    @Override
+    public int getIntUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return UnsafeSlice.getIntUnchecked(getRawSlice(position), offsets[position]);
+    }
+
+    @Override
+    public long getLongUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return UnsafeSlice.getLongUnchecked(getRawSlice(position), offsets[position]);
+    }
+
+    @Override
+    public long getLongUnchecked(int position, int offset)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return UnsafeSlice.getLongUnchecked(getRawSlice(position), offsets[position] + offset);
+    }
+
+    @Override
+    public Slice getSliceUnchecked(int position, int offset, int length)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return getRawSlice(position).slice(offsets[position] + offset, length);
+    }
+
+    @Override
+    public int getSliceLengthUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return offsets[position + 1] - offsets[position];
+    }
+
+    @Override
+    public int getOffsetBase()
+    {
+        return arrayOffset;
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return valueIsNull[position];
     }
 }

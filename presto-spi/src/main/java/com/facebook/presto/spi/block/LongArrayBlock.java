@@ -24,11 +24,12 @@ import static com.facebook.presto.spi.block.BlockUtil.checkArrayRange;
 import static com.facebook.presto.spi.block.BlockUtil.checkValidRegion;
 import static com.facebook.presto.spi.block.BlockUtil.compactArray;
 import static com.facebook.presto.spi.block.BlockUtil.countUsedPositions;
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static io.airlift.slice.SizeOf.sizeOf;
 import static java.lang.Math.toIntExact;
 
 public class LongArrayBlock
-        implements Block
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(LongArrayBlock.class).instanceSize();
 
@@ -121,7 +122,7 @@ public class LongArrayBlock
     public long getLong(int position)
     {
         checkReadablePosition(position);
-        return values[position + arrayOffset];
+        return getLongUnchecked(position + arrayOffset);
     }
 
     @Override
@@ -171,7 +172,7 @@ public class LongArrayBlock
     public boolean isNull(int position)
     {
         checkReadablePosition(position);
-        return valueIsNull != null && valueIsNull[position + arrayOffset];
+        return valueIsNull != null && isNullUnchecked(position + arrayOffset);
     }
 
     @Override
@@ -260,10 +261,23 @@ public class LongArrayBlock
     }
 
     @Override
-    public void getContents(BlockDecoder contents)
+    public int getOffsetBase()
     {
-        contents.setValues(values);
-        contents.setValueIsNull(valueIsNull);
-        contents.setArrayOffset(arrayOffset);
+        return arrayOffset;
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return valueIsNull[position];
+    }
+
+    @Override
+    public long getLongUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return values[position];
     }
 }

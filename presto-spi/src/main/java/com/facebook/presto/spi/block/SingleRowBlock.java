@@ -14,14 +14,17 @@
 
 package com.facebook.presto.spi.block;
 
+import io.airlift.slice.Slice;
 import org.openjdk.jol.info.ClassLayout;
 
 import java.util.function.BiConsumer;
 
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static java.lang.String.format;
 
 public class SingleRowBlock
         extends AbstractSingleRowBlock
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(SingleRowBlock.class).instanceSize();
 
@@ -113,5 +116,67 @@ public class SingleRowBlock
             return this;
         }
         return new SingleRowBlock(rowIndex, loadedFieldBlocks);
+    }
+
+    @Override
+    public byte getByteUnchecked(int position)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getByteUnchecked(rowIndex);
+    }
+
+    @Override
+    public short getShortUnchecked(int position)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getShortUnchecked(rowIndex);
+    }
+
+    @Override
+    public int getIntUnchecked(int position)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getIntUnchecked(rowIndex);
+    }
+
+    @Override
+    public long getLongUnchecked(int position)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getLongUnchecked(rowIndex);
+    }
+
+    @Override
+    public long getLongUnchecked(int position, int offset)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getLongUnchecked(rowIndex, offset);
+    }
+
+    @Override
+    public Slice getSliceUnchecked(int position, int offset, int length)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getSliceUnchecked(rowIndex, offset, length);
+    }
+
+    @Override
+    public int getSliceLengthUnchecked(int position)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getSliceLengthUnchecked(rowIndex);
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        return ((UncheckedBlock) getRawFieldBlock(position)).getBlockUnchecked(rowIndex);
+    }
+
+    @Override
+    public int getOffsetBase()
+    {
+        return 0;
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) getRawFieldBlock(position)).isNullUnchecked(getRowIndex());
     }
 }

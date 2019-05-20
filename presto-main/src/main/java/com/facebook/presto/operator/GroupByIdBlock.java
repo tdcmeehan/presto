@@ -15,6 +15,8 @@ package com.facebook.presto.operator;
 
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
+import com.facebook.presto.spi.block.ImmutableBlock;
+import com.facebook.presto.spi.block.UncheckedBlock;
 import io.airlift.slice.Slice;
 import org.openjdk.jol.info.ClassLayout;
 
@@ -25,7 +27,7 @@ import static com.google.common.base.MoreObjects.toStringHelper;
 import static java.util.Objects.requireNonNull;
 
 public class GroupByIdBlock
-        implements Block
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(GroupByIdBlock.class).instanceSize();
 
@@ -231,5 +233,65 @@ public class GroupByIdBlock
     public Block getLoadedBlock()
     {
         return block.getLoadedBlock();
+    }
+
+    @Override
+    public byte getByteUnchecked(int position)
+    {
+        return ((UncheckedBlock) block).getByteUnchecked(position);
+    }
+
+    @Override
+    public short getShortUnchecked(int position)
+    {
+        return ((UncheckedBlock) block).getShortUnchecked(position);
+    }
+
+    @Override
+    public int getIntUnchecked(int position)
+    {
+        return ((UncheckedBlock) block).getIntUnchecked(position);
+    }
+
+    @Override
+    public long getLongUnchecked(int position)
+    {
+        return ((UncheckedBlock) block).getLongUnchecked(position);
+    }
+
+    @Override
+    public long getLongUnchecked(int position, int offset)
+    {
+        return ((UncheckedBlock) block).getLongUnchecked(position, offset);
+    }
+
+    @Override
+    public Slice getSliceUnchecked(int position, int offset, int length)
+    {
+        return ((UncheckedBlock) block).getSliceUnchecked(position, offset, length);
+    }
+
+    @Override
+    public int getSliceLengthUnchecked(int position)
+    {
+        return ((UncheckedBlock) block).getSliceLengthUnchecked(position);
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        return ((UncheckedBlock) block).getBlockUnchecked(position);
+    }
+
+    @Override
+    public int getOffsetBase()
+    {
+        return ((UncheckedBlock) block).getOffsetBase();
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        return ((UncheckedBlock) block).isNullUnchecked(position);
     }
 }

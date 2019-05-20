@@ -18,10 +18,11 @@ import org.openjdk.jol.info.ClassLayout;
 
 import java.util.function.BiConsumer;
 
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static java.util.Objects.requireNonNull;
 
 public class LazyBlock
-        implements Block
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(LazyBlock.class).instanceSize();
 
@@ -288,5 +289,76 @@ public class LazyBlock
 
         // clear reference to loader to free resources, since load was successful
         loader = null;
+    }
+
+    @Override
+    public byte getByteUnchecked(int position)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getByteUnchecked(position);
+    }
+
+    @Override
+    public short getShortUnchecked(int position)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getShortUnchecked(position);
+    }
+
+    @Override
+    public int getIntUnchecked(int position)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getIntUnchecked(position);
+    }
+
+    @Override
+    public long getLongUnchecked(int position)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getLongUnchecked(position);
+    }
+
+    @Override
+    public long getLongUnchecked(int position, int offset)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getLongUnchecked(position, offset);
+    }
+
+    @Override
+    public Slice getSliceUnchecked(int position, int offset, int length)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getSliceUnchecked(position, offset, length);
+    }
+
+    @Override
+    public int getSliceLengthUnchecked(int position)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getSliceLengthUnchecked(position);
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getBlockUnchecked(position);
+    }
+
+    @Override
+    public int getOffsetBase()
+    {
+        assureLoaded();
+        return ((UncheckedBlock) block).getOffsetBase();
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) block).isNullUnchecked(position);
     }
 }

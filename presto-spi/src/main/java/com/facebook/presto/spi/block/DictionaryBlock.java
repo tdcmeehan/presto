@@ -27,13 +27,14 @@ import static com.facebook.presto.spi.block.BlockUtil.checkValidPosition;
 import static com.facebook.presto.spi.block.BlockUtil.checkValidPositions;
 import static com.facebook.presto.spi.block.BlockUtil.checkValidRegion;
 import static com.facebook.presto.spi.block.BlockUtil.countUsedPositions;
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static com.facebook.presto.spi.block.DictionaryId.randomDictionaryId;
 import static io.airlift.slice.SizeOf.sizeOf;
 import static java.lang.Math.min;
 import static java.util.Objects.requireNonNull;
 
 public class DictionaryBlock
-        implements Block
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(DictionaryBlock.class).instanceSize() + ClassLayout.parseClass(DictionaryId.class).instanceSize();
 
@@ -473,5 +474,75 @@ public class DictionaryBlock
             // ignore if copy positions is not supported for the dictionary block
             return this;
         }
+    }
+
+    @Override
+    public byte getByteUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getByteUnchecked(ids[position]);
+    }
+
+    @Override
+    public short getShortUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getShortUnchecked(ids[position]);
+    }
+
+    @Override
+    public int getIntUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getIntUnchecked(ids[position]);
+    }
+
+    @Override
+    public long getLongUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getLongUnchecked(ids[position]);
+    }
+
+    @Override
+    public long getLongUnchecked(int position, int offset)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getLongUnchecked(ids[position], offset);
+    }
+
+    @Override
+    public Slice getSliceUnchecked(int position, int offset, int length)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getSliceUnchecked(ids[position], offset, length);
+    }
+
+    @Override
+    public int getSliceLengthUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getSliceLengthUnchecked(ids[position]);
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return ((UncheckedBlock) dictionary).getBlockUnchecked(ids[position]);
+    }
+
+    @Override
+    public int getOffsetBase()
+    {
+        return idsOffset;
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, idsOffset, positionCount);
+        return ((UncheckedBlock) dictionary).isNullUnchecked(ids[position]);
     }
 }

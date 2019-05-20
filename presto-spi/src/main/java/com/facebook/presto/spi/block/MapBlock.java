@@ -25,6 +25,7 @@ import java.util.Arrays;
 import java.util.Optional;
 import java.util.function.BiConsumer;
 
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static com.facebook.presto.spi.block.MapBlockBuilder.buildHashTable;
 import static io.airlift.slice.SizeOf.sizeOf;
 import static java.lang.String.format;
@@ -32,6 +33,7 @@ import static java.util.Objects.requireNonNull;
 
 public class MapBlock
         extends AbstractMapBlock
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(MapBlock.class).instanceSize();
 
@@ -229,7 +231,7 @@ public class MapBlock
     }
 
     @Override
-    protected int getOffsetBase()
+    public int getOffsetBase()
     {
         return startOffset;
     }
@@ -355,5 +357,23 @@ public class MapBlock
             }
             this.hashTables.set(hashTables);
         }
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        assert rawPositionInRange(position, this.getOffsetBase(), getPositionCount());
+
+        int startEntryOffset = getOffsets()[position];
+        int endEntryOffset = getOffsets()[position + 1];
+        return new SingleMapBlock(startEntryOffset * 2, (endEntryOffset - startEntryOffset) * 2, this);
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, this.getOffsetBase(), getPositionCount());
+        return getMapIsNull()[position];
     }
 }

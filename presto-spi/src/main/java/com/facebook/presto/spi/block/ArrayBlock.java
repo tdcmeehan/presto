@@ -20,12 +20,14 @@ import javax.annotation.Nullable;
 import java.util.Optional;
 import java.util.function.BiConsumer;
 
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static io.airlift.slice.SizeOf.sizeOf;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 public class ArrayBlock
         extends AbstractArrayBlock
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(ArrayBlock.class).instanceSize();
 
@@ -157,7 +159,7 @@ public class ArrayBlock
     }
 
     @Override
-    protected int getOffsetBase()
+    public int getOffsetBase()
     {
         return arrayOffset;
     }
@@ -192,5 +194,21 @@ public class ArrayBlock
                 valueIsNull,
                 offsets,
                 loadedValuesBlock);
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        int startValueOffset = getOffsets()[position];
+        int endValueOffset = getOffsets()[position + 1];
+        return getRawElementBlock().getRegion(startValueOffset, endValueOffset - startValueOffset);
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return getValueIsNull()[position];
     }
 }

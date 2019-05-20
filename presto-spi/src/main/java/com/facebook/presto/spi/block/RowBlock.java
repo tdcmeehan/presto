@@ -20,12 +20,14 @@ import javax.annotation.Nullable;
 import java.util.Optional;
 import java.util.function.BiConsumer;
 
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static io.airlift.slice.SizeOf.sizeOf;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 public class RowBlock
         extends AbstractRowBlock
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(RowBlock.class).instanceSize();
 
@@ -129,7 +131,7 @@ public class RowBlock
     }
 
     @Override
-    protected int getOffsetBase()
+    public int getOffsetBase()
     {
         return startOffset;
     }
@@ -214,5 +216,20 @@ public class RowBlock
                 rowIsNull,
                 fieldBlockOffsets,
                 loadedFieldBlocks);
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return new SingleRowBlock(getFieldBlockOffsets()[position], getRawFieldBlocks());
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        return getRowIsNull()[position];
     }
 }

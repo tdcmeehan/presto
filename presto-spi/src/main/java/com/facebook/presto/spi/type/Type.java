@@ -17,6 +17,7 @@ import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
 import com.facebook.presto.spi.block.BlockBuilderStatus;
+import com.facebook.presto.spi.block.UncheckedBlock;
 import com.fasterxml.jackson.annotation.JsonValue;
 import io.airlift.slice.Slice;
 
@@ -84,14 +85,29 @@ public interface Type
     boolean getBoolean(Block block, int position);
 
     /**
+     * Gets the value at the {@code block} {@code position} as a boolean.
+     */
+    boolean getBooleanUnchecked(UncheckedBlock block, int position);
+
+    /**
      * Gets the value at the {@code block} {@code position} as a long.
      */
     long getLong(Block block, int position);
 
     /**
+     * Gets the value at the {@code block} {@code position} as a long.
+     */
+    long getLongUnchecked(UncheckedBlock block, int position);
+
+    /**
      * Gets the value at the {@code block} {@code position} as a double.
      */
     double getDouble(Block block, int position);
+
+    /**
+     * Gets the value at the {@code block} {@code position} as a double.
+     */
+    double getDoubleUnchecked(UncheckedBlock block, int position);
 
     /**
      * Gets the value at the {@code block} {@code position} as a Slice.

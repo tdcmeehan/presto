@@ -26,12 +26,14 @@ import java.util.function.BiConsumer;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.spi.block.AbstractMapBlock.HASH_MULTIPLIER;
+import static com.facebook.presto.spi.block.BlockUtil.rawPositionInRange;
 import static com.facebook.presto.spi.block.MapBlockBuilder.computePosition;
 import static io.airlift.slice.SizeOf.sizeOfIntArray;
 import static java.lang.String.format;
 
 public class SingleMapBlock
         extends AbstractSingleMapBlock
+        implements ImmutableBlock
 {
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(SingleMapBlock.class).instanceSize();
 
@@ -423,5 +425,115 @@ public class SingleMapBlock
         if (equalsResult == null) {
             throw new PrestoException(NOT_SUPPORTED, "map key cannot be null or contain nulls");
         }
+    }
+
+    @Override
+    public byte getByteUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getByteUnchecked(position >> 2);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getByteUnchecked(position >> 2);
+        }
+    }
+
+    @Override
+    public short getShortUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getShortUnchecked(position >> 2);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getShortUnchecked(position >> 2);
+        }
+    }
+
+    @Override
+    public int getIntUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getIntUnchecked(position >> 2);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getIntUnchecked(position >> 2);
+        }
+    }
+
+    @Override
+    public long getLongUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getLongUnchecked(position >> 2);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getLongUnchecked(position >> 2);
+        }
+    }
+
+    @Override
+    public long getLongUnchecked(int position, int offset)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getLongUnchecked(position >> 2);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getLongUnchecked(position >> 2);
+        }
+    }
+
+    @Override
+    public Slice getSliceUnchecked(int position, int offset, int length)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getSliceUnchecked(position >> 2, offset, length);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getSliceUnchecked(position >> 2, offset, length);
+        }
+    }
+
+    @Override
+    public int getSliceLengthUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getSliceLengthUnchecked(position >> 2);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getSliceLengthUnchecked(position >> 2);
+        }
+    }
+
+    @Override
+    public Block getBlockUnchecked(int position)
+    {
+        assert rawPositionInRange(position, getOffsetBase(), getPositionCount());
+        if ((position & 1) == 0) {
+            return ((UncheckedBlock) getRawKeyBlock()).getBlockUnchecked(position / 2);
+        }
+        else {
+            return ((UncheckedBlock) getRawValueBlock()).getBlockUnchecked(position / 2);
+        }
+    }
+
+    @Override
+    public int getOffsetBase()
+    {
+        return getOffset();
+    }
+
+    @Override
+    public boolean isNullUnchecked(int position)
+    {
+        assert mayHaveNull() : "no nulls present";
+        assert rawPositionInRange(position, getOffset(), getPositionCount());
+        return ((UncheckedBlock) getRawValueBlock()).isNullUnchecked(position);
     }
 }

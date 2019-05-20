@@ -395,7 +395,7 @@ public class MapBlockBuilder
             }
         }
 
-        closeEntry(singleMapBlock.getHashTable(), singleMapBlock.getOffset() / 2 * HASH_MULTIPLIER);
+        closeEntry(singleMapBlock.getHashTable(), singleMapBlock.getOffsetBase() / 2 * HASH_MULTIPLIER);
         return this;
     }
 
