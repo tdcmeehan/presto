@@ -487,6 +487,62 @@ public class QuantileDigest
         return builder.build();
     }
 
+    /**
+     * Get the approx truncated mean from the digest.
+     * The mean is computed as a weighted average of values between the upper and lower quantiles (inclusive)
+     * When the rank of a quantile is non-integer, a portion of the nearest rank's value is included in the mean
+     * according to its fraction within the quantile bound.
+     * <p>
+     * If the value in the digest needs to be converted before the mean is calculated,
+     * valueFunction can be used. Else, pass in the identity function.
+     */
+    public Double getTruncatedMean(double lowerQuantile, double upperQuantile, TruncMeanValueFunction valueFunction)
+    {
+        if (weightedCount == 0 || lowerQuantile >= upperQuantile) {
+            return null;
+        }
+
+        AtomicDouble meanResult = new AtomicDouble();
+        double lowerRank = lowerQuantile * weightedCount;
+        double upperRank = upperQuantile * weightedCount;
+
+        postOrderTraversal(root, new Callback()
+        {
+            private double sum;
+            private double count;
+            private double mean;
+
+            public boolean process(int node)
+            {
+                double nodeCount = counts[node];
+                if (nodeCount == 0) {
+                    return true;
+                }
+
+                sum += nodeCount;
+
+                double amountOverLower = Math.max(sum - lowerRank, 0);
+                double amountOverUpper = Math.max(sum - upperRank, 0);
+                // Constrain node count to the rank of the lower and upper bound quantiles
+                nodeCount = Math.max(0, Math.min(Math.min(nodeCount, amountOverLower), nodeCount - amountOverUpper));
+
+                if (amountOverLower > 0) {
+                    double value = valueFunction.value(Math.min(upperBound(node), max));
+                    mean = (mean * count + nodeCount * value) / (count + nodeCount);
+                    count += nodeCount;
+                }
+
+                if (amountOverUpper > 0 || sum == weightedCount) {
+                    meanResult.set(mean);
+                    return false;
+                }
+                return true;
+            }
+        });
+
+        return meanResult.get();
+    }
+
     private static final class HistogramBuilderStateHolder
     {
         double sum;
@@ -1314,5 +1370,12 @@ public class QuantileDigest
         MiddleFunction DEFAULT = (lowerBound, upperBound) -> lowerBound + (upperBound - lowerBound) / 2.0;
 
         double middle(long lowerBound, long upperBound);
+    }
+
+    public interface TruncMeanValueFunction
+    {
+        QuantileDigest.TruncMeanValueFunction DEFAULT = value -> value;
+
+        double value(long value);
     }
 }
