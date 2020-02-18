@@ -63,6 +63,7 @@ import static com.facebook.airlift.concurrent.MoreFutures.addTimeout;
 import static com.facebook.airlift.concurrent.Threads.threadsNamed;
 import static com.facebook.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
 import static com.facebook.airlift.http.server.AsyncResponseHandler.bindAsyncResponse;
+import static com.facebook.presto.execution.QueryState.DISPATCHING;
 import static com.facebook.presto.execution.QueryState.FAILED;
 import static com.facebook.presto.execution.QueryState.QUEUED;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
@@ -85,7 +86,7 @@ import static javax.ws.rs.core.Response.Status.NOT_FOUND;
 public class QueuedStatementResource
 {
     private static final Logger log = Logger.get(QueuedStatementResource.class);
-    private static final Duration MAX_WAIT_TIME = new Duration(1, SECONDS);
+    private static final Duration MAX_WAIT_TIME = new Duration(10, SECONDS);
     private static final Ordering<Comparable<Duration>> WAIT_ORDERING = Ordering.natural().nullsLast();
     private static final Duration NO_DURATION = new Duration(0, MILLISECONDS);
 
@@ -170,6 +171,7 @@ public class QueuedStatementResource
             @Context UriInfo uriInfo,
             @Suspended AsyncResponse asyncResponse)
     {
+        maxWait = Duration.valueOf("10s");
         Query query = getQuery(queryId, slug);
 
         // wait for query to be dispatched, up to the wait timeout
@@ -244,13 +246,13 @@ public class QueuedStatementResource
     private static QueryResults createQueryResults(
             QueryId queryId,
             URI nextUri,
-            Optional<QueryError> queryError,
+            boolean present, Optional<QueryError> queryError,
             UriInfo uriInfo,
             String xForwardedProto,
             Duration elapsedTime,
             Duration queuedTime)
     {
-        QueryState state = queryError.map(error -> FAILED).orElse(QUEUED);
+        QueryState state = queryError.map(error -> FAILED).orElseGet(() -> present ? DISPATCHING : QUEUED);
         return new QueryResults(
                 queryId.toString(),
                 getQueryHtmlUri(queryId, uriInfo, xForwardedProto),
@@ -382,6 +384,7 @@ public class QueuedStatementResource
             return QueuedStatementResource.createQueryResults(
                     queryId,
                     nextUri,
+                    dispatchInfo.getCoordinatorLocation().isPresent(),
                     queryError,
                     uriInfo,
                     xForwardedProto,
@@ -396,9 +399,11 @@ public class QueuedStatementResource
                 return null;
             }
             // if dispatched, redirect to new uri
-            return dispatchInfo.getCoordinatorLocation()
-                            .map(coordinatorLocation -> getRedirectUri(coordinatorLocation, uriInfo, xForwardedProto))
-                            .orElseGet(() -> getQueuedUri(queryId, slug, token, uriInfo, xForwardedProto));
+            URI uri = dispatchInfo.getCoordinatorLocation()
+                    .map(coordinatorLocation -> getRedirectUri(coordinatorLocation, uriInfo, xForwardedProto))
+                    .orElseGet(() -> getQueuedUri(queryId, slug, token, uriInfo, xForwardedProto));
+            System.out.println("Redirect: " + uri);
+            return uri;
         }
 
         private URI getRedirectUri(CoordinatorLocation coordinatorLocation, UriInfo uriInfo, String xForwardedProto)

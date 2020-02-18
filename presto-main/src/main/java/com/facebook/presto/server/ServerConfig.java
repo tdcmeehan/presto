@@ -22,12 +22,25 @@ import static java.util.concurrent.TimeUnit.MINUTES;
 
 public class ServerConfig
 {
+    private boolean resourceManager = true;
     private boolean coordinator = true;
     private String prestoVersion = getClass().getPackage().getImplementationVersion();
     private String dataSources;
     private boolean includeExceptionInResponse = true;
     private Duration gracePeriod = new Duration(2, MINUTES);
     private boolean enhancedErrorReporting = true;
+
+    public boolean isResourceManager()
+    {
+        return resourceManager;
+    }
+
+    @Config("resource-manager")
+    public ServerConfig setResourceManager(boolean resourceManager)
+    {
+        this.resourceManager = resourceManager;
+        return this;
+    }
 
     public boolean isCoordinator()
     {

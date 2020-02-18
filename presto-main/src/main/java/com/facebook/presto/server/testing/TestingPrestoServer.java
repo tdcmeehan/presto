@@ -41,6 +41,8 @@ import com.facebook.presto.execution.SqlQueryManager;
 import com.facebook.presto.execution.StateMachine.StateChangeListener;
 import com.facebook.presto.execution.TaskManager;
 import com.facebook.presto.execution.resourceGroups.InternalResourceGroupManager;
+import com.facebook.presto.execution.resourceGroups.NoQueueResourceGroupManager;
+import com.facebook.presto.execution.resourceGroups.ResourceGroupManager;
 import com.facebook.presto.memory.ClusterMemoryManager;
 import com.facebook.presto.memory.LocalMemoryManager;
 import com.facebook.presto.metadata.AllNodes;
@@ -136,7 +138,7 @@ public class TestingPrestoServer
     private final StatsCalculator statsCalculator;
     private final TestingAccessControlManager accessControl;
     private final ProcedureTester procedureTester;
-    private final Optional<InternalResourceGroupManager<?>> resourceGroupManager;
+    private final Optional<ResourceGroupManager<?>> resourceGroupManager;
     private final SplitManager splitManager;
     private final PageSourceManager pageSourceManager;
     private final NodePartitioningManager nodePartitioningManager;
@@ -152,6 +154,7 @@ public class TestingPrestoServer
     private final GracefulShutdownHandler gracefulShutdownHandler;
     private final ShutdownAction shutdownAction;
     private final RequestBlocker requestBlocker;
+    private final boolean resourceManager;
     private final boolean coordinator;
 
     public static class TestShutdownAction
@@ -215,6 +218,21 @@ public class TestingPrestoServer
             Optional<Path> baseDataDir)
             throws Exception
     {
+        this(false, coordinator, properties, environment, discoveryUri, parserOptions, additionalModules, baseDataDir);
+    }
+
+    public TestingPrestoServer(
+            boolean resourceManager,
+            boolean coordinator,
+            Map<String, String> properties,
+            String environment,
+            URI discoveryUri,
+            SqlParserOptions parserOptions,
+            List<Module> additionalModules,
+            Optional<Path> baseDataDir)
+            throws Exception
+    {
+        this.resourceManager = resourceManager;
         this.coordinator = coordinator;
 
         this.baseDataDir = baseDataDir.orElseGet(TestingPrestoServer::tempDirectory);
@@ -228,6 +246,7 @@ public class TestingPrestoServer
 
         ImmutableMap.Builder<String, String> serverProperties = ImmutableMap.<String, String>builder()
                 .putAll(properties)
+                .put("resource-manager", String.valueOf(resourceManager))
                 .put("coordinator", String.valueOf(coordinator))
                 .put("presto.version", "testversion")
                 .put("task.concurrency", "4")
@@ -310,7 +329,12 @@ public class TestingPrestoServer
         if (coordinator) {
             dispatchManager = injector.getInstance(DispatchManager.class);
             queryManager = (SqlQueryManager) injector.getInstance(QueryManager.class);
-            resourceGroupManager = Optional.of(injector.getInstance(InternalResourceGroupManager.class));
+            if (resourceManager && coordinator) {
+                resourceGroupManager = Optional.of(injector.getInstance(NoQueueResourceGroupManager.class));
+            }
+            else {
+                resourceGroupManager = Optional.of(injector.getInstance(InternalResourceGroupManager.class));
+            }
             nodePartitioningManager = injector.getInstance(NodePartitioningManager.class);
             planOptimizerManager = injector.getInstance(ConnectorPlanOptimizerManager.class);
             clusterMemoryManager = injector.getInstance(ClusterMemoryManager.class);
@@ -468,7 +492,7 @@ public class TestingPrestoServer
         return pageSourceManager;
     }
 
-    public Optional<InternalResourceGroupManager<?>> getResourceGroupManager()
+    public Optional<ResourceGroupManager<?>> getResourceGroupManager()
     {
         return resourceGroupManager;
     }

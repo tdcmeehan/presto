@@ -16,13 +16,17 @@ package com.facebook.presto.server.protocol;
 import com.facebook.airlift.concurrent.BoundedExecutor;
 import com.facebook.presto.Session;
 import com.facebook.presto.client.QueryResults;
+import com.facebook.presto.dispatcher.DispatchManager;
 import com.facebook.presto.execution.QueryManager;
 import com.facebook.presto.memory.context.SimpleLocalMemoryContext;
 import com.facebook.presto.operator.ExchangeClient;
 import com.facebook.presto.operator.ExchangeClientSupplier;
 import com.facebook.presto.server.ForStatementResource;
+import com.facebook.presto.server.HttpRequestSessionContext;
+import com.facebook.presto.server.SessionContext;
 import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.spi.block.BlockEncodingSerde;
+import com.facebook.presto.spi.resourceGroups.ResourceGroupId;
 import com.google.common.collect.Ordering;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -30,9 +34,11 @@ import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 
 import javax.inject.Inject;
+import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.GET;
 import javax.ws.rs.HeaderParam;
+import javax.ws.rs.POST;
 import javax.ws.rs.Path;
 import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
@@ -73,6 +79,7 @@ import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static javax.ws.rs.core.MediaType.TEXT_PLAIN_TYPE;
+import static javax.ws.rs.core.Response.Status.BAD_REQUEST;
 import static javax.ws.rs.core.Response.Status.NOT_FOUND;
 
 @Path("/")
@@ -92,19 +99,48 @@ public class ExecutingStatementResource
 
     private final ConcurrentMap<QueryId, Query> queries = new ConcurrentHashMap<>();
 
+    private DispatchManager dispatchManager;
+
     @Inject
     public ExecutingStatementResource(
             QueryManager queryManager,
             ExchangeClientSupplier exchangeClientSupplier,
             BlockEncodingSerde blockEncodingSerde,
             @ForStatementResource BoundedExecutor responseExecutor,
-            @ForStatementResource ScheduledExecutorService timeoutExecutor)
+            @ForStatementResource ScheduledExecutorService timeoutExecutor,
+
+            DispatchManager dispatchManager)
     {
         this.queryManager = requireNonNull(queryManager, "queryManager is null");
         this.exchangeClientSupplier = requireNonNull(exchangeClientSupplier, "exchangeClientSupplier is null");
         this.blockEncodingSerde = requireNonNull(blockEncodingSerde, "blockEncodingSerde is null");
         this.responseExecutor = requireNonNull(responseExecutor, "responseExecutor is null");
         this.timeoutExecutor = requireNonNull(timeoutExecutor, "timeoutExecutor is null");
+
+        this.dispatchManager = dispatchManager;
+    }
+
+    @POST
+    @Path("/v1/statement/executing/{queryId}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response postQueryResults(
+            @PathParam("queryId") QueryId queryId,
+            @QueryParam("slug") String slug,
+            @QueryParam("resourceGroupId") ResourceGroupId resourceGroupId,
+            String statement,
+            @HeaderParam(X_FORWARDED_PROTO) String xForwardedProto,
+            @Context HttpServletRequest servletRequest,
+            @Context UriInfo uriInfo)
+    {
+        if (isNullOrEmpty(statement)) {
+            throw badRequest(BAD_REQUEST, "SQL statement is empty");
+        }
+
+        SessionContext sessionContext = new HttpRequestSessionContext(servletRequest);
+
+        dispatchManager.createQuery(queryId, slug, sessionContext, statement);
+
+        return Response.ok().build();
     }
 
     @GET

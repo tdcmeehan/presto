@@ -209,8 +209,8 @@ public class ServerMainModule
     {
         ServerConfig serverConfig = buildConfigObject(ServerConfig.class);
 
-        if (serverConfig.isCoordinator()) {
-            install(new CoordinatorModule());
+        if (serverConfig.isResourceManager() || serverConfig.isCoordinator()) {
+            install(new CoordinatorModule(serverConfig.isResourceManager(), serverConfig.isCoordinator()));
         }
         else {
             install(new WorkerModule());

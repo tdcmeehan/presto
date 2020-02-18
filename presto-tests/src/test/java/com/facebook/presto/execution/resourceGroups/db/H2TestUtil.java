@@ -17,6 +17,7 @@ import com.facebook.airlift.json.JsonCodec;
 import com.facebook.presto.Session;
 import com.facebook.presto.execution.QueryManager;
 import com.facebook.presto.execution.QueryState;
+import com.facebook.presto.execution.resourceGroups.InternalResourceGroupManager;
 import com.facebook.presto.resourceGroups.ResourceGroupSelector;
 import com.facebook.presto.resourceGroups.db.DbResourceGroupConfig;
 import com.facebook.presto.resourceGroups.db.DbResourceGroupConfigurationManager;
@@ -133,7 +134,7 @@ class H2TestUtil
         try {
             Plugin h2ResourceGroupManagerPlugin = new H2ResourceGroupManagerPlugin();
             queryRunner.installPlugin(h2ResourceGroupManagerPlugin);
-            queryRunner.getCoordinator().getResourceGroupManager().get()
+            ((InternalResourceGroupManager) queryRunner.getCoordinator().getResourceGroupManager().get())
                     .setConfigurationManager(CONFIGURATION_MANAGER_TYPE, ImmutableMap.of("resource-groups.config-db-url", dbConfigUrl, "node.environment", environment));
             queryRunner.installPlugin(new TpchPlugin());
             queryRunner.createCatalog("tpch", "tpch");
@@ -187,7 +188,7 @@ class H2TestUtil
     public static List<ResourceGroupSelector> getSelectors(DistributedQueryRunner queryRunner)
     {
         try {
-            return ((DbResourceGroupConfigurationManager) queryRunner.getCoordinator().getResourceGroupManager().get().getConfigurationManager()).getSelectors();
+            return ((DbResourceGroupConfigurationManager) ((InternalResourceGroupManager) queryRunner.getCoordinator().getResourceGroupManager().get()).getConfigurationManager()).getSelectors();
         }
         catch (PrestoException e) {
             if (e.getErrorCode() == CONFIGURATION_INVALID.toErrorCode()) {

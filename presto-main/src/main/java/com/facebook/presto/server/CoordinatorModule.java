@@ -30,6 +30,7 @@ import com.facebook.presto.dispatcher.DispatchQueryFactory;
 import com.facebook.presto.dispatcher.FailedDispatchQueryFactory;
 import com.facebook.presto.dispatcher.LocalDispatchQueryFactory;
 import com.facebook.presto.dispatcher.QueuedStatementResource;
+import com.facebook.presto.dispatcher.RemoteDispatchQueryFactory;
 import com.facebook.presto.event.QueryMonitor;
 import com.facebook.presto.event.QueryMonitorConfig;
 import com.facebook.presto.execution.AddColumnTask;
@@ -79,6 +80,7 @@ import com.facebook.presto.execution.TaskManagerConfig;
 import com.facebook.presto.execution.UseTask;
 import com.facebook.presto.execution.resourceGroups.InternalResourceGroupManager;
 import com.facebook.presto.execution.resourceGroups.LegacyResourceGroupConfigurationManager;
+import com.facebook.presto.execution.resourceGroups.NoQueueResourceGroupManager;
 import com.facebook.presto.execution.resourceGroups.ResourceGroupManager;
 import com.facebook.presto.execution.scheduler.AllAtOnceExecutionPolicy;
 import com.facebook.presto.execution.scheduler.ExecutionPolicy;
@@ -88,6 +90,7 @@ import com.facebook.presto.execution.scheduler.SplitSchedulerStats;
 import com.facebook.presto.failureDetector.FailureDetectorModule;
 import com.facebook.presto.memory.ClusterMemoryManager;
 import com.facebook.presto.memory.ForMemoryManager;
+import com.facebook.presto.memory.ForResourceManager;
 import com.facebook.presto.memory.LowMemoryKiller;
 import com.facebook.presto.memory.MemoryManagerConfig;
 import com.facebook.presto.memory.MemoryManagerConfig.LowMemoryKillerPolicy;
@@ -181,6 +184,15 @@ import static org.weakref.jmx.guice.ExportBinder.newExporter;
 public class CoordinatorModule
         extends AbstractConfigurationAwareModule
 {
+    private final boolean resourceManager;
+    private final boolean coordinator;
+
+    public CoordinatorModule(boolean resourceManager, boolean coordinator)
+    {
+        this.resourceManager = resourceManager;
+        this.coordinator = coordinator;
+    }
+
     @Override
     protected void setup(Binder binder)
     {
@@ -226,9 +238,19 @@ public class CoordinatorModule
         newExporter(binder).export(QueryManager.class).withGeneratedName();
         binder.bind(QueryPreparer.class).in(Scopes.SINGLETON);
         binder.bind(SessionSupplier.class).to(QuerySessionSupplier.class).in(Scopes.SINGLETON);
-        binder.bind(InternalResourceGroupManager.class).in(Scopes.SINGLETON);
-        newExporter(binder).export(InternalResourceGroupManager.class).withGeneratedName();
-        binder.bind(ResourceGroupManager.class).to(InternalResourceGroupManager.class);
+        if (resourceManager && coordinator) {
+            binder.bind(NoQueueResourceGroupManager.class).in(Scopes.SINGLETON);
+            newExporter(binder).export(NoQueueResourceGroupManager.class).withGeneratedName();
+            binder.bind(ResourceGroupManager.class).to(NoQueueResourceGroupManager.class);
+        }
+        else if (resourceManager || coordinator) {
+            binder.bind(InternalResourceGroupManager.class).in(Scopes.SINGLETON);
+            newExporter(binder).export(InternalResourceGroupManager.class).withGeneratedName();
+            binder.bind(ResourceGroupManager.class).to(InternalResourceGroupManager.class);
+        }
+        else {
+            throw new IllegalStateException();
+        }
         binder.bind(LegacyResourceGroupConfigurationManager.class).in(Scopes.SINGLETON);
 
         // dispatcher
@@ -237,7 +259,18 @@ public class CoordinatorModule
         binder.bind(DispatchExecutor.class).in(Scopes.SINGLETON);
 
         // local dispatcher
-        binder.bind(DispatchQueryFactory.class).to(LocalDispatchQueryFactory.class);
+        if (coordinator) {
+            binder.bind(DispatchQueryFactory.class).to(LocalDispatchQueryFactory.class);
+        }
+        else {
+            httpClientBinder(binder).bindHttpClient("memoryManager", ForResourceManager.class)
+                    .withTracing()
+                    .withConfigDefaults(config -> {
+                        config.setIdleTimeout(new Duration(30, SECONDS));
+                        config.setRequestTimeout(new Duration(10, SECONDS));
+                    });
+            binder.bind(DispatchQueryFactory.class).to(RemoteDispatchQueryFactory.class);
+        }
 
         // cluster memory manager
         binder.bind(ClusterMemoryManager.class).in(Scopes.SINGLETON);

@@ -87,7 +87,7 @@ public class TestResourceGroupIntegration
 
     private static InternalResourceGroupManager<?> getResourceGroupManager(DistributedQueryRunner queryRunner)
     {
-        return queryRunner.getCoordinator().getResourceGroupManager()
+        return (InternalResourceGroupManager<?>) queryRunner.getCoordinator().getResourceGroupManager()
                 .orElseThrow(() -> new IllegalArgumentException("no resource group manager"));
     }
 }

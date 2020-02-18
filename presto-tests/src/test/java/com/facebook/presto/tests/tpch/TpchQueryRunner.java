@@ -26,7 +26,8 @@ public final class TpchQueryRunner
     {
         Logging.initialize();
         DistributedQueryRunner queryRunner = TpchQueryRunnerBuilder.builder()
-                .setSingleExtraProperty("http-server.http.port", "8080")
+                .setSingleExtraProperty("http-server.http.port", "8081")
+                .setResourceManagerEnabled(true)
                 .build();
         Thread.sleep(10);
         Logger log = Logger.get(TpchQueryRunner.class);

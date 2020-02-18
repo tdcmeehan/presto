@@ -15,6 +15,7 @@ package com.facebook.presto.execution;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.execution.TestEventListenerPlugin.TestingEventListenerPlugin;
+import com.facebook.presto.execution.resourceGroups.InternalResourceGroupManager;
 import com.facebook.presto.resourceGroups.ResourceGroupManagerPlugin;
 import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.spi.eventlistener.QueryCompletedEvent;
@@ -68,7 +69,7 @@ public class TestEventListener
         queryRunner.installPlugin(new TestingEventListenerPlugin(generatedEvents));
         queryRunner.installPlugin(new ResourceGroupManagerPlugin());
         queryRunner.createCatalog("tpch", "tpch", ImmutableMap.of("tpch.splits-per-node", Integer.toString(SPLITS_PER_NODE)));
-        queryRunner.getCoordinator().getResourceGroupManager().get()
+        ((InternalResourceGroupManager) queryRunner.getCoordinator().getResourceGroupManager().get())
                 .setConfigurationManager("file", ImmutableMap.of("resource-groups.config-file", getResourceFilePath("resource_groups_config_simple.json")));
     }
 
