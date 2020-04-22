@@ -55,7 +55,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.facebook.airlift.concurrent.Threads.threadsNamed;
 import static com.facebook.presto.execution.SqlTask.createSqlTask;
-import static com.facebook.presto.execution.TaskManagerConfig.TaskPriorityTracking.TASK_FAIR;
 import static com.facebook.presto.execution.TaskTestUtils.createTestSplitMonitor;
 import static com.facebook.presto.execution.TaskTestUtils.createTestingPlanner;
 import static com.facebook.presto.memory.LocalMemoryManager.GENERAL_POOL;
@@ -88,7 +87,7 @@ public class TestMemoryRevokingScheduler
     {
         memoryPool = new MemoryPool(GENERAL_POOL, new DataSize(10, BYTE));
 
-        TaskExecutor taskExecutor = new TaskExecutor(8, 16, 3, 4, TASK_FAIR, Ticker.systemTicker());
+        TaskExecutor taskExecutor = new TaskExecutor(8, 16, 3, 4, Ticker.systemTicker());
         taskExecutor.start();
 
         // Must be single threaded

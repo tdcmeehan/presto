@@ -83,7 +83,6 @@ public class TaskManagerConfig
     private BigDecimal levelTimeMultiplier = new BigDecimal(2.0);
 
     private boolean legacyLifespanCompletionCondition;
-    private TaskPriorityTracking taskPriorityTracking = TaskPriorityTracking.TASK_FAIR;
 
     @MinDuration("1ms")
     @MaxDuration("10s")
@@ -552,24 +551,5 @@ public class TaskManagerConfig
     {
         this.legacyLifespanCompletionCondition = legacyLifespanCompletionCondition;
         return this;
-    }
-
-    @NotNull
-    public TaskPriorityTracking getTaskPriorityTracking()
-    {
-        return taskPriorityTracking;
-    }
-
-    @Config("task.task-priority-tracking")
-    public TaskManagerConfig setTaskPriorityTracking(TaskPriorityTracking taskPriorityTracking)
-    {
-        this.taskPriorityTracking = taskPriorityTracking;
-        return this;
-    }
-
-    public enum TaskPriorityTracking
-    {
-        TASK_FAIR,
-        QUERY_FAIR,
     }
 }
