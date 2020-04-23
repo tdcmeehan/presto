@@ -97,7 +97,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 @ThreadSafe
 public class QueryStateMachine
 {
-    private static final Logger QUERY_STATE_LOG = Logger.get(QueryStateMachine.class);
+    public static final Logger QUERY_STATE_LOG = Logger.get(QueryStateMachine.class);
 
     private final QueryId queryId;
     private final String query;

@@ -13,9 +13,10 @@
  */
 package com.facebook.presto.execution;
 
-import com.facebook.presto.Session;
+import com.facebook.presto.execution.QueryExecution.QueryOutputInfo;
 import com.facebook.presto.execution.StateMachine.StateChangeListener;
 import com.facebook.presto.server.BasicQueryInfo;
+import com.facebook.presto.server.SessionContext;
 import com.facebook.presto.spi.QueryId;
 import com.google.common.util.concurrent.ListenableFuture;
 
@@ -32,7 +33,7 @@ public interface QueryManager
      *
      * @throws NoSuchElementException if query does not exist
      */
-    void addOutputInfoListener(QueryId queryId, Consumer<QueryExecution.QueryOutputInfo> listener)
+    void addOutputInfoListener(QueryId queryId, Consumer<QueryOutputInfo> listener)
             throws NoSuchElementException;
 
     /**
@@ -68,16 +69,6 @@ public interface QueryManager
     /**
      * @throws NoSuchElementException if query does not exist
      */
-    Session getQuerySession(QueryId queryId);
-
-    /**
-     * @throws NoSuchElementException if query does not exist
-     */
-    boolean isQuerySlugValid(QueryId queryId, String slug);
-
-    /**
-     * @throws NoSuchElementException if query does not exist
-     */
     QueryState getQueryState(QueryId queryId)
             throws NoSuchElementException;
 
@@ -87,10 +78,13 @@ public interface QueryManager
      */
     void recordHeartbeat(QueryId queryId);
 
+    QueryId createQueryId();
+
     /**
-     * Creates a new query using the specified query execution.
+     * Creates a new query.  This method may be called multiple times for the same query id.  The
+     * the first call will be accepted, and the other calls will be ignored.
      */
-    void createQuery(QueryExecution execution);
+    ListenableFuture<?> createQuery(QueryId queryId, SessionContext sessionContext, String query);
 
     /**
      * Attempts to fail the query for the specified reason.  If the query is already in a final

@@ -14,7 +14,6 @@
 package com.facebook.presto.execution;
 
 import com.facebook.presto.Session;
-import com.facebook.presto.dispatcher.DispatchManager;
 import com.facebook.presto.resourceGroups.ResourceGroupManagerPlugin;
 import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.spi.resourceGroups.ResourceGroupId;
@@ -317,8 +316,8 @@ public class TestQueues
 
             QueryId queryId = createQuery(queryRunner, newRejectionSession(), LONG_LASTING_QUERY);
             waitForQueryState(queryRunner, queryId, FAILED);
-            DispatchManager dispatchManager = queryRunner.getCoordinator().getDispatchManager();
-            assertEquals(dispatchManager.getQueryInfo(queryId).getErrorCode(), QUERY_REJECTED.toErrorCode());
+            QueryManager queryManager = queryRunner.getCoordinator().getQueryManager();
+            assertEquals(queryManager.getQueryInfo(queryId).getErrorCode(), QUERY_REJECTED.toErrorCode());
         }
     }
 

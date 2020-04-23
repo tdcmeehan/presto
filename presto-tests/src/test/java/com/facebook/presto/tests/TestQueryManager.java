@@ -13,7 +13,6 @@
  */
 package com.facebook.presto.tests;
 
-import com.facebook.presto.dispatcher.DispatchManager;
 import com.facebook.presto.execution.QueryInfo;
 import com.facebook.presto.execution.QueryManager;
 import com.facebook.presto.execution.QueryState;
@@ -61,18 +60,17 @@ public class TestQueryManager
     public void testFailQuery()
             throws Exception
     {
-        DispatchManager dispatchManager = queryRunner.getCoordinator().getDispatchManager();
-        QueryId queryId = dispatchManager.createQueryId();
-        dispatchManager.createQuery(
+        QueryManager queryManager = queryRunner.getCoordinator().getQueryManager();
+        QueryId queryId = queryManager.createQueryId();
+        queryManager.createQuery(
                 queryId,
-                "slug",
                 new TestingSessionContext(TEST_SESSION),
                 "SELECT * FROM lineitem")
                 .get();
 
         // wait until query starts running
         while (true) {
-            QueryState state = dispatchManager.getQueryInfo(queryId).getState();
+            QueryState state = queryManager.getQueryState(queryId);
             if (state.isDone()) {
                 fail("unexpected query state: " + state);
             }
@@ -83,7 +81,6 @@ public class TestQueryManager
         }
 
         // cancel query
-        QueryManager queryManager = queryRunner.getCoordinator().getQueryManager();
         queryManager.failQuery(queryId, new PrestoException(GENERIC_INTERNAL_ERROR, "mock exception"));
         QueryInfo queryInfo = queryManager.getFullQueryInfo(queryId);
         assertEquals(queryInfo.getState(), FAILED);

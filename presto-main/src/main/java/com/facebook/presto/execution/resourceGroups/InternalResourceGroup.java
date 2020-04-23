@@ -701,7 +701,7 @@ public class InternalResourceGroup
                 group = group.parent.get();
             }
             updateEligibility();
-            executor.execute(query::startWaitingForResources);
+            executor.execute(query::start);
         }
     }
 
