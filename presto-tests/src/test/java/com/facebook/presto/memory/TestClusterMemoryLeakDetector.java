@@ -83,7 +83,6 @@ public class TestClusterMemoryLeakDetector
                         Duration.valueOf("8m"),
                         Duration.valueOf("7m"),
                         Duration.valueOf("34m"),
-                        12,
                         13,
                         14,
                         15,

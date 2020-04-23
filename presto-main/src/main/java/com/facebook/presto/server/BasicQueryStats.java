@@ -46,8 +46,6 @@ public class BasicQueryStats
     private final Duration elapsedTime;
     private final Duration executionTime;
 
-    private final int peakRunningTasks;
-
     private final int totalDrivers;
     private final int queuedDrivers;
     private final int runningDrivers;
@@ -79,7 +77,6 @@ public class BasicQueryStats
             @JsonProperty("queuedTime") Duration queuedTime,
             @JsonProperty("elapsedTime") Duration elapsedTime,
             @JsonProperty("executionTime") Duration executionTime,
-            @JsonProperty("peakRunningTasks") int peakRunningTasks,
             @JsonProperty("totalDrivers") int totalDrivers,
             @JsonProperty("queuedDrivers") int queuedDrivers,
             @JsonProperty("runningDrivers") int runningDrivers,
@@ -105,8 +102,6 @@ public class BasicQueryStats
         this.queuedTime = requireNonNull(queuedTime, "queuedTime is null");
         this.elapsedTime = requireNonNull(elapsedTime, "elapsedTime is null");
         this.executionTime = requireNonNull(executionTime, "executionTime is null");
-
-        this.peakRunningTasks = peakRunningTasks;
 
         checkArgument(totalDrivers >= 0, "totalDrivers is negative");
         this.totalDrivers = totalDrivers;
@@ -144,7 +139,6 @@ public class BasicQueryStats
                 queryStats.getQueuedTime(),
                 queryStats.getElapsedTime(),
                 queryStats.getExecutionTime(),
-                queryStats.getPeakRunningTasks(),
                 queryStats.getTotalDrivers(),
                 queryStats.getQueuedDrivers(),
                 queryStats.getRunningDrivers(),
@@ -174,7 +168,6 @@ public class BasicQueryStats
                 new Duration(0, MILLISECONDS),
                 new Duration(0, MILLISECONDS),
                 new Duration(0, MILLISECONDS),
-                0,
                 0,
                 0,
                 0,
@@ -277,11 +270,6 @@ public class BasicQueryStats
     public DataSize getTotalMemoryReservation()
     {
         return totalMemoryReservation;
-    }
-
-    public int getPeakRunningTasks()
-    {
-        return peakRunningTasks;
     }
 
     @JsonProperty
