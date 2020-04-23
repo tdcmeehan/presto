@@ -39,6 +39,7 @@ import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.spi.resourceGroups.QueryType;
 import com.facebook.presto.spi.resourceGroups.SelectionContext;
 import com.facebook.presto.spi.resourceGroups.SelectionCriteria;
+import com.facebook.presto.spi.security.AccessControlContext;
 import com.facebook.presto.sql.planner.Plan;
 import com.facebook.presto.sql.tree.Statement;
 import com.facebook.presto.transaction.TransactionManager;
@@ -335,7 +336,7 @@ public class SqlQueryManager
 
             // decode session
             session = sessionSupplier.createSession(queryId, sessionContext);
-            accessControl.checkQueryIntegrity(session.getIdentity(), query);
+            accessControl.checkQueryIntegrity(session.getIdentity(), new AccessControlContext(queryId, Optional.ofNullable(sessionContext.getClientInfo()), Optional.ofNullable(sessionContext.getSource())), query);
 
             WarningCollector warningCollector = warningCollectorFactory.create();
 
