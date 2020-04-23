@@ -104,7 +104,7 @@ public class QueryStateMachine
     private final Session session;
     private final URI self;
     private final Optional<QueryType> queryType;
-    private final ResourceGroupId resourceGroup;
+    private final Optional<ResourceGroupId> resourceGroup;
     private final TransactionManager transactionManager;
     private final Metadata metadata;
     private final QueryOutputManager outputManager;
@@ -156,7 +156,7 @@ public class QueryStateMachine
             String query,
             Session session,
             URI self,
-            ResourceGroupId resourceGroup,
+            Optional<ResourceGroupId> resourceGroup,
             Optional<QueryType> queryType,
             TransactionManager transactionManager,
             Executor executor,
@@ -236,7 +236,7 @@ public class QueryStateMachine
                 query,
                 session,
                 self,
-                resourceGroup,
+                Optional.of(resourceGroup),
                 queryType,
                 transactionManager,
                 executor,
@@ -375,7 +375,7 @@ public class QueryStateMachine
         return new BasicQueryInfo(
                 queryId,
                 session.toSessionRepresentation(),
-                Optional.of(resourceGroup),
+                resourceGroup,
                 state,
                 memoryPool.get().getId(),
                 stageStats.isScheduled(),
@@ -450,7 +450,7 @@ public class QueryStateMachine
                 inputs.get(),
                 output.get(),
                 completeInfo,
-                Optional.of(resourceGroup),
+                resourceGroup,
                 queryType,
                 failedTasks);
     }
