@@ -20,6 +20,7 @@ import com.facebook.presto.spi.resourceGroups.QueryType;
 import com.facebook.presto.spi.resourceGroups.ResourceGroupId;
 
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
 
 public interface DispatchQueryFactory
 {
@@ -30,5 +31,6 @@ public interface DispatchQueryFactory
             String slug,
             ResourceGroupId resourceGroup,
             Optional<QueryType> queryType,
-            WarningCollector warningCollector);
+            WarningCollector warningCollector,
+            ExecutorService queryExecutor);
 }

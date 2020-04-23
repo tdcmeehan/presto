@@ -19,6 +19,7 @@ import com.facebook.presto.client.QueryResults;
 import com.facebook.presto.client.StatementStats;
 import com.facebook.presto.execution.ExecutionFailureInfo;
 import com.facebook.presto.execution.QueryState;
+import com.facebook.presto.server.ForStatementResource;
 import com.facebook.presto.server.HttpRequestSessionContext;
 import com.facebook.presto.server.SessionContext;
 import com.facebook.presto.spi.ErrorCode;
@@ -55,7 +56,6 @@ import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -91,7 +91,7 @@ public class QueuedStatementResource
 
     private final DispatchManager dispatchManager;
 
-    private final Executor responseExecutor;
+    private final BoundedExecutor responseExecutor;
     private final ScheduledExecutorService timeoutExecutor;
 
     private final ConcurrentMap<QueryId, Query> queries = new ConcurrentHashMap<>();
@@ -100,13 +100,13 @@ public class QueuedStatementResource
     @Inject
     public QueuedStatementResource(
             DispatchManager dispatchManager,
-            DispatchExecutor executor)
+            @ForStatementResource BoundedExecutor responseExecutor,
+            @ForStatementResource ScheduledExecutorService timeoutExecutor)
     {
         this.dispatchManager = requireNonNull(dispatchManager, "dispatchManager is null");
 
-        requireNonNull(dispatchManager, "dispatchManager is null");
-        this.responseExecutor = requireNonNull(executor, "responseExecutor is null").getExecutor();
-        this.timeoutExecutor = requireNonNull(executor, "timeoutExecutor is null").getScheduledExecutor();
+        this.responseExecutor = requireNonNull(responseExecutor, "responseExecutor is null");
+        this.timeoutExecutor = requireNonNull(timeoutExecutor, "timeoutExecutor is null");
 
         queryPurger.scheduleWithFixedDelay(
                 () -> {
