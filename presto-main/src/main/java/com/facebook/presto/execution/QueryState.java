@@ -29,10 +29,6 @@ public enum QueryState
      */
     WAITING_FOR_RESOURCES(false),
     /**
-     * Query is being dispatched to a coordinator.
-     */
-    DISPATCHING(false),
-    /**
      * Query is being planned.
      */
     PLANNING(false),
