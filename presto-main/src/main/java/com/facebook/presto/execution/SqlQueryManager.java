@@ -120,6 +120,8 @@ public class SqlQueryManager
     private final SessionSupplier sessionSupplier;
     private final SessionPropertyDefaults sessionPropertyDefaults;
 
+    private final ClusterSizeMonitor clusterSizeMonitor;
+
     private final Map<Class<? extends Statement>, QueryExecutionFactory<?>> executionFactories;
 
     private final SqlQueryManagerStats stats = new SqlQueryManagerStats();
@@ -141,6 +143,7 @@ public class SqlQueryManager
             QueryIdGenerator queryIdGenerator,
             SessionSupplier sessionSupplier,
             SessionPropertyDefaults sessionPropertyDefaults,
+            ClusterSizeMonitor clusterSizeMonitor,
             Map<Class<? extends Statement>, QueryExecutionFactory<?>> executionFactories,
             WarningCollectorFactory warningCollectorFactory)
     {
@@ -169,7 +172,7 @@ public class SqlQueryManager
         this.sessionSupplier = requireNonNull(sessionSupplier, "sessionSupplier is null");
         this.sessionPropertyDefaults = requireNonNull(sessionPropertyDefaults, "sessionPropertyDefaults is null");
 
-        this.path = sqlEnvironmentConfig.getPath();
+        this.clusterSizeMonitor = requireNonNull(clusterSizeMonitor, "clusterSizeMonitor is null");
 
         this.maxQueryLength = queryManagerConfig.getMaxQueryLength();
         this.maxQueryCpuTime = queryManagerConfig.getQueryMaxCpuTime();
@@ -322,6 +325,8 @@ public class SqlQueryManager
         PreparedQuery preparedQuery;
         Optional<QueryType> queryType = Optional.empty();
         try {
+            clusterSizeMonitor.verifyInitialMinimumWorkersRequirement();
+
             if (query.length() > maxQueryLength) {
                 int queryLength = query.length();
                 query = query.substring(0, maxQueryLength);
