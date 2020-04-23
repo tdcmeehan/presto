@@ -13,11 +13,42 @@
  */
 package com.facebook.presto.dispatcher;
 
-import javax.ws.rs.core.UriInfo;
-
 import java.net.URI;
+import java.util.Optional;
 
-public interface CoordinatorLocation
+import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.google.common.base.Preconditions.checkArgument;
+import static java.util.Objects.requireNonNull;
+
+public class CoordinatorLocation
 {
-    URI getUri(UriInfo uriInfo, String xForwardedProto);
+    private final Optional<URI> httpUri;
+    private final Optional<URI> httpsUri;
+
+    public CoordinatorLocation(Optional<URI> httpUri, Optional<URI> httpsUri)
+    {
+        this.httpUri = requireNonNull(httpUri, "httpUri is null");
+        this.httpsUri = requireNonNull(httpsUri, "httpsUri is null");
+        checkArgument(httpUri.isPresent() || httpsUri.isPresent(), "Coordinator must have a HTTP or HTTPS port");
+    }
+
+    public URI getUri(String preferredScheme)
+    {
+        if ("https".equalsIgnoreCase(preferredScheme)) {
+            return httpsUri.orElseGet(httpUri::get);
+        }
+        else {
+            return httpUri.orElseGet(httpsUri::get);
+        }
+    }
+
+    @Override
+    public String toString()
+    {
+        return toStringHelper(this)
+                .omitNullValues()
+                .add("httpUri", httpUri.orElse(null))
+                .add("httpsUri", httpsUri.orElse(null))
+                .toString();
+    }
 }

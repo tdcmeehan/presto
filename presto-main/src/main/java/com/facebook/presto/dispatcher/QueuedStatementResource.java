@@ -403,7 +403,7 @@ public class QueuedStatementResource
 
         private URI getRedirectUri(CoordinatorLocation coordinatorLocation, UriInfo uriInfo, String xForwardedProto)
         {
-            URI coordinatorUri = coordinatorLocation.getUri(uriInfo, xForwardedProto);
+            URI coordinatorUri = coordinatorLocation.getUri(getScheme(xForwardedProto, uriInfo));
             return uriBuilderFrom(coordinatorUri)
                     .appendPath("/v1/statement/executing")
                     .appendPath(queryId.toString())
