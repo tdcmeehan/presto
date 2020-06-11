@@ -103,6 +103,9 @@ public class TestPrestoDriverUri
 
         // empty extra credentials
         assertInvalid("presto://localhost:8080?extraCredentials=", "Connection property 'extraCredentials' value is empty");
+
+        assertInvalid("presto://localhost:8080?sessionProperties=", "Connection property 'sessionProperties' value is empty");
+        assertInvalid("presto://localhost:8080?sessionProperties=sdf", "Connection property 'sessionProperties' value is invalid: sdf");
     }
 
     @Test(expectedExceptions = SQLException.class, expectedExceptionsMessageRegExp = "Connection property 'user' is required")
@@ -233,6 +236,16 @@ public class TestPrestoDriverUri
         PrestoDriverUri parameters = createDriverUri("presto://localhost:8080?extraCredentials=" + extraCredentials);
         Properties properties = parameters.getProperties();
         assertEquals(properties.getProperty(EXTRA_CREDENTIALS.getKey()), extraCredentials);
+    }
+
+    @Test
+    public void testUriWithSessionProperties()
+            throws SQLException
+    {
+        String sessionProperties = "sessionProp1:sessionValue1;sessionProp2:sessionValue2";
+        PrestoDriverUri parameters = createDriverUri("presto://localhost:8080?extraCredentials=" + sessionProperties);
+        Properties properties = parameters.getProperties();
+        assertEquals(properties.getProperty(EXTRA_CREDENTIALS.getKey()), sessionProperties);
     }
 
     private static void assertUriPortScheme(PrestoDriverUri parameters, int port, String scheme)
