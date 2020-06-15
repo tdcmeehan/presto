@@ -93,7 +93,7 @@ public class ProxyResource
     private static final Logger log = Logger.get(ProxyResource.class);
 
     private static final String X509_ATTRIBUTE = "javax.servlet.request.X509Certificate";
-    private static final Duration ASYNC_TIMEOUT = new Duration(2, MINUTES);
+    private static final Duration ASYNC_TIMEOUT = new Duration(10, MINUTES);
     private static final JsonFactory JSON_FACTORY = new JsonFactory().disable(CANONICALIZE_FIELD_NAMES);
 
     private final ExecutorService executor = newCachedThreadPool(daemonThreadsNamed("proxy-%s"));
