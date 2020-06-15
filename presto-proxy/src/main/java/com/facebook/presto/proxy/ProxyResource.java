@@ -296,10 +296,10 @@ public class ProxyResource
 
     private static Response responseWithHeaders(ResponseBuilder builder, ProxyResponse response)
     {
-        response.getHeaders().asMap().forEach((headerName, value) -> {
+        response.getHeaders().asMap().forEach((headerName, values) -> {
             String name = headerName.toString();
             if (isPrestoHeader(name) || name.equalsIgnoreCase(SET_COOKIE)) {
-                builder.header(name, value);
+                values.forEach(value -> builder.header(name, value));
             }
         });
         return builder.build();
