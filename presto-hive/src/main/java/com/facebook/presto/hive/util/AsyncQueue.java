@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.hive.util;
 
+import com.facebook.airlift.log.Logger;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -110,6 +111,7 @@ public class AsyncQueue<T>
             notEmptySignal = SettableFuture.create();
         }
         if (newSize >= targetQueueSize) {
+            Logger.get(AsyncQueue.class).info("Max queue" + targetQueueSize);
             return notFullSignal;
         }
         return immediateFuture(null);

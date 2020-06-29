@@ -17,8 +17,6 @@ import com.facebook.airlift.stats.CounterStat;
 import com.facebook.presto.common.predicate.Domain;
 import com.facebook.presto.hive.HiveBucketing.HiveBucketFilter;
 import com.facebook.presto.hive.HiveColumnHandle.ColumnType;
-import com.facebook.presto.hive.authentication.NoHdfsAuthentication;
-import com.facebook.presto.hive.filesystem.ExtendedFileSystem;
 import com.facebook.presto.hive.metastore.Column;
 import com.facebook.presto.hive.metastore.StorageFormat;
 import com.facebook.presto.hive.metastore.Table;
@@ -31,22 +29,12 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.BlockLocation;
-import org.apache.hadoop.fs.FSDataInputStream;
-import org.apache.hadoop.fs.FSDataOutputStream;
-import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.RemoteIterator;
-import org.apache.hadoop.fs.permission.FsPermission;
-import org.apache.hadoop.util.Progressable;
 import org.testng.annotations.Test;
 
-import java.io.IOException;
-import java.net.URI;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
@@ -510,133 +498,5 @@ public class TestBackgroundHiveSplitLoader
                 null,
                 path,
                 new BlockLocation[] {});
-    }
-
-    private static class TestingHdfsEnvironment
-            extends HdfsEnvironment
-    {
-        private final List<LocatedFileStatus> files;
-
-        public TestingHdfsEnvironment(List<LocatedFileStatus> files)
-        {
-            super(
-                    new HiveHdfsConfiguration(new HdfsConfigurationInitializer(new HiveClientConfig(), new MetastoreClientConfig()), ImmutableSet.of()),
-                    new MetastoreClientConfig(),
-                    new NoHdfsAuthentication());
-            this.files = ImmutableList.copyOf(files);
-        }
-
-        @Override
-        public ExtendedFileSystem getFileSystem(String user, Path path, Configuration configuration)
-        {
-            return new TestingHdfsFileSystem(files);
-        }
-    }
-
-    private static class TestingHdfsFileSystem
-            extends ExtendedFileSystem
-    {
-        private final List<LocatedFileStatus> files;
-
-        public TestingHdfsFileSystem(List<LocatedFileStatus> files)
-        {
-            this.files = ImmutableList.copyOf(files);
-        }
-
-        @Override
-        public boolean delete(Path f, boolean recursive)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean rename(Path src, Path dst)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public void setWorkingDirectory(Path dir)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public FileStatus[] listStatus(Path f)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public RemoteIterator<LocatedFileStatus> listLocatedStatus(Path f)
-        {
-            return new RemoteIterator<LocatedFileStatus>()
-            {
-                private final Iterator<LocatedFileStatus> iterator = files.iterator();
-
-                @Override
-                public boolean hasNext()
-                        throws IOException
-                {
-                    return iterator.hasNext();
-                }
-
-                @Override
-                public LocatedFileStatus next()
-                        throws IOException
-                {
-                    return iterator.next();
-                }
-            };
-        }
-
-        @Override
-        public FSDataOutputStream create(
-                Path f,
-                FsPermission permission,
-                boolean overwrite,
-                int bufferSize,
-                short replication,
-                long blockSize,
-                Progressable progress)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean mkdirs(Path f, FsPermission permission)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public FSDataOutputStream append(Path f, int bufferSize, Progressable progress)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public FSDataInputStream open(Path f, int bufferSize)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public FileStatus getFileStatus(Path f)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public Path getWorkingDirectory()
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public URI getUri()
-        {
-            throw new UnsupportedOperationException();
-        }
     }
 }

@@ -96,7 +96,7 @@ public class LegacyAccessControl
     public void checkCanDropTable(ConnectorTransactionHandle transaction, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
     {
         if (!allowDropTable) {
-            denyDropTable(tableName.toString());
+//            denyDropTable(tableName.toString());
         }
 
         TransactionalMetadata metadata = hiveTransactionManager.get(transaction);

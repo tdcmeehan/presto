@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.hive;
 
+import com.facebook.airlift.log.Logger;
 import com.facebook.presto.common.predicate.Domain;
 import com.facebook.presto.hive.HiveBucketing.HiveBucketFilter;
 import com.facebook.presto.hive.HiveSplit.BucketConversion;
@@ -265,13 +266,22 @@ public class BackgroundHiveSplitLoader
         if (splits == null) {
             HivePartitionMetadata partition = partitions.poll();
             if (partition == null) {
+                Logger.get(BackgroundHiveSplitLoader.class).info("partition == null");
                 return COMPLETED_FUTURE;
             }
+            Logger.get(BackgroundHiveSplitLoader.class).info("Partition added");
             return loadPartition(partition);
         }
 
+        long loaded = 0;
+        //Rohit hasNext takes 23% CPU
+        //Rohit addToQueue takes 30% CPU
         while (splits.hasNext() && !stopped) {
             ListenableFuture<?> future = hiveSplitSource.addToQueue(splits.next());
+            loaded++;
+            if (loaded % 100000 == 0) {
+                Logger.get(BackgroundHiveSplitLoader.class).info("Loaded %d", loaded);
+            }
             if (!future.isDone()) {
                 fileIterators.addFirst(splits);
                 return future;
@@ -279,6 +289,7 @@ public class BackgroundHiveSplitLoader
         }
 
         // No need to put the iterator back, since it's either empty or we've stopped
+        Logger.get(BackgroundHiveSplitLoader.class).info("return " + loaded);
         return COMPLETED_FUTURE;
     }
 

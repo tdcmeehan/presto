@@ -53,6 +53,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.JavaUtils;
 import org.apache.hadoop.hive.ql.exec.Utilities;
 import org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat;
+import org.apache.hadoop.hive.ql.io.orc.OrcInputFormat;
 import org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat;
 import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
 import org.apache.hadoop.hive.serde2.AbstractSerDe;
@@ -65,6 +66,7 @@ import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableComparable;
 import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.io.compress.CompressionCodecFactory;
+import org.apache.hadoop.mapred.FileInputFormat;
 import org.apache.hadoop.mapred.FileSplit;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
@@ -338,10 +340,13 @@ public final class HiveUtil
         return HIVE_TIMESTAMP_PARSER.withZone(timeZone).parseMillis(value);
     }
 
+    //Rohit takes 3.8 % CPU
     public static boolean isSplittable(InputFormat<?, ?> inputFormat, FileSystem fileSystem, Path path)
     {
-        // ORC uses a custom InputFormat but is always splittable
-        if (inputFormat.getClass().getSimpleName().equals("OrcInputFormat")) {
+        System.out.println("inputFormat is: " + inputFormat.getClass());
+        if(inputFormat instanceof FileInputFormat ||
+                inputFormat instanceof OrcInputFormat ||
+                inputFormat instanceof  PageInputFormat) {
             return true;
         }
 
@@ -350,13 +355,15 @@ public final class HiveUtil
         for (Class<?> clazz = inputFormat.getClass(); clazz != null; clazz = clazz.getSuperclass()) {
             try {
                 method = clazz.getDeclaredMethod("isSplitable", FileSystem.class, Path.class);
+                System.out.println("method is: " + method);
                 break;
             }
-            catch (NoSuchMethodException ignored) {
+            catch (Exception ignored) {
             }
         }
 
         if (method == null) {
+            System.out.println("method is null, returning false");
             return false;
         }
         try {
