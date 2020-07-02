@@ -14,23 +14,14 @@
 package com.facebook.presto.server.protocol;
 
 import com.facebook.airlift.concurrent.BoundedExecutor;
-import com.facebook.airlift.log.Logger;
-import com.facebook.presto.Session;
 import com.facebook.presto.client.QueryResults;
-import com.facebook.presto.common.block.BlockEncodingSerde;
-import com.facebook.presto.execution.QueryManager;
-import com.facebook.presto.memory.context.SimpleLocalMemoryContext;
-import com.facebook.presto.operator.ExchangeClient;
-import com.facebook.presto.operator.ExchangeClientSupplier;
 import com.facebook.presto.server.ForStatementResource;
 import com.facebook.presto.spi.QueryId;
-import com.google.common.collect.Ordering;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 
-import javax.annotation.PreDestroy;
 import javax.inject.Inject;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.GET;
@@ -53,11 +44,7 @@ import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 import java.util.Map.Entry;
 import java.util.NoSuchElementException;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ScheduledExecutorService;
 
-import static com.facebook.airlift.concurrent.Threads.threadsNamed;
 import static com.facebook.airlift.http.server.AsyncResponseHandler.bindAsyncResponse;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_ADDED_PREPARE;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_CLEAR_SESSION;
@@ -68,77 +55,24 @@ import static com.facebook.presto.client.PrestoHeaders.PRESTO_SET_ROLE;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_SET_SCHEMA;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_SET_SESSION;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_STARTED_TRANSACTION_ID;
-import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
-import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.net.HttpHeaders.X_FORWARDED_PROTO;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.Objects.requireNonNull;
-import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static javax.ws.rs.core.MediaType.TEXT_PLAIN_TYPE;
 
 @Path("/")
 public class ExecutingStatementResource
 {
-    private static final Logger log = Logger.get(ExecutingStatementResource.class);
-    private static final Duration MAX_WAIT_TIME = new Duration(1, SECONDS);
-    private static final Ordering<Comparable<Duration>> WAIT_ORDERING = Ordering.natural().nullsLast();
-
-    private static final DataSize DEFAULT_TARGET_RESULT_SIZE = new DataSize(1, MEGABYTE);
-    private static final DataSize MAX_TARGET_RESULT_SIZE = new DataSize(128, MEGABYTE);
-
-    private final QueryManager queryManager;
-    private final ExchangeClientSupplier exchangeClientSupplier;
-    private final BlockEncodingSerde blockEncodingSerde;
     private final BoundedExecutor responseExecutor;
-    private final ScheduledExecutorService timeoutExecutor;
-
-    private final ConcurrentMap<QueryId, Query> queries = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService queryPurger = newSingleThreadScheduledExecutor(threadsNamed("execution-query-purger"));
+    private final LocalQueryResultsProvider queryExecutor;
 
     @Inject
     public ExecutingStatementResource(
-            QueryManager queryManager,
-            ExchangeClientSupplier exchangeClientSupplier,
-            BlockEncodingSerde blockEncodingSerde,
             @ForStatementResource BoundedExecutor responseExecutor,
-            @ForStatementResource ScheduledExecutorService timeoutExecutor)
+            LocalQueryResultsProvider queryExecutor)
     {
-        this.queryManager = requireNonNull(queryManager, "queryManager is null");
-        this.exchangeClientSupplier = requireNonNull(exchangeClientSupplier, "exchangeClientSupplier is null");
-        this.blockEncodingSerde = requireNonNull(blockEncodingSerde, "blockEncodingSerde is null");
         this.responseExecutor = requireNonNull(responseExecutor, "responseExecutor is null");
-        this.timeoutExecutor = requireNonNull(timeoutExecutor, "timeoutExecutor is null");
-
-        queryPurger.scheduleWithFixedDelay(
-                () -> {
-                    try {
-                        for (Entry<QueryId, Query> entry : queries.entrySet()) {
-                            // forget about this query if the query manager is no longer tracking it
-                            try {
-                                queryManager.getQueryState(entry.getKey());
-                            }
-                            catch (NoSuchElementException e) {
-                                // query is no longer registered
-                                queries.remove(entry.getKey());
-                            }
-                        }
-                    }
-                    catch (Throwable e) {
-                        log.warn(e, "Error removing old queries");
-                    }
-                },
-                200,
-                200,
-                MILLISECONDS);
-    }
-
-    @PreDestroy
-    public void stop()
-    {
-        queryPurger.shutdownNow();
+        this.queryExecutor = requireNonNull(queryExecutor, "queryExecutor is null");
     }
 
     @GET
@@ -154,70 +88,8 @@ public class ExecutingStatementResource
             @Context UriInfo uriInfo,
             @Suspended AsyncResponse asyncResponse)
     {
-        Query query = getQuery(queryId, slug);
-        if (isNullOrEmpty(proto)) {
-            proto = uriInfo.getRequestUri().getScheme();
-        }
-
-        asyncQueryResults(query, token, maxWait, targetResultSize, uriInfo, proto, asyncResponse);
-    }
-
-    protected Query getQuery(QueryId queryId, String slug)
-    {
-        Query query = queries.get(queryId);
-        if (query != null) {
-            if (!query.isSlugValid(slug)) {
-                throw notFound("Query not found");
-            }
-            return query;
-        }
-
-        // this is the first time the query has been accessed on this coordinator
-        Session session;
-        try {
-            if (!queryManager.isQuerySlugValid(queryId, slug)) {
-                throw notFound("Query not found");
-            }
-            session = queryManager.getQuerySession(queryId);
-        }
-        catch (NoSuchElementException e) {
-            throw notFound("Query not found");
-        }
-
-        query = queries.computeIfAbsent(queryId, id -> {
-            ExchangeClient exchangeClient = exchangeClientSupplier.get(new SimpleLocalMemoryContext(newSimpleAggregatedMemoryContext(), ExecutingStatementResource.class.getSimpleName()));
-            return Query.create(
-                    session,
-                    slug,
-                    queryManager,
-                    exchangeClient,
-                    responseExecutor,
-                    timeoutExecutor,
-                    blockEncodingSerde);
-        });
-        return query;
-    }
-
-    private void asyncQueryResults(
-            Query query,
-            long token,
-            Duration maxWait,
-            DataSize targetResultSize,
-            UriInfo uriInfo,
-            String scheme,
-            AsyncResponse asyncResponse)
-    {
-        Duration wait = WAIT_ORDERING.min(MAX_WAIT_TIME, maxWait);
-        if (targetResultSize == null) {
-            targetResultSize = DEFAULT_TARGET_RESULT_SIZE;
-        }
-        else {
-            targetResultSize = Ordering.natural().min(targetResultSize, MAX_TARGET_RESULT_SIZE);
-        }
-        ListenableFuture<QueryResults> queryResultsFuture = query.waitForResults(token, uriInfo, scheme, wait, targetResultSize);
-
-        ListenableFuture<Response> response = Futures.transform(queryResultsFuture, queryResults -> toResponse(query, queryResults), directExecutor());
-
+        ListenableFuture<LocalQueryResultsProvider.QueryWithResults> queryResultsFuture = queryExecutor.fetchQueryResults(queryId, token, slug, maxWait, targetResultSize, proto, uriInfo);
+        ListenableFuture<Response> response = Futures.transform(queryResultsFuture, queryWithResults -> toResponse(queryWithResults.getQuery(), queryWithResults.getQueryResults()), directExecutor());
         bindAsyncResponse(asyncResponse, response, responseExecutor);
     }
 
@@ -273,21 +145,8 @@ public class ExecutingStatementResource
             @PathParam("token") long token,
             @QueryParam("slug") String slug)
     {
-        Query query = queries.get(queryId);
-        if (query != null) {
-            if (!query.isSlugValid(slug)) {
-                throw notFound("Query not found");
-            }
-            query.cancel();
-            return Response.noContent().build();
-        }
-
-        // cancel the query execution directly instead of creating the statement client
         try {
-            if (!queryManager.isQuerySlugValid(queryId, slug)) {
-                throw notFound("Query not found");
-            }
-            queryManager.cancelQuery(queryId);
+            queryExecutor.cancelQuery(queryId, slug);
             return Response.noContent().build();
         }
         catch (NoSuchElementException e) {

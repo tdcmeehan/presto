@@ -21,6 +21,7 @@ import com.facebook.presto.execution.ExecutionFailureInfo;
 import com.facebook.presto.execution.QueryState;
 import com.facebook.presto.server.HttpRequestSessionContext;
 import com.facebook.presto.server.SessionContext;
+import com.facebook.presto.server.protocol.LocalQueryResultsProvider;
 import com.facebook.presto.spi.ErrorCode;
 import com.facebook.presto.spi.QueryId;
 import com.google.common.collect.ImmutableList;
@@ -28,6 +29,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Ordering;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 
 import javax.annotation.PreDestroy;
@@ -68,8 +70,12 @@ import static com.facebook.presto.execution.QueryState.QUEUED;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
+import static com.google.common.base.Verify.verify;
 import static com.google.common.net.HttpHeaders.X_FORWARDED_PROTO;
+import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static com.google.common.util.concurrent.Futures.transform;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
+import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.UUID.randomUUID;
@@ -90,6 +96,7 @@ public class QueuedStatementResource
     private static final Duration NO_DURATION = new Duration(0, MILLISECONDS);
 
     private final DispatchManager dispatchManager;
+    private final LocalQueryResultsProvider queryExecutor;
 
     private final Executor responseExecutor;
     private final ScheduledExecutorService timeoutExecutor;
@@ -100,9 +107,11 @@ public class QueuedStatementResource
     @Inject
     public QueuedStatementResource(
             DispatchManager dispatchManager,
-            DispatchExecutor executor)
+            DispatchExecutor executor,
+            LocalQueryResultsProvider queryExecutor)
     {
         this.dispatchManager = requireNonNull(dispatchManager, "dispatchManager is null");
+        this.queryExecutor = queryExecutor;
 
         requireNonNull(dispatchManager, "dispatchManager is null");
         this.responseExecutor = requireNonNull(executor, "responseExecutor is null").getExecutor();
@@ -152,10 +161,10 @@ public class QueuedStatementResource
         }
 
         SessionContext sessionContext = new HttpRequestSessionContext(servletRequest);
-        Query query = new Query(statement, sessionContext, dispatchManager);
+        Query query = new Query(statement, sessionContext, dispatchManager, queryExecutor, timeoutExecutor);
         queries.put(query.getQueryId(), query);
 
-        return Response.ok(query.getQueryResults(query.getLastToken(), uriInfo, xForwardedProto)).build();
+        return Response.ok(query.getInitialQueryResults(uriInfo, xForwardedProto)).build();
     }
 
     @GET
@@ -180,13 +189,13 @@ public class QueuedStatementResource
                 timeoutExecutor);
 
         // when state changes, fetch the next result
-        ListenableFuture<QueryResults> queryResultsFuture = Futures.transform(
+        ListenableFuture<QueryResults> queryResultsFuture = Futures.transformAsync(
                 futureStateChange,
                 ignored -> query.getQueryResults(token, uriInfo, xForwardedProto),
                 responseExecutor);
 
         // transform to Response
-        ListenableFuture<Response> response = Futures.transform(
+        ListenableFuture<Response> response = transform(
                 queryResultsFuture,
                 queryResults -> Response.ok(queryResults).build(),
                 directExecutor());
@@ -284,6 +293,8 @@ public class QueuedStatementResource
         private final String query;
         private final SessionContext sessionContext;
         private final DispatchManager dispatchManager;
+        private final LocalQueryResultsProvider queryExecutor;
+        private final ScheduledExecutorService timeoutExecutor;
         private final QueryId queryId;
         private final String slug = "x" + randomUUID().toString().toLowerCase(ENGLISH).replace("-", "");
         private final AtomicLong lastToken = new AtomicLong();
@@ -291,11 +302,13 @@ public class QueuedStatementResource
         @GuardedBy("this")
         private ListenableFuture<?> querySubmissionFuture;
 
-        public Query(String query, SessionContext sessionContext, DispatchManager dispatchManager)
+        public Query(String query, SessionContext sessionContext, DispatchManager dispatchManager, LocalQueryResultsProvider queryExecutor, ScheduledExecutorService timeoutExecutor)
         {
             this.query = requireNonNull(query, "query is null");
             this.sessionContext = requireNonNull(sessionContext, "sessionContext is null");
             this.dispatchManager = requireNonNull(dispatchManager, "dispatchManager is null");
+            this.queryExecutor = requireNonNull(queryExecutor, "queryExecutor is null");
+            this.timeoutExecutor = requireNonNull(timeoutExecutor, "timeoutExecutor is null");
             this.queryId = dispatchManager.createQueryId();
         }
 
@@ -335,7 +348,18 @@ public class QueuedStatementResource
             return dispatchManager.waitForDispatched(queryId);
         }
 
-        public QueryResults getQueryResults(long token, UriInfo uriInfo, String xForwardedProto)
+        public synchronized QueryResults getInitialQueryResults(UriInfo uriInfo, String xForwardedProto)
+        {
+            verify(lastToken.get() == 0);
+            verify(querySubmissionFuture == null);
+            return createQueryResults(
+                    1,
+                    uriInfo,
+                    xForwardedProto,
+                    DispatchInfo.queued(NO_DURATION, NO_DURATION));
+        }
+
+        public ListenableFuture<QueryResults> getQueryResults(long token, UriInfo uriInfo, String xForwardedProto)
         {
             long lastToken = this.lastToken.get();
             // token should be the last token or the next token
@@ -348,11 +372,11 @@ public class QueuedStatementResource
             synchronized (this) {
                 // if query submission has not finished, return simple empty result
                 if (querySubmissionFuture == null || !querySubmissionFuture.isDone()) {
-                    return createQueryResults(
+                    return immediateFuture(createQueryResults(
                             token + 1,
                             uriInfo,
                             xForwardedProto,
-                            DispatchInfo.queued(NO_DURATION, NO_DURATION));
+                            DispatchInfo.queued(NO_DURATION, NO_DURATION)));
                 }
             }
 
@@ -364,7 +388,18 @@ public class QueuedStatementResource
                         .build());
             }
 
-            return createQueryResults(token + 1, uriInfo, xForwardedProto, dispatchInfo.get());
+            if (!waitForDispatched().isDone()) {
+                return immediateFuture(createQueryResults(token + 1, uriInfo, xForwardedProto, dispatchInfo.get()));
+            }
+            ListenableFuture<QueryResults> queryResults = transform(
+                    queryExecutor.fetchQueryResults(queryId, token + 1, slug, new Duration(1, SECONDS), new DataSize(1, MEGABYTE), xForwardedProto, uriInfo),
+                    LocalQueryResultsProvider.QueryWithResults::getQueryResults,
+                    directExecutor());
+            return addTimeout(
+                    queryResults,
+                    () -> createQueryResults(token + 1, uriInfo, xForwardedProto, dispatchInfo.get()),
+                    new Duration(2, SECONDS),
+                    timeoutExecutor);
         }
 
         public synchronized void cancel()
@@ -397,8 +432,8 @@ public class QueuedStatementResource
             }
             // if dispatched, redirect to new uri
             return dispatchInfo.getCoordinatorLocation()
-                            .map(coordinatorLocation -> getRedirectUri(coordinatorLocation, uriInfo, xForwardedProto))
-                            .orElseGet(() -> getQueuedUri(queryId, slug, token, uriInfo, xForwardedProto));
+                    .map(coordinatorLocation -> getRedirectUri(coordinatorLocation, uriInfo, xForwardedProto))
+                    .orElseGet(() -> getQueuedUri(queryId, slug, token, uriInfo, xForwardedProto));
         }
 
         private URI getRedirectUri(CoordinatorLocation coordinatorLocation, UriInfo uriInfo, String xForwardedProto)

@@ -97,6 +97,7 @@ import com.facebook.presto.memory.TotalReservationOnBlockedNodesLowMemoryKiller;
 import com.facebook.presto.metadata.CatalogManager;
 import com.facebook.presto.operator.ForScheduler;
 import com.facebook.presto.server.protocol.ExecutingStatementResource;
+import com.facebook.presto.server.protocol.LocalQueryResultsProvider;
 import com.facebook.presto.server.remotetask.HttpRemoteTaskFactory;
 import com.facebook.presto.server.remotetask.RemoteTaskStats;
 import com.facebook.presto.spi.memory.ClusterMemoryPoolManager;
@@ -230,6 +231,8 @@ public class CoordinatorModule
         newExporter(binder).export(InternalResourceGroupManager.class).withGeneratedName();
         binder.bind(ResourceGroupManager.class).to(InternalResourceGroupManager.class);
         binder.bind(LegacyResourceGroupConfigurationManager.class).in(Scopes.SINGLETON);
+
+        binder.bind(LocalQueryResultsProvider.class).in(Scopes.SINGLETON);
 
         // dispatcher
         binder.bind(DispatchManager.class).in(Scopes.SINGLETON);
