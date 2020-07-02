@@ -392,7 +392,7 @@ public class QueuedStatementResource
                 return immediateFuture(createQueryResults(token + 1, uriInfo, xForwardedProto, dispatchInfo.get()));
             }
             ListenableFuture<QueryResults> queryResults = transform(
-                    queryExecutor.fetchQueryResults(queryId, token + 1, slug, new Duration(1, SECONDS), new DataSize(1, MEGABYTE), xForwardedProto, uriInfo),
+                    queryExecutor.fetchQueryResults(queryId, 0, slug, new Duration(1, SECONDS), new DataSize(1, MEGABYTE), xForwardedProto, uriInfo),
                     LocalQueryResultsProvider.QueryWithResults::getQueryResults,
                     directExecutor());
             return addTimeout(
