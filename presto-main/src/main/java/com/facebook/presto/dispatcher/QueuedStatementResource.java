@@ -162,6 +162,7 @@ public class QueuedStatementResource
 
         SessionContext sessionContext = new HttpRequestSessionContext(servletRequest);
         Query query = new Query(statement, sessionContext, dispatchManager, queryExecutor, timeoutExecutor);
+        query.trySubmitQuery();
         queries.put(query.getQueryId(), query);
 
         return Response.ok(query.getInitialQueryResults(uriInfo, xForwardedProto)).build();
@@ -336,9 +337,7 @@ public class QueuedStatementResource
         {
             // if query query submission has not finished, wait for it to finish
             synchronized (this) {
-                if (querySubmissionFuture == null) {
-                    querySubmissionFuture = dispatchManager.createQuery(queryId, slug, sessionContext, query);
-                }
+                trySubmitQuery();
                 if (!querySubmissionFuture.isDone()) {
                     return querySubmissionFuture;
                 }
@@ -348,10 +347,18 @@ public class QueuedStatementResource
             return dispatchManager.waitForDispatched(queryId);
         }
 
+        private void trySubmitQuery()
+        {
+            synchronized (this) {
+                if (querySubmissionFuture == null) {
+                    querySubmissionFuture = dispatchManager.createQuery(queryId, slug, sessionContext, query);
+                }
+            }
+        }
+
         public synchronized QueryResults getInitialQueryResults(UriInfo uriInfo, String xForwardedProto)
         {
             verify(lastToken.get() == 0);
-            verify(querySubmissionFuture == null);
             return createQueryResults(
                     1,
                     uriInfo,
