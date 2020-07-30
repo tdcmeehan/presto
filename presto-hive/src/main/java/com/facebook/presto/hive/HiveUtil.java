@@ -346,8 +346,8 @@ public final class HiveUtil
         // ORC uses a custom InputFormat but is always splittable
         if (inputFormat.getClass().getSimpleName().equals("OrcInputFormat") ||
                 (inputFormat.getClass().getSimpleName().equals("RCFileInputFormat"))) {
-            System.out.println("inputFormat is " + inputFormat.getClass());
-            System.out.println("isSplittable is true");
+//            System.out.println("inputFormat is " + inputFormat.getClass());
+//            System.out.println("isSplittable is true");
             return true;
         }
 

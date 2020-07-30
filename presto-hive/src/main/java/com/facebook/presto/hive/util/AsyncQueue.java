@@ -111,7 +111,7 @@ public class AsyncQueue<T>
             notEmptySignal = SettableFuture.create();
         }
         if (newSize >= targetQueueSize) {
-            Logger.get(AsyncQueue.class).info("Max queue" + targetQueueSize);
+//            Logger.get(AsyncQueue.class).info("Max queue" + targetQueueSize);
             return notFullSignal;
         }
         return immediateFuture(null);

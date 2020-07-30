@@ -266,10 +266,10 @@ public class BackgroundHiveSplitLoader
         if (splits == null) {
             HivePartitionMetadata partition = partitions.poll();
             if (partition == null) {
-                Logger.get(BackgroundHiveSplitLoader.class).info("partition == null");
+//                Logger.get(BackgroundHiveSplitLoader.class).info("partition == null");
                 return COMPLETED_FUTURE;
             }
-            Logger.get(BackgroundHiveSplitLoader.class).info("Partition added");
+//            Logger.get(BackgroundHiveSplitLoader.class).info("Partition added");
             return loadPartition(partition);
         }
 
@@ -280,7 +280,7 @@ public class BackgroundHiveSplitLoader
             ListenableFuture<?> future = hiveSplitSource.addToQueue(splits.next());
             loaded++;
             if (loaded % 100000 == 0) {
-                Logger.get(BackgroundHiveSplitLoader.class).info("Loaded %d", loaded);
+//                Logger.get(BackgroundHiveSplitLoader.class).info("Loaded %d", loaded);
             }
             if (!future.isDone()) {
                 fileIterators.addFirst(splits);
@@ -289,7 +289,7 @@ public class BackgroundHiveSplitLoader
         }
 
         // No need to put the iterator back, since it's either empty or we've stopped
-        Logger.get(BackgroundHiveSplitLoader.class).info("return " + loaded);
+//        Logger.get(BackgroundHiveSplitLoader.class).info("return " + loaded);
         return COMPLETED_FUTURE;
     }
 

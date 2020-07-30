@@ -66,9 +66,9 @@ import static java.util.concurrent.Executors.newCachedThreadPool;
 
 @State(Scope.Thread)
 @OutputTimeUnit(TimeUnit.SECONDS)
-@Measurement(iterations = 1)
-@Warmup(iterations = 1)
-@Fork(1)
+@Measurement(iterations = 10)
+@Warmup(iterations = 10)
+@Fork(3)
 @BenchmarkMode(Mode.AverageTime)
 public class BenchmarkHiveSplitSource
 {
@@ -77,17 +77,19 @@ public class BenchmarkHiveSplitSource
     private static final ExecutorService EXECUTOR = newCachedThreadPool(daemonThreadsNamed("test-%s"));
 
     private static final Table SIMPLE_TABLE = table(ImmutableList.of(), Optional.empty());
-//    @Param({"500000", "5000000"})
-    @Param({"1"})
+    @Param({"500000", "5000000"})
+//    @Param({"1"})
     public int splits;
-//    @Param({"1", "8"})
-    @Param({"1"})
+    @Param({"1", "8"})
+//    @Param({"1"})
     public int loaderThreads;
-//    @Param({"1", "64"})
-    @Param({"1"})
+    @Param({"1", "64"})
+//    @Param({"1"})
     public int partitions;
 
     private HiveSplitSource hiveSplitSource;
+    @Param({"1000", "100000", "1000000"})
+    private int batchSize;
 
     @Setup(Level.Invocation)
     public void setup()
@@ -112,7 +114,7 @@ public class BenchmarkHiveSplitSource
         long splitsCount = 0;
         while (!hiveSplitSource.isFinished()) {
             List<ConnectorSplit> splits = hiveSplitSource
-                    .getNextBatch(NOT_PARTITIONED, 100_000)
+                    .getNextBatch(NOT_PARTITIONED, batchSize)
                     .get()
                     .getSplits();
             splitsCount += splits.size();
