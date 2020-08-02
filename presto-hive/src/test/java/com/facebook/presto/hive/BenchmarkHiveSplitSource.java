@@ -65,7 +65,7 @@ import static io.airlift.units.DataSize.Unit.GIGABYTE;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 
 @State(Scope.Thread)
-@OutputTimeUnit(TimeUnit.SECONDS)
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
 @Measurement(iterations = 10)
 @Warmup(iterations = 10)
 @Fork(3)
@@ -111,16 +111,13 @@ public class BenchmarkHiveSplitSource
     public void testCachingDirectoryLister(Blackhole bh)
             throws Exception
     {
-        long splitsCount = 0;
         while (!hiveSplitSource.isFinished()) {
-            List<ConnectorSplit> splits = hiveSplitSource
+            hiveSplitSource
                     .getNextBatch(NOT_PARTITIONED, batchSize)
                     .get()
-                    .getSplits();
-            splitsCount += splits.size();
-            bh.consume(splits);
+                    .getSplits()
+                    .forEach(bh::consume);
         }
-        LOGGER.info("Drained %d", splitsCount);
     }
 
     private BackgroundHiveSplitLoader backgroundHiveSplitLoader(List<LocatedFileStatus> files, DirectoryLister directoryLister, String fileStatusCacheTables)
