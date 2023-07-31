@@ -67,6 +67,7 @@ import com.facebook.presto.hive.orc.OrcSelectivePageSource;
 import com.facebook.presto.hive.pagefile.PageFilePageSource;
 import com.facebook.presto.hive.parquet.ParquetPageSource;
 import com.facebook.presto.hive.rcfile.RcFilePageSource;
+import com.facebook.presto.hive.rule.BaseHiveFilterPushdown.ConnectorPushdownFilterResult;
 import com.facebook.presto.hive.rule.HiveFilterPushdown;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.spi.ColumnHandle;
@@ -2289,7 +2290,7 @@ public abstract class AbstractTestHiveClient
         }
     }
 
-    private static HiveFilterPushdown.ConnectorPushdownFilterResult pushdownFilter(
+    private static ConnectorPushdownFilterResult pushdownFilter(
             ConnectorSession session,
             ConnectorMetadata metadata,
             SemiTransactionalHiveMetastore metastore,
@@ -2301,8 +2302,8 @@ public abstract class AbstractTestHiveClient
             RowExpression filter,
             Optional<ConnectorTableLayoutHandle> currentLayoutHandle)
     {
-        HiveFilterPushdown filterPushdown = new HiveFilterPushdown(new HiveTransactionManager(), rowExpressionService, functionResolution, partitionManager, functionMetadataManager);
-        return filterPushdown.pushdownFilter(session, metadata, metastore, tableHandle, filter, currentLayoutHandle);
+        HiveFilterPushdown filterPushdown = new HiveFilterPushdown(rowExpressionService, functionResolution, functionMetadataManager, new HiveTransactionManager(), partitionManager);
+        return filterPushdown.pushdownFilter(session, metadata, tableHandle, filter, currentLayoutHandle);
     }
 
     private static void assertBucketTableEvolutionResult(MaterializedResult result, List<ColumnHandle> columnHandles, Set<Integer> bucketIds, int rowCount)
