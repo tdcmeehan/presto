@@ -43,6 +43,7 @@ public class IcebergConfig
     private double minimumAssignedSplitWeight = 0.05;
     private boolean parquetDereferencePushdownEnabled = true;
     private boolean mergeOnReadModeEnabled;
+    private boolean pushdownFilterEnabled;
 
     @NotNull
     public FileFormat getFileFormat()
@@ -179,5 +180,18 @@ public class IcebergConfig
     public boolean isMergeOnReadModeEnabled()
     {
         return mergeOnReadModeEnabled;
+    }
+
+    public boolean isPushdownFilterEnabled()
+    {
+        return pushdownFilterEnabled;
+    }
+
+    @Config("iceberg.pushdown-filter-enabled")
+    @ConfigDescription("Experimental: Enable filter pushdown for Iceberg. This is only supported with Native Worker.")
+    public IcebergConfig setPushdownFilterEnabled(boolean pushdownFilterEnabled)
+    {
+        this.pushdownFilterEnabled = pushdownFilterEnabled;
+        return this;
     }
 }

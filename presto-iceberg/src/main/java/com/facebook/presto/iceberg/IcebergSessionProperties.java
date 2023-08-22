@@ -79,6 +79,7 @@ public final class IcebergSessionProperties
     public static final String READ_MASKED_VALUE_ENABLED = "read_null_masked_parquet_encrypted_value_enabled";
     public static final String PARQUET_DEREFERENCE_PUSHDOWN_ENABLED = "parquet_dereference_pushdown_enabled";
     public static final String MERGE_ON_READ_MODE_ENABLED = "merge_on_read_enabled";
+    public static final String PUSHDOWN_FILTER_ENABLED = "pushdown_filter_enabled";
     private final List<PropertyMetadata<?>> sessionProperties;
 
     @Inject
@@ -279,6 +280,11 @@ public final class IcebergSessionProperties
                         MERGE_ON_READ_MODE_ENABLED,
                         "Reads enabled for merge-on-read Iceberg tables",
                         icebergConfig.isMergeOnReadModeEnabled(),
+                        false),
+                booleanProperty(
+                        PUSHDOWN_FILTER_ENABLED,
+                        "Experimental: Enable Filter Pushdown for Iceberg. This is only supported with Native Worker.",
+                        icebergConfig.isPushdownFilterEnabled(),
                         false));
     }
 
@@ -455,5 +461,10 @@ public final class IcebergSessionProperties
     public static boolean isMergeOnReadModeEnabled(ConnectorSession session)
     {
         return session.getProperty(MERGE_ON_READ_MODE_ENABLED, Boolean.class);
+    }
+
+    public static boolean isPushdownFilterEnabled(ConnectorSession session)
+    {
+        return session.getProperty(PUSHDOWN_FILTER_ENABLED, Boolean.class);
     }
 }
