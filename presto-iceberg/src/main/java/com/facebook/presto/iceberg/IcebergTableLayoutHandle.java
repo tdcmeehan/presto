@@ -13,41 +13,59 @@
  */
 package com.facebook.presto.iceberg;
 
+import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.predicate.TupleDomain;
-import com.facebook.presto.spi.ColumnHandle;
-import com.facebook.presto.spi.ConnectorTableLayoutHandle;
+import com.facebook.presto.hive.BaseHiveTableLayoutHandle;
+import com.facebook.presto.spi.relation.RowExpression;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 
 import static java.util.Objects.requireNonNull;
 
 public class IcebergTableLayoutHandle
-        implements ConnectorTableLayoutHandle
+        extends BaseHiveTableLayoutHandle
 {
+    private final Map<String, IcebergColumnHandle> predicateColumns;
+    private final Optional<Set<IcebergColumnHandle>> requestedColumns;
     private final IcebergTableHandle table;
-    private final TupleDomain<ColumnHandle> tupleDomain;
 
     @JsonCreator
     public IcebergTableLayoutHandle(
-            @JsonProperty("table") IcebergTableHandle table,
-            @JsonProperty("tupleDomain") TupleDomain<ColumnHandle> domain)
+            @JsonProperty("domainPredicate") TupleDomain<Subfield> domainPredicate,
+            @JsonProperty("remainingPredicate") RowExpression remainingPredicate,
+            @JsonProperty("predicateColumns") Map<String, IcebergColumnHandle> predicateColumns,
+            @JsonProperty("requestedColumns") Optional<Set<IcebergColumnHandle>> requestedColumns,
+            @JsonProperty("pushdownFilterEnabled") boolean pushdownFilterEnabled,
+            @JsonProperty("table") IcebergTableHandle table)
     {
+        super(domainPredicate, remainingPredicate, pushdownFilterEnabled);
+
+        this.predicateColumns = requireNonNull(predicateColumns, "predicateColumns is null");
+        this.requestedColumns = requireNonNull(requestedColumns, "requestedColumns is null");
         this.table = requireNonNull(table, "table is null");
-        this.tupleDomain = requireNonNull(domain, "tupleDomain is null");
+    }
+
+    @JsonProperty
+    public Map<String, IcebergColumnHandle> getPredicateColumns()
+    {
+        return predicateColumns;
+    }
+
+    @JsonProperty
+    public Optional<Set<IcebergColumnHandle>> getRequestedColumns()
+    {
+        return requestedColumns;
     }
 
     @JsonProperty
     public IcebergTableHandle getTable()
     {
         return table;
-    }
-
-    @JsonProperty
-    public TupleDomain<ColumnHandle> getTupleDomain()
-    {
-        return tupleDomain;
     }
 
     @Override
@@ -60,14 +78,18 @@ public class IcebergTableLayoutHandle
             return false;
         }
         IcebergTableLayoutHandle that = (IcebergTableLayoutHandle) o;
-        return Objects.equals(table, that.table) &&
-                Objects.equals(tupleDomain, that.tupleDomain);
+        return Objects.equals(getDomainPredicate(), that.getDomainPredicate()) &&
+                Objects.equals(getRemainingPredicate(), that.getRemainingPredicate()) &&
+                Objects.equals(predicateColumns, that.predicateColumns) &&
+                Objects.equals(requestedColumns, that.requestedColumns) &&
+                Objects.equals(isPushdownFilterEnabled(), that.isPushdownFilterEnabled()) &&
+                Objects.equals(table, that.table);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(table, tupleDomain);
+        return Objects.hash(getDomainPredicate(), getRemainingPredicate(), predicateColumns, requestedColumns, isPushdownFilterEnabled(), table);
     }
 
     @Override
