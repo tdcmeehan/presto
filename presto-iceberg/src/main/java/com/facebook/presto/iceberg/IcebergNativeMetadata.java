@@ -28,6 +28,8 @@ import com.facebook.presto.spi.ConnectorTableMetadata;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableNotFoundException;
+import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.relation.RowExpressionService;
 import com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionSpec;
@@ -77,10 +79,12 @@ public class IcebergNativeMetadata
     public IcebergNativeMetadata(
             IcebergResourceFactory resourceFactory,
             TypeManager typeManager,
+            StandardFunctionResolution functionResolution,
+            RowExpressionService rowExpressionService,
             JsonCodec<CommitTaskData> commitTaskCodec,
             CatalogType catalogType)
     {
-        super(typeManager, commitTaskCodec);
+        super(typeManager, functionResolution, rowExpressionService, commitTaskCodec);
         this.resourceFactory = requireNonNull(resourceFactory, "resourceFactory is null");
         this.catalogType = requireNonNull(catalogType, "catalogType is null");
     }
@@ -136,7 +140,7 @@ public class IcebergNativeMetadata
     public Map<String, ColumnHandle> getColumnHandles(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
         IcebergTableHandle table = (IcebergTableHandle) tableHandle;
-        Table icebergTable = getNativeIcebergTable(resourceFactory, session, table.getSchemaTableName());
+        Table icebergTable = getIcebergTable(session, table.getSchemaTableName());
         return getColumns(icebergTable.schema(), typeManager).stream()
                 .collect(toImmutableMap(IcebergColumnHandle::getName, identity()));
     }
@@ -224,7 +228,7 @@ public class IcebergNativeMetadata
     public ConnectorInsertTableHandle beginInsert(ConnectorSession session, ConnectorTableHandle tableHandle)
     {
         IcebergTableHandle table = (IcebergTableHandle) tableHandle;
-        Table icebergTable = getNativeIcebergTable(resourceFactory, session, table.getSchemaTableName());
+        Table icebergTable = getIcebergTable(session, table.getSchemaTableName());
 
         return beginIcebergTableInsert(table, icebergTable);
     }
@@ -249,7 +253,7 @@ public class IcebergNativeMetadata
     {
         Table icebergTable;
         try {
-            icebergTable = getNativeIcebergTable(resourceFactory, session, table);
+            icebergTable = getIcebergTable(session, table);
         }
         catch (NoSuchTableException e) {
             throw new TableNotFoundException(table);

@@ -33,12 +33,11 @@ import com.facebook.presto.spi.relation.DomainTranslator;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.RowExpressionService;
 
-import javax.inject.Inject;
-
 import java.util.Map;
 import java.util.stream.Collectors;
 
 import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
+import static com.facebook.presto.iceberg.IcebergSessionProperties.isPushdownFilterEnabled;
 import static com.facebook.presto.spi.ConnectorPlanRewriter.rewriteWith;
 import static java.util.Objects.requireNonNull;
 
@@ -49,7 +48,6 @@ public class IcebergPlanOptimizer
     private final StandardFunctionResolution functionResolution;
     private final TypeManager typeManager;
 
-    @Inject
     IcebergPlanOptimizer(StandardFunctionResolution functionResolution, RowExpressionService rowExpressionService, TypeManager typeManager)
     {
         this.functionResolution = requireNonNull(functionResolution, "functionResolution is null");
@@ -60,6 +58,9 @@ public class IcebergPlanOptimizer
     @Override
     public PlanNode optimize(PlanNode maxSubplan, ConnectorSession session, VariableAllocator variableAllocator, PlanNodeIdAllocator idAllocator)
     {
+        if (isPushdownFilterEnabled(session)) {
+            return maxSubplan;
+        }
         return rewriteWith(new FilterPushdownRewriter(functionResolution, rowExpressionService, typeManager, idAllocator, session), maxSubplan);
     }
 

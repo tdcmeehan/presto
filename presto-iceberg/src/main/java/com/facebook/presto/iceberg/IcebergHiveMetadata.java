@@ -33,6 +33,8 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaNotFoundException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableNotFoundException;
+import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.relation.RowExpressionService;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.apache.hadoop.fs.Path;
@@ -84,9 +86,11 @@ public class IcebergHiveMetadata
             ExtendedHiveMetastore metastore,
             HdfsEnvironment hdfsEnvironment,
             TypeManager typeManager,
+            StandardFunctionResolution functionResolution,
+            RowExpressionService rowExpressionService,
             JsonCodec<CommitTaskData> commitTaskCodec)
     {
-        super(typeManager, commitTaskCodec);
+        super(typeManager, functionResolution, rowExpressionService, commitTaskCodec);
         this.metastore = requireNonNull(metastore, "metastore is null");
         this.hdfsEnvironment = requireNonNull(hdfsEnvironment, "hdfsEnvironment is null");
     }
@@ -252,7 +256,7 @@ public class IcebergHiveMetadata
     {
         IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
         // TODO: support path override in Iceberg table creation
-        org.apache.iceberg.Table table = getHiveIcebergTable(metastore, hdfsEnvironment, session, handle.getSchemaTableName());
+        org.apache.iceberg.Table table = getIcebergTable(session, handle.getSchemaTableName());
         if (table.properties().containsKey(OBJECT_STORE_PATH) ||
                 table.properties().containsKey("write.folder-storage.path") || // Removed from Iceberg as of 0.14.0, but preserved for backward compatibility
                 table.properties().containsKey(WRITE_METADATA_LOCATION) ||
@@ -279,7 +283,7 @@ public class IcebergHiveMetadata
             throw new TableNotFoundException(table);
         }
 
-        org.apache.iceberg.Table icebergTable = getHiveIcebergTable(metastore, hdfsEnvironment, session, table);
+        org.apache.iceberg.Table icebergTable = getIcebergTable(session, table);
         List<ColumnMetadata> columns = getColumnMetadatas(icebergTable);
 
         return new ConnectorTableMetadata(table, columns, createMetadataProperties(icebergTable), getTableComment(icebergTable));

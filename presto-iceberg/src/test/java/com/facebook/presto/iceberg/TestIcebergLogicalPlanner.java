@@ -17,18 +17,28 @@ import com.facebook.presto.Session;
 import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.cost.StatsProvider;
+import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.TableScanNode;
+import com.facebook.presto.spi.relation.CallExpression;
+import com.facebook.presto.spi.relation.ConstantExpression;
+import com.facebook.presto.spi.relation.RowExpression;
+import com.facebook.presto.spi.relation.SpecialFormExpression;
+import com.facebook.presto.spi.relation.VariableReferenceExpression;
+import com.facebook.presto.sql.planner.Plan;
 import com.facebook.presto.sql.planner.assertions.MatchResult;
 import com.facebook.presto.sql.planner.assertions.Matcher;
 import com.facebook.presto.sql.planner.assertions.PlanMatchPattern;
 import com.facebook.presto.sql.planner.assertions.SymbolAliases;
 import com.facebook.presto.sql.planner.plan.JoinNode;
+import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
+import com.google.common.base.Functions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import org.intellij.lang.annotations.Language;
@@ -43,13 +53,17 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static com.facebook.presto.SystemSessionProperties.PUSHDOWN_DEREFERENCE_ENABLED;
+import static com.facebook.presto.common.function.OperatorType.EQUAL;
 import static com.facebook.presto.common.predicate.Domain.create;
+import static com.facebook.presto.common.predicate.Domain.multipleValues;
 import static com.facebook.presto.common.predicate.Domain.singleValue;
 import static com.facebook.presto.common.predicate.Range.greaterThan;
 import static com.facebook.presto.common.predicate.TupleDomain.withColumnDomains;
 import static com.facebook.presto.common.predicate.ValueSet.ofRanges;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
+import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.common.type.DoubleType.DOUBLE;
+import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
 import static com.facebook.presto.iceberg.IcebergAbstractMetadata.isEntireColumn;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.ColumnType.SYNTHESIZED;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.getSynthesizedIcebergColumnHandle;
@@ -57,14 +71,28 @@ import static com.facebook.presto.iceberg.IcebergColumnHandle.isPushedDownSubfie
 import static com.facebook.presto.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
 import static com.facebook.presto.iceberg.IcebergQueryRunner.createIcebergQueryRunner;
 import static com.facebook.presto.iceberg.IcebergSessionProperties.PARQUET_DEREFERENCE_PUSHDOWN_ENABLED;
+import static com.facebook.presto.iceberg.IcebergSessionProperties.PUSHDOWN_FILTER_ENABLED;
 import static com.facebook.presto.parquet.ParquetTypeUtils.pushdownColumnNameForSubfield;
+import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.AND;
+import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.OR;
+import static com.facebook.presto.sql.analyzer.TypeSignatureProvider.fromTypes;
 import static com.facebook.presto.sql.planner.assertions.MatchResult.NO_MATCH;
 import static com.facebook.presto.sql.planner.assertions.MatchResult.match;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.anyTree;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.exchange;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.filter;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.node;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.output;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.project;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.strictTableScan;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.values;
+import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static java.util.Objects.requireNonNull;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertTrue;
 
 public class TestIcebergLogicalPlanner
         extends AbstractTestQueryFramework
@@ -76,6 +104,232 @@ public class TestIcebergLogicalPlanner
             throws Exception
     {
         return createIcebergQueryRunner(ImmutableMap.of("experimental.pushdown-subfields-enabled", "true"), ImmutableMap.of());
+    }
+
+    @Test
+    public void testFilterPushdown()
+    {
+        Session sessionWithFilterPushdown = pushdownFilterEnabled();
+
+        // Only domain predicates
+        assertPlan("SELECT linenumber FROM lineitem WHERE partkey = 10",
+                output(exchange(project(
+                        filter("partkey=10",
+                                strictTableScan("lineitem", identityMap("linenumber", "partkey")))))));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE partkey = 10",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        withColumnDomains(ImmutableMap.of(new Subfield(
+                                "partkey",
+                                ImmutableList.of()),
+                                singleValue(BIGINT, 10L))),
+                        TRUE_CONSTANT,
+                        ImmutableSet.of("partkey")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT partkey, linenumber FROM lineitem WHERE partkey = 10",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("partkey", "linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        withColumnDomains(ImmutableMap.of(new Subfield(
+                                "partkey",
+                                ImmutableList.of()),
+                                singleValue(BIGINT, 10L))),
+                        TRUE_CONSTANT,
+                        ImmutableSet.of("partkey")));
+
+        // Remaining predicate is NULL
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE cardinality(NULL) > 0",
+                output(values("linenumber")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE orderkey > 10 AND cardinality(NULL) > 0",
+                output(values("linenumber")));
+
+        // Remaining predicate is always FALSE
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE cardinality(ARRAY[1]) > 1",
+                output(values("linenumber")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE orderkey > 10 AND cardinality(ARRAY[1]) > 1",
+                output(values("linenumber")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE orderkey = 10 OR cardinality(ARRAY[1]) > 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        withColumnDomains(ImmutableMap.of(new Subfield(
+                                        "orderkey",
+                                        ImmutableList.of()),
+                                singleValue(BIGINT, 10L))),
+                        TRUE_CONSTANT,
+                        ImmutableSet.of("orderkey")));
+
+        // Remaining predicate is always TRUE
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE cardinality(ARRAY[1]) = 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        TupleDomain.all(),
+                        TRUE_CONSTANT,
+                        ImmutableSet.of()));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE orderkey = 10 AND cardinality(ARRAY[1]) = 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        withColumnDomains(ImmutableMap.of(new Subfield(
+                                        "orderkey",
+                                        ImmutableList.of()),
+                                singleValue(BIGINT, 10L))),
+                        TRUE_CONSTANT,
+                        ImmutableSet.of("orderkey")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE orderkey = 10 OR cardinality(ARRAY[1]) = 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        TupleDomain.all(),
+                        TRUE_CONSTANT,
+                        ImmutableSet.of()));
+
+        // TupleDomain predicate is always FALSE
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE orderkey = 1 AND orderkey = 2",
+                output(values("linenumber")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE orderkey = 1 AND orderkey = 2 AND linenumber % 2 = 1",
+                output(values("linenumber")));
+
+        FunctionAndTypeManager functionAndTypeManager = getQueryRunner().getMetadata().getFunctionAndTypeManager();
+        FunctionResolution functionResolution = new FunctionResolution(functionAndTypeManager.getFunctionAndTypeResolver());
+        RowExpression remainingPredicate = new CallExpression(EQUAL.name(),
+                functionResolution.comparisonFunction(EQUAL, BIGINT, BIGINT),
+                BOOLEAN,
+                ImmutableList.of(
+                        new CallExpression("mod",
+                                functionAndTypeManager.lookupFunction("mod", fromTypes(BIGINT, BIGINT)),
+                                BIGINT,
+                                ImmutableList.of(
+                                        new VariableReferenceExpression(Optional.empty(), "orderkey", BIGINT),
+                                        constant(2))),
+                        constant(1)));
+
+        // Only remaining predicate
+        assertPlan("SELECT linenumber FROM lineitem WHERE mod(orderkey, 2) = 1",
+                output(exchange(project(
+                        filter("mod(orderkey, 2) = 1",
+                                strictTableScan("lineitem", identityMap("linenumber", "orderkey")))))));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE mod(orderkey, 2) = 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        TupleDomain.all(),
+                        remainingPredicate,
+                        ImmutableSet.of("orderkey")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT orderkey, linenumber FROM lineitem WHERE mod(orderkey, 2) = 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("orderkey", "linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        TupleDomain.all(),
+                        remainingPredicate,
+                        ImmutableSet.of("orderkey")));
+
+        // A mix of domain and remaining predicates
+        assertPlan("SELECT linenumber FROM lineitem WHERE partkey = 10 AND mod(orderkey, 2) = 1",
+                output(exchange(project(
+                        filter("partkey = 10 AND mod(orderkey, 2) = 1",
+                                strictTableScan("lineitem", identityMap("linenumber", "orderkey", "partkey")))))));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE partkey = 10 AND mod(orderkey, 2) = 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        withColumnDomains(ImmutableMap.of(new Subfield(
+                                "partkey",
+                                ImmutableList.of()),
+                                singleValue(BIGINT, 10L))),
+                        remainingPredicate,
+                        ImmutableSet.of("partkey", "orderkey")));
+
+        assertPlan(sessionWithFilterPushdown, "SELECT partkey, orderkey, linenumber FROM lineitem WHERE partkey = 10 AND mod(orderkey, 2) = 1",
+                output(exchange(
+                        strictTableScan("lineitem", identityMap("partkey", "orderkey", "linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        withColumnDomains(ImmutableMap.of(new Subfield(
+                                "partkey",
+                                ImmutableList.of()),
+                                singleValue(BIGINT, 10L))),
+                        remainingPredicate,
+                        ImmutableSet.of("partkey", "orderkey")));
+
+        RowExpression newRemainingPredicate = new SpecialFormExpression(AND,
+                BOOLEAN,
+                ImmutableList.of(
+                        new SpecialFormExpression(OR,
+                                BOOLEAN,
+                                ImmutableList.of(
+                                        new CallExpression(EQUAL.name(),
+                                                functionResolution.comparisonFunction(EQUAL, BIGINT, BIGINT),
+                                                BOOLEAN,
+                                                ImmutableList.of(
+                                                        new VariableReferenceExpression(Optional.empty(), "partkey", BIGINT),
+                                                        constant(10))),
+                                        new CallExpression(EQUAL.name(),
+                                                functionResolution.comparisonFunction(EQUAL, BIGINT, BIGINT),
+                                                BOOLEAN,
+                                                ImmutableList.of(
+                                                        new VariableReferenceExpression(Optional.empty(), "orderkey", BIGINT),
+                                                        constant(5))))),
+                        new SpecialFormExpression(OR,
+                                BOOLEAN,
+                                ImmutableList.of(
+                                        new CallExpression(EQUAL.name(),
+                                                functionResolution.comparisonFunction(EQUAL, BIGINT, BIGINT),
+                                                BOOLEAN,
+                                                ImmutableList.of(
+                                                        new VariableReferenceExpression(Optional.empty(), "orderkey", BIGINT),
+                                                        constant(10))),
+                                        new CallExpression(EQUAL.name(),
+                                                functionResolution.comparisonFunction(EQUAL, BIGINT, BIGINT),
+                                                BOOLEAN,
+                                                ImmutableList.of(
+                                                        new VariableReferenceExpression(Optional.empty(), "partkey", BIGINT),
+                                                        constant(5)))))));
+
+        // A mix of OR, AND in domain predicates
+        assertPlan(sessionWithFilterPushdown, "SELECT linenumber FROM lineitem WHERE (partkey = 10 and orderkey = 10) OR (partkey = 5 AND orderkey = 5)",
+                output(exchange(strictTableScan("lineitem", identityMap("linenumber")))),
+                plan -> assertTableLayout(
+                        plan,
+                        "lineitem",
+                        withColumnDomains(ImmutableMap.of(
+                                new Subfield("partkey", ImmutableList.of()),
+                                multipleValues(BIGINT, ImmutableList.of(5L, 10L)),
+                                new Subfield("orderkey", ImmutableList.of()),
+                                multipleValues(BIGINT, ImmutableList.of(5L, 10L)))),
+                        newRemainingPredicate,
+                        ImmutableSet.of("partkey", "orderkey")));
     }
 
     @Test
@@ -264,6 +518,42 @@ public class TestIcebergLogicalPlanner
     private void assertParquetDereferencePushDown(Session session, @Language("SQL") String query, String tableName, Map<String, Subfield> expectedDeferencePushDowns)
     {
         assertPlan(session, query, anyTree(tableScanParquetDeferencePushDowns(tableName, expectedDeferencePushDowns)));
+    }
+
+    private RowExpression constant(long value)
+    {
+        return new ConstantExpression(value, BIGINT);
+    }
+
+    private static Map<String, String> identityMap(String... values)
+    {
+        return Arrays.stream(values).collect(toImmutableMap(Functions.identity(), Functions.identity()));
+    }
+
+    private void assertTableLayout(Plan plan, String tableName, TupleDomain<Subfield> domainPredicate, RowExpression remainingPredicate, Set<String> predicateColumnNames)
+    {
+        TableScanNode tableScan = searchFrom(plan.getRoot())
+                .where(node -> isTableScanNode(node, tableName))
+                .findOnlyElement();
+
+        assertTrue(tableScan.getTable().getLayout().isPresent());
+        IcebergTableLayoutHandle layoutHandle = (IcebergTableLayoutHandle) tableScan.getTable().getLayout().get();
+
+        assertEquals(layoutHandle.getPredicateColumns().keySet(), predicateColumnNames);
+        assertEquals(layoutHandle.getDomainPredicate(), domainPredicate);
+        assertEquals(layoutHandle.getRemainingPredicate(), remainingPredicate);
+    }
+
+    private static boolean isTableScanNode(PlanNode node, String tableName)
+    {
+        return node instanceof TableScanNode && ((IcebergTableHandle) ((TableScanNode) node).getTable().getConnectorHandle()).getTableName().equals(tableName);
+    }
+
+    private Session pushdownFilterEnabled()
+    {
+        return Session.builder(getQueryRunner().getDefaultSession())
+                .setCatalogSessionProperty(ICEBERG_CATALOG, PUSHDOWN_FILTER_ENABLED, "true")
+                .build();
     }
 
     private Session withParquetDereferencePushDownEnabled()

@@ -13,8 +13,13 @@
  */
 package com.facebook.presto.iceberg.optimizer;
 
+import com.facebook.presto.common.type.TypeManager;
+import com.facebook.presto.iceberg.IcebergTransactionManager;
 import com.facebook.presto.spi.ConnectorPlanOptimizer;
 import com.facebook.presto.spi.connector.ConnectorPlanOptimizerProvider;
+import com.facebook.presto.spi.function.FunctionMetadataManager;
+import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.relation.RowExpressionService;
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Inject;
 
@@ -29,9 +34,21 @@ public class IcebergPlanOptimizerProvider
 
     @Inject
     public IcebergPlanOptimizerProvider(
-            Set<ConnectorPlanOptimizer> planOptimizers)
+            IcebergTransactionManager transactionManager,
+            RowExpressionService rowExpressionService,
+            StandardFunctionResolution functionResolution,
+            FunctionMetadataManager functionMetadataManager,
+            TypeManager typeManager)
     {
-        this.planOptimizers = requireNonNull(planOptimizers, "planOptimizers is null");
+        requireNonNull(transactionManager, "transactionManager is null");
+        requireNonNull(rowExpressionService, "rowExpressionService is null");
+        requireNonNull(functionResolution, "functionResolution is null");
+        requireNonNull(functionMetadataManager, "functionMetadataManager is null");
+        requireNonNull(typeManager, "typeManager is null");
+        this.planOptimizers = ImmutableSet.of(
+                new IcebergPlanOptimizer(functionResolution, rowExpressionService, typeManager),
+                new IcebergFilterPushdown(rowExpressionService, functionResolution, functionMetadataManager, transactionManager),
+                new IcebergParquetDereferencePushDown(transactionManager, rowExpressionService, typeManager));
     }
 
     @Override
@@ -43,6 +60,6 @@ public class IcebergPlanOptimizerProvider
     @Override
     public Set<ConnectorPlanOptimizer> getPhysicalPlanOptimizers()
     {
-        return ImmutableSet.of();
+        return planOptimizers;
     }
 }

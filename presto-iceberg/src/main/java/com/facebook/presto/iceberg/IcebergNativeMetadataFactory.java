@@ -16,6 +16,8 @@ package com.facebook.presto.iceberg;
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
+import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.relation.RowExpressionService;
 
 import javax.inject.Inject;
 
@@ -28,16 +30,22 @@ public class IcebergNativeMetadataFactory
     final JsonCodec<CommitTaskData> commitTaskCodec;
     final IcebergResourceFactory resourceFactory;
     final CatalogType catalogType;
+    final StandardFunctionResolution functionResolution;
+    final RowExpressionService rowExpressionService;
 
     @Inject
     public IcebergNativeMetadataFactory(
             IcebergConfig config,
             IcebergResourceFactory resourceFactory,
             TypeManager typeManager,
+            StandardFunctionResolution functionResolution,
+            RowExpressionService rowExpressionService,
             JsonCodec<CommitTaskData> commitTaskCodec)
     {
         this.resourceFactory = requireNonNull(resourceFactory, "resourceFactory is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
+        this.functionResolution = requireNonNull(functionResolution, "functionResolution is null");
+        this.rowExpressionService = requireNonNull(rowExpressionService, "rowExpressionService is null");
         this.commitTaskCodec = requireNonNull(commitTaskCodec, "commitTaskCodec is null");
         requireNonNull(config, "config is null");
         this.catalogType = config.getCatalogType();
@@ -45,6 +53,6 @@ public class IcebergNativeMetadataFactory
 
     public ConnectorMetadata create()
     {
-        return new IcebergNativeMetadata(resourceFactory, typeManager, commitTaskCodec, catalogType);
+        return new IcebergNativeMetadata(resourceFactory, typeManager, functionResolution, rowExpressionService, commitTaskCodec, catalogType);
     }
 }
