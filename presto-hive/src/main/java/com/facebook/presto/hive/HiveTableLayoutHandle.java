@@ -47,6 +47,7 @@ import static java.util.Objects.requireNonNull;
 
 public class HiveTableLayoutHandle
         extends BaseHiveTableLayoutHandle
+        implements SupportsPartitionColumnPredicate
 {
     private final SchemaTableName schemaTableName;
     private final String tablePath;
@@ -209,6 +210,7 @@ public class HiveTableLayoutHandle
     }
 
     @JsonProperty
+    @Override
     public TupleDomain<ColumnHandle> getPartitionColumnPredicate()
     {
         return partitionColumnPredicate;

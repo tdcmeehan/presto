@@ -21,7 +21,6 @@ import com.facebook.presto.hive.HiveColumnHandle;
 import com.facebook.presto.hive.HiveMetadata;
 import com.facebook.presto.hive.HivePartitionManager;
 import com.facebook.presto.hive.HivePartitionResult;
-import com.facebook.presto.hive.HiveStorageFormat;
 import com.facebook.presto.hive.HiveTableHandle;
 import com.facebook.presto.hive.HiveTableLayoutHandle;
 import com.facebook.presto.hive.HiveTransactionManager;
@@ -30,23 +29,24 @@ import com.facebook.presto.hive.metastore.MetastoreContext;
 import com.facebook.presto.hive.metastore.SemiTransactionalHiveMetastore;
 import com.facebook.presto.hive.metastore.Table;
 import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.ConnectorPlanOptimizer;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableHandle;
 import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.Constraint;
-import com.facebook.presto.spi.PrestoWarning;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.TableNotFoundException;
+import com.facebook.presto.spi.VariableAllocator;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.function.FunctionMetadataManager;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
-import com.facebook.presto.spi.plan.TableScanNode;
-import com.facebook.presto.spi.plan.ValuesNode;
+import com.facebook.presto.spi.plan.PlanNode;
+import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
+import com.facebook.presto.spi.relation.DomainTranslator;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.RowExpressionService;
 import com.google.common.base.Functions;
-import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Map;
@@ -54,18 +54,16 @@ import java.util.Optional;
 import java.util.Set;
 
 import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
-import static com.facebook.presto.hive.HiveSessionProperties.isParquetPushdownFilterEnabled;
 import static com.facebook.presto.hive.HiveSessionProperties.isPushdownFilterEnabled;
-import static com.facebook.presto.hive.HiveTableProperties.getHiveStorageFormat;
-import static com.facebook.presto.hive.HiveWarningCode.HIVE_TABLESCAN_CONVERTED_TO_VALUESNODE;
 import static com.facebook.presto.hive.metastore.MetastoreUtil.getMetastoreHeaders;
 import static com.facebook.presto.hive.metastore.MetastoreUtil.isUserDefinedTypeEncodingEnabled;
+import static com.facebook.presto.hive.rule.FilterPushdownUtils.getDomainPredicate;
+import static com.facebook.presto.hive.rule.FilterPushdownUtils.getPredicateColumnNames;
+import static com.facebook.presto.spi.ConnectorPlanRewriter.rewriteWith;
 import static com.google.common.base.MoreObjects.toStringHelper;
-import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
-import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -76,10 +74,13 @@ import static java.util.Objects.requireNonNull;
  * merged with the one already pushed down.
  */
 public class HiveFilterPushdown
-        extends BaseHiveFilterPushdown
+        implements ConnectorPlanOptimizer
 {
-    protected final HiveTransactionManager transactionManager;
-    protected final HivePartitionManager partitionManager;
+    private final RowExpressionService rowExpressionService;
+    private final StandardFunctionResolution functionResolution;
+    private final FunctionMetadataManager functionMetadataManager;
+    private final HiveTransactionManager transactionManager;
+    private final HivePartitionManager partitionManager;
 
     public HiveFilterPushdown(
             RowExpressionService rowExpressionService,
@@ -88,135 +89,18 @@ public class HiveFilterPushdown
             HiveTransactionManager transactionManager,
             HivePartitionManager partitionManager)
     {
-        super(rowExpressionService, functionResolution, functionMetadataManager);
-
+        this.rowExpressionService = requireNonNull(rowExpressionService, "rowExpressionService is null");
+        this.functionResolution = requireNonNull(functionResolution, "functionResolution is null");
+        this.functionMetadataManager = requireNonNull(functionMetadataManager, "functionMetadataManager is null");
         this.transactionManager = requireNonNull(transactionManager, "transactionManager is null");
         this.partitionManager = requireNonNull(partitionManager, "partitionManager is null");
     }
-
-    @Override
-    protected ConnectorPushdownFilterResult getConnectorPushdownFilterResult(
-            Map<String, ColumnHandle> columnHandles,
-            ConnectorMetadata metadata,
-            ConnectorSession session,
-            TupleDomain<Subfield> domainPredicate,
-            RemainingExpressions remainingExpressions,
-            Set<String> predicateColumnNames,
-            Optional<ConnectorTableLayoutHandle> currentLayoutHandle,
-            ConnectorTableHandle tableHandle,
-            HivePartitionResult hivePartitionResult)
+    private static ConnectorMetadata getConnectorMetadata(HiveTransactionManager transactionManager, TableHandle tableHandle)
     {
-        Map<String, HiveColumnHandle> predicateColumns = predicateColumnNames.stream()
-                .map(columnHandles::get)
-                .map(HiveColumnHandle.class::cast)
-                .collect(toImmutableMap(HiveColumnHandle::getName, Functions.identity()));
-
-        HiveTableHandle hiveTableHandle = (HiveTableHandle) tableHandle;
-        SchemaTableName tableName = hiveTableHandle.getSchemaTableName();
-
-        SemiTransactionalHiveMetastore metastore = ((HiveMetadata) metadata).getMetastore();
-
-        MetastoreContext context = new MetastoreContext(session.getIdentity(), session.getQueryId(), session.getClientInfo(), session.getSource(), getMetastoreHeaders(session), isUserDefinedTypeEncodingEnabled(session), metastore.getColumnConverterProvider());
-        Table table = metastore.getTable(context, hiveTableHandle)
-                .orElseThrow(() -> new TableNotFoundException(tableName));
-
-        String layoutString = createTableLayoutString(
-                session,
-                rowExpressionService,
-                tableName,
-                hivePartitionResult.getBucketHandle(),
-                hivePartitionResult.getBucketFilter(),
-                remainingExpressions.getRemainingExpression(),
-                domainPredicate);
-
-        Optional<Set<HiveColumnHandle>> requestedColumns = currentLayoutHandle.map(layout -> ((HiveTableLayoutHandle) layout).getRequestedColumns()).orElse(Optional.empty());
-
-        boolean appendRowNumbereEnabled = currentLayoutHandle.map(layout -> ((HiveTableLayoutHandle) layout).isAppendRowNumberEnabled()).orElse(false);
-
-        return new ConnectorPushdownFilterResult(
-                metadata.getTableLayout(
-                        session,
-                        new HiveTableLayoutHandle.Builder()
-                                .setSchemaTableName(tableName)
-                                .setTablePath(table.getStorage().getLocation())
-                                .setPartitionColumns(hivePartitionResult.getPartitionColumns())
-                                .setDataColumns(pruneColumnComments(hivePartitionResult.getDataColumns()))
-                                .setTableParameters(hivePartitionResult.getTableParameters())
-                                .setDomainPredicate(domainPredicate)
-                                .setRemainingPredicate(remainingExpressions.getRemainingExpression())
-                                .setPredicateColumns(predicateColumns)
-                                .setPartitionColumnPredicate(hivePartitionResult.getEnforcedConstraint())
-                                .setPartitions(hivePartitionResult.getPartitions())
-                                .setBucketHandle(hivePartitionResult.getBucketHandle())
-                                .setBucketFilter(hivePartitionResult.getBucketFilter())
-                                .setPushdownFilterEnabled(true)
-                                .setLayoutString(layoutString)
-                                .setRequestedColumns(requestedColumns)
-                                .setPartialAggregationsPushedDown(false)
-                                .setAppendRowNumberEnabled(appendRowNumbereEnabled)
-                                .setHiveTableHandle(hiveTableHandle)
-                                .build()),
-                remainingExpressions.getDynamicFilterExpression());
-    }
-
-    @Override
-    protected TupleDomain<ColumnHandle> getUnenforcedConstraint(HivePartitionResult hivePartitionResult, Constraint<ColumnHandle> constraint)
-    {
-        return hivePartitionResult.getUnenforcedConstraint();
-    }
-
-    @Override
-    protected HivePartitionResult getHivePartitionResult(ConnectorMetadata metadata, ConnectorTableHandle tableHandle, Constraint<ColumnHandle> constraint, ConnectorSession session)
-    {
-        return partitionManager.getPartitions(((HiveMetadata) metadata).getMetastore(), tableHandle, constraint, session);
-    }
-
-    @Override
-    protected TupleDomain<ColumnHandle> intersectionWithPartitionColumnPredicate(ConnectorTableLayoutHandle currentLayoutHandle, TupleDomain<ColumnHandle> entireColumnDomain)
-    {
-        return entireColumnDomain.intersect(((HiveTableLayoutHandle) currentLayoutHandle).getPartitionColumnPredicate());
-    }
-
-    @Override
-    protected boolean isPushdownFilterSupported(ConnectorSession session, TableHandle tableHandle)
-    {
-        checkArgument(tableHandle.getConnectorHandle() instanceof HiveTableHandle, "pushdownFilter is never supported on a non-hive TableHandle");
-        if (((HiveTableHandle) tableHandle.getConnectorHandle()).getAnalyzePartitionValues().isPresent()) {
-            return false;
-        }
-
-        boolean pushdownFilterEnabled = isPushdownFilterEnabled(session);
-        if (pushdownFilterEnabled) {
-            HiveStorageFormat hiveStorageFormat = getHiveStorageFormat(getMetadata(tableHandle).getTableMetadata(session, tableHandle.getConnectorHandle()).getProperties());
-            return hiveStorageFormat == HiveStorageFormat.ORC || hiveStorageFormat == HiveStorageFormat.DWRF || hiveStorageFormat == HiveStorageFormat.PARQUET && isParquetPushdownFilterEnabled(session);
-        }
-        return false;
-    }
-
-    @Override
-    protected ConnectorMetadata getMetadata(TableHandle tableHandle)
-    {
+        requireNonNull(transactionManager, "transactionManager is null");
         ConnectorMetadata metadata = transactionManager.get(tableHandle.getTransaction());
         checkState(metadata instanceof HiveMetadata, "metadata must be HiveMetadata");
         return metadata;
-    }
-
-    @Override
-    protected PrestoWarning getPrestoWarning(TableScanNode tableScan)
-    {
-        return new PrestoWarning(
-                HIVE_TABLESCAN_CONVERTED_TO_VALUESNODE,
-                format(
-                        "Table '%s' returns 0 rows, and is converted to an empty %s by %s",
-                        tableScan.getTable().getConnectorHandle(),
-                        ValuesNode.class.getSimpleName(),
-                        HiveFilterPushdown.class.getSimpleName()));
-    }
-
-    @Override
-    protected Subfield toSubfield(ColumnHandle columnHandle)
-    {
-        return new Subfield(((HiveColumnHandle) columnHandle).getName(), ImmutableList.of());
     }
 
     private static List<Column> pruneColumnComments(List<Column> columns)
@@ -242,5 +126,101 @@ public class HiveFilterPushdown
                 .add("filter", TRUE_CONSTANT.equals(remainingPredicate) ? null : rowExpressionService.formatRowExpression(session, remainingPredicate))
                 .add("domains", domainPredicate.isAll() ? null : domainPredicate.toString(session.getSqlFunctionProperties()))
                 .toString();
+    }
+
+    @Override
+    public PlanNode optimize(PlanNode maxSubplan, ConnectorSession session, VariableAllocator variableAllocator, PlanNodeIdAllocator idAllocator)
+    {
+        if (!isPushdownFilterEnabled(session)) {
+            return maxSubplan;
+        }
+        return rewriteWith(new Rewriter(session, idAllocator, rowExpressionService, functionResolution, functionMetadataManager), maxSubplan);
+    }
+
+    private class Rewriter
+            extends BaseRewriter
+    {
+        public Rewriter(
+                ConnectorSession session,
+                PlanNodeIdAllocator idAllocator,
+                RowExpressionService rowExpressionService,
+                StandardFunctionResolution functionResolution,
+                FunctionMetadataManager functionMetadataManager)
+        {
+            super(session, idAllocator, rowExpressionService, functionResolution, functionMetadataManager, tableHandle -> getConnectorMetadata(transactionManager, tableHandle));
+        }
+
+        @Override
+        protected ConnectorPushdownFilterResult getConnectorPushdownFilterResult(
+                Map<String, ColumnHandle> columnHandles,
+                ConnectorMetadata metadata,
+                ConnectorSession session,
+                RemainingExpressions remainingExpressions,
+                DomainTranslator.ExtractionResult<Subfield> decomposedFilter,
+                RowExpression optimizedRemainingExpression,
+                Constraint<ColumnHandle> constraint,
+                Optional<ConnectorTableLayoutHandle> currentLayoutHandle,
+                ConnectorTableHandle tableHandle)
+        {
+            HivePartitionResult hivePartitionResult = partitionManager.getPartitions(((HiveMetadata) metadata).getMetastore(), tableHandle, constraint, session);
+
+            TupleDomain<ColumnHandle> unenforcedConstraint = hivePartitionResult.getUnenforcedConstraint();
+
+            TupleDomain<Subfield> domainPredicate = getDomainPredicate(decomposedFilter, unenforcedConstraint);
+
+            Set<String> predicateColumnNames = getPredicateColumnNames(optimizedRemainingExpression, domainPredicate);
+
+            Map<String, HiveColumnHandle> predicateColumns = predicateColumnNames.stream()
+                    .map(columnHandles::get)
+                    .map(HiveColumnHandle.class::cast)
+                    .collect(toImmutableMap(HiveColumnHandle::getName, Functions.identity()));
+
+            HiveTableHandle hiveTableHandle = (HiveTableHandle) tableHandle;
+            SchemaTableName tableName = hiveTableHandle.getSchemaTableName();
+
+            SemiTransactionalHiveMetastore metastore = ((HiveMetadata) metadata).getMetastore();
+
+            MetastoreContext context = new MetastoreContext(session.getIdentity(), session.getQueryId(), session.getClientInfo(), session.getSource(), getMetastoreHeaders(session), isUserDefinedTypeEncodingEnabled(session), metastore.getColumnConverterProvider());
+            Table table = metastore.getTable(context, hiveTableHandle)
+                    .orElseThrow(() -> new TableNotFoundException(tableName));
+
+            String layoutString = createTableLayoutString(
+                    session,
+                    rowExpressionService,
+                    tableName,
+                    hivePartitionResult.getBucketHandle(),
+                    hivePartitionResult.getBucketFilter(),
+                    remainingExpressions.getRemainingExpression(),
+                    domainPredicate);
+
+            Optional<Set<HiveColumnHandle>> requestedColumns = currentLayoutHandle.map(layout -> ((HiveTableLayoutHandle) layout).getRequestedColumns()).orElse(Optional.empty());
+
+            boolean appendRowNumbereEnabled = currentLayoutHandle.map(layout -> ((HiveTableLayoutHandle) layout).isAppendRowNumberEnabled()).orElse(false);
+
+            return new BaseRewriter.ConnectorPushdownFilterResult(
+                    metadata.getTableLayout(
+                            session,
+                            new HiveTableLayoutHandle.Builder()
+                                    .setSchemaTableName(tableName)
+                                    .setTablePath(table.getStorage().getLocation())
+                                    .setPartitionColumns(hivePartitionResult.getPartitionColumns())
+                                    .setDataColumns(pruneColumnComments(hivePartitionResult.getDataColumns()))
+                                    .setTableParameters(hivePartitionResult.getTableParameters())
+                                    .setDomainPredicate(domainPredicate)
+                                    .setRemainingPredicate(remainingExpressions.getRemainingExpression())
+                                    .setPredicateColumns(predicateColumns)
+                                    .setPartitionColumnPredicate(hivePartitionResult.getEnforcedConstraint())
+                                    .setPartitions(hivePartitionResult.getPartitions())
+                                    .setBucketHandle(hivePartitionResult.getBucketHandle())
+                                    .setBucketFilter(hivePartitionResult.getBucketFilter())
+                                    .setPushdownFilterEnabled(true)
+                                    .setLayoutString(layoutString)
+                                    .setRequestedColumns(requestedColumns)
+                                    .setPartialAggregationsPushedDown(false)
+                                    .setAppendRowNumberEnabled(appendRowNumbereEnabled)
+                                    .setHiveTableHandle(hiveTableHandle)
+                                    .build()),
+                    remainingExpressions.getDynamicFilterExpression());
+        }
     }
 }

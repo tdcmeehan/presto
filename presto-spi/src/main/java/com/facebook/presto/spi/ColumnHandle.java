@@ -41,4 +41,6 @@ public interface ColumnHandle
     {
         return this;
     }
+
+    String getName();
 }

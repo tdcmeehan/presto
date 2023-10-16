@@ -19,6 +19,8 @@ import com.facebook.presto.tests.DistributedQueryRunner;
 import com.google.common.collect.ImmutableMap;
 
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class TpchQueryRunner
 {
@@ -100,6 +102,9 @@ public final class TpchQueryRunner
     public static void main(String[] args)
             throws Exception
     {
+        Pattern pattern = Pattern.compile("@[a-zA-Z0-9-]+\\.[a-zA-Z0-9.]+$");
+        Matcher x = pattern.matcher("@a.b-c.d.e");
+        x.matches();
         Logging.initialize();
         DistributedQueryRunner queryRunner = createQueryRunner(ImmutableMap.of("http-server.http.port", "8080"));
         Thread.sleep(10);

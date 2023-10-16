@@ -15,43 +15,48 @@ package com.facebook.presto.iceberg.optimizer;
 
 import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.predicate.TupleDomain;
-import com.facebook.presto.hive.HivePartitionResult;
-import com.facebook.presto.hive.rule.BaseHiveFilterPushdown;
+import com.facebook.presto.hive.rule.BaseRewriter;
 import com.facebook.presto.iceberg.IcebergAbstractMetadata;
 import com.facebook.presto.iceberg.IcebergColumnHandle;
 import com.facebook.presto.iceberg.IcebergTableHandle;
 import com.facebook.presto.iceberg.IcebergTableLayoutHandle;
 import com.facebook.presto.iceberg.IcebergTransactionManager;
 import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.ConnectorPlanOptimizer;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableHandle;
 import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.Constraint;
-import com.facebook.presto.spi.PrestoWarning;
 import com.facebook.presto.spi.TableHandle;
+import com.facebook.presto.spi.VariableAllocator;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.function.FunctionMetadataManager;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
-import com.facebook.presto.spi.plan.TableScanNode;
-import com.facebook.presto.spi.plan.ValuesNode;
+import com.facebook.presto.spi.plan.PlanNode;
+import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
+import com.facebook.presto.spi.relation.DomainTranslator;
+import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.RowExpressionService;
 import com.google.common.base.Functions;
-import com.google.common.collect.ImmutableList;
 
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import static com.facebook.presto.hive.rule.FilterPushdownUtils.getDomainPredicate;
+import static com.facebook.presto.hive.rule.FilterPushdownUtils.getPredicateColumnNames;
 import static com.facebook.presto.iceberg.IcebergSessionProperties.isPushdownFilterEnabled;
-import static com.facebook.presto.iceberg.IcebergWarningCode.ICEBERG_TABLESCAN_CONVERTED_TO_VALUESNODE;
+import static com.facebook.presto.spi.ConnectorPlanRewriter.rewriteWith;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
-import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 public class IcebergFilterPushdown
-        extends BaseHiveFilterPushdown
+        implements ConnectorPlanOptimizer
 {
+    private final RowExpressionService rowExpressionService;
+    private final StandardFunctionResolution functionResolution;
+    private final FunctionMetadataManager functionMetadataManager;
     protected IcebergTransactionManager icebergTransactionManager;
 
     public IcebergFilterPushdown(
@@ -60,90 +65,78 @@ public class IcebergFilterPushdown
             FunctionMetadataManager functionMetadataManager,
             IcebergTransactionManager transactionManager)
     {
-        super(rowExpressionService, functionResolution, functionMetadataManager);
-
+        this.rowExpressionService = requireNonNull(rowExpressionService, "rowExpressionService is null");
+        this.functionResolution = requireNonNull(functionResolution, "functionResolution is null");
+        this.functionMetadataManager = requireNonNull(functionMetadataManager, "functionMetadataManager is null");
         this.icebergTransactionManager = requireNonNull(transactionManager, "transactionManager is null");
     }
 
     @Override
-    protected ConnectorPushdownFilterResult getConnectorPushdownFilterResult(
-            Map<String, ColumnHandle> columnHandles,
-            ConnectorMetadata metadata,
-            ConnectorSession session,
-            TupleDomain<Subfield> domainPredicate,
-            RemainingExpressions remainingExpressions,
-            Set<String> predicateColumnNames,
-            Optional<ConnectorTableLayoutHandle> currentLayoutHandle,
-            ConnectorTableHandle tableHandle,
-            HivePartitionResult hivePartitionResult)
+    public PlanNode optimize(PlanNode maxSubplan, ConnectorSession session, VariableAllocator variableAllocator, PlanNodeIdAllocator idAllocator)
     {
-        Map<String, IcebergColumnHandle> predicateColumns = predicateColumnNames.stream()
-                .map(columnHandles::get)
-                .map(IcebergColumnHandle.class::cast)
-                .collect(toImmutableMap(IcebergColumnHandle::getName, Functions.identity()));
-
-        Optional<Set<IcebergColumnHandle>> requestedColumns = currentLayoutHandle.map(layout -> ((IcebergTableLayoutHandle) layout).getRequestedColumns()).orElse(Optional.empty());
-
-        return new ConnectorPushdownFilterResult(
-                metadata.getTableLayout(
-                        session,
-                        new IcebergTableLayoutHandle(
-                                domainPredicate,
-                                remainingExpressions.getRemainingExpression(),
-                                predicateColumns,
-                                requestedColumns,
-                                true,
-                                (IcebergTableHandle) tableHandle)),
-                remainingExpressions.getDynamicFilterExpression());
+        if (!isPushdownFilterEnabled(session)) {
+            return maxSubplan;
+        }
+        return rewriteWith(new Rewriter(session, idAllocator, rowExpressionService, functionResolution, functionMetadataManager), maxSubplan);
     }
 
-    @Override
-    protected TupleDomain<ColumnHandle> getUnenforcedConstraint(HivePartitionResult hivePartitionResult, Constraint<ColumnHandle> constraint)
+    private class Rewriter
+            extends BaseRewriter
     {
-        return TupleDomain.withColumnDomains(constraint.getSummary().getDomains().get());
+        public Rewriter(
+                ConnectorSession session,
+                PlanNodeIdAllocator idAllocator,
+                RowExpressionService rowExpressionService,
+                StandardFunctionResolution functionResolution,
+                FunctionMetadataManager functionMetadataManager)
+        {
+            super(session, idAllocator, rowExpressionService, functionResolution, functionMetadataManager, tableHandle -> getConnectorMetadata(icebergTransactionManager, tableHandle));
+        }
+
+        @Override
+        protected ConnectorPushdownFilterResult getConnectorPushdownFilterResult(
+                Map<String, ColumnHandle> columnHandles,
+                ConnectorMetadata metadata,
+                ConnectorSession session,
+                RemainingExpressions remainingExpressions,
+                DomainTranslator.ExtractionResult<Subfield> decomposedFilter,
+                RowExpression optimizedRemainingExpression,
+                Constraint<ColumnHandle> constraint,
+                Optional<ConnectorTableLayoutHandle> currentLayoutHandle,
+                ConnectorTableHandle tableHandle)
+        {
+            TupleDomain<ColumnHandle> unenforcedConstraint = TupleDomain.withColumnDomains(constraint.getSummary().getDomains().get());
+
+            TupleDomain<Subfield> domainPredicate = getDomainPredicate(decomposedFilter, unenforcedConstraint);
+
+            Set<String> predicateColumnNames = getPredicateColumnNames(optimizedRemainingExpression, domainPredicate);
+
+            Map<String, IcebergColumnHandle> predicateColumns = predicateColumnNames.stream()
+                    .map(columnHandles::get)
+                    .map(IcebergColumnHandle.class::cast)
+                    .collect(toImmutableMap(IcebergColumnHandle::getName, Functions.identity()));
+
+            Optional<Set<IcebergColumnHandle>> requestedColumns = currentLayoutHandle.map(layout -> ((IcebergTableLayoutHandle) layout).getRequestedColumns()).orElse(Optional.empty());
+
+            return new ConnectorPushdownFilterResult(
+                    metadata.getTableLayout(
+                            session,
+                            new IcebergTableLayoutHandle(
+                                    domainPredicate,
+                                    remainingExpressions.getRemainingExpression(),
+                                    predicateColumns,
+                                    requestedColumns,
+                                    true,
+                                    (IcebergTableHandle) tableHandle)),
+                    remainingExpressions.getDynamicFilterExpression());
+        }
     }
 
-    @Override
-    protected HivePartitionResult getHivePartitionResult(ConnectorMetadata metadata, ConnectorTableHandle tableHandle, Constraint<ColumnHandle> constraint, ConnectorSession session)
+    private static ConnectorMetadata getConnectorMetadata(IcebergTransactionManager icebergTransactionManager, TableHandle tableHandle)
     {
-        return null;
-    }
-
-    @Override
-    protected TupleDomain<ColumnHandle> intersectionWithPartitionColumnPredicate(ConnectorTableLayoutHandle currentLayoutHandle, TupleDomain<ColumnHandle> entireColumnDomain)
-    {
-        return entireColumnDomain;
-    }
-
-    @Override
-    protected boolean isPushdownFilterSupported(ConnectorSession session, TableHandle tableHandle)
-    {
-        return isPushdownFilterEnabled(session);
-    }
-
-    @Override
-    protected ConnectorMetadata getMetadata(TableHandle tableHandle)
-    {
+        requireNonNull(icebergTransactionManager, "icebergTransactionManager is null");
         ConnectorMetadata metadata = icebergTransactionManager.get(tableHandle.getTransaction());
         checkState(metadata instanceof IcebergAbstractMetadata, "metadata must be IcebergAbstractMetadata");
         return metadata;
-    }
-
-    @Override
-    protected PrestoWarning getPrestoWarning(TableScanNode tableScan)
-    {
-        return new PrestoWarning(
-                ICEBERG_TABLESCAN_CONVERTED_TO_VALUESNODE,
-                format(
-                        "Table '%s' returns 0 rows, and is converted to an empty %s by %s",
-                        tableScan.getTable().getConnectorHandle(),
-                        ValuesNode.class.getSimpleName(),
-                        IcebergFilterPushdown.class.getSimpleName()));
-    }
-
-    @Override
-    protected Subfield toSubfield(ColumnHandle columnHandle)
-    {
-        return new Subfield(((IcebergColumnHandle) columnHandle).getName(), ImmutableList.of());
     }
 }

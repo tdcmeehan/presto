@@ -41,7 +41,7 @@ import static com.facebook.presto.common.function.OperatorType.SUBSCRIPT;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.common.type.Varchars.isVarcharType;
-import static com.facebook.presto.hive.HiveSessionProperties.isRangeFiltersOnSubscriptsEnabled;
+import static com.facebook.presto.hive.BaseHiveSessionProperties.isRangeFiltersOnSubscriptsEnabled;
 import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.DEREFERENCE;
 import static com.google.common.base.Verify.verify;
 import static java.util.Collections.unmodifiableList;
@@ -76,7 +76,7 @@ public final class SubfieldExtractor
             Optional<Subfield> subfield = extract(expression);
             // If the expression involves array or map subscripts, it is considered only if allowed by nested_columns_filter_enabled.
             if (hasSubscripts(subfield)) {
-                if (isRangeFiltersOnSubscriptsEnabled(connectorSession)) {
+                if (BaseHiveSessionProperties.isRangeFiltersOnSubscriptsEnabled(connectorSession)) {
                     return subfield;
                 }
                 return Optional.empty();

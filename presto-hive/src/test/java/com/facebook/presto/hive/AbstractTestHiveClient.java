@@ -67,7 +67,8 @@ import com.facebook.presto.hive.orc.OrcSelectivePageSource;
 import com.facebook.presto.hive.pagefile.PageFilePageSource;
 import com.facebook.presto.hive.parquet.ParquetPageSource;
 import com.facebook.presto.hive.rcfile.RcFilePageSource;
-import com.facebook.presto.hive.rule.BaseHiveFilterPushdown.ConnectorPushdownFilterResult;
+import com.facebook.presto.hive.rule.BaseRewriter;
+import com.facebook.presto.hive.rule.BaseRewriter.ConnectorPushdownFilterResult;
 import com.facebook.presto.hive.rule.HiveFilterPushdown;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.spi.ColumnHandle;
@@ -112,6 +113,7 @@ import com.facebook.presto.spi.function.FunctionMetadataManager;
 import com.facebook.presto.spi.function.SqlFunctionId;
 import com.facebook.presto.spi.function.SqlInvokedFunction;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.RowExpressionService;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
@@ -2302,7 +2304,9 @@ public abstract class AbstractTestHiveClient
             RowExpression filter,
             Optional<ConnectorTableLayoutHandle> currentLayoutHandle)
     {
+        // TODO: this needs to be refactored as well
         HiveFilterPushdown filterPushdown = new HiveFilterPushdown(rowExpressionService, functionResolution, functionMetadataManager, new HiveTransactionManager(), partitionManager);
+//        BaseRewriter filterPush = new BaseRewriter(session, new PlanNodeIdAllocator(), rowExpressionService, functionResolution, functionMetadataManager, null);
         return filterPushdown.pushdownFilter(session, metadata, tableHandle, filter, currentLayoutHandle);
     }
 

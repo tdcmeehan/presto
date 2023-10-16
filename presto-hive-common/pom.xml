@@ -21,6 +21,16 @@
 
         <dependency>
             <groupId>com.facebook.presto</groupId>
+            <artifactId>presto-expressions</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.airlift</groupId>
+            <artifactId>configuration</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.presto</groupId>
             <artifactId>presto-spi</artifactId>
         </dependency>
 
@@ -54,6 +64,10 @@
             <groupId>org.testng</groupId>
             <artifactId>testng</artifactId>
             <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>javax.inject</groupId>
+            <artifactId>javax.inject</artifactId>
         </dependency>
     </dependencies>
 </project>
