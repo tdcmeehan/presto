@@ -27,3 +27,4 @@ General Changes
 * Make :ref:`map_type` comparable.
 * Fix leak of tasks blocked during query teardown.
 * Improve query queue config validation.
+* Test
