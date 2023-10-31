@@ -1,5 +1,5 @@
 ========================
-Exchange Materialization
+Exchange Materializations
 ========================
 
 Presto allows exchange materialization to support memory intensive queries.
