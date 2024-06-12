@@ -38,6 +38,7 @@ import static java.util.Collections.emptyList;
 import static java.util.Collections.emptySet;
 
 public interface Plugin
+        extends PluginV2
 {
     default Iterable<ConnectorFactory> getConnectorFactories()
     {

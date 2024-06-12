@@ -347,6 +347,7 @@ public final class SystemSessionProperties
     public static final String DEFAULT_VIEW_SECURITY_MODE = "default_view_security_mode";
     public static final String JOIN_PREFILTER_BUILD_SIDE = "join_prefilter_build_side";
     public static final String OPTIMIZER_USE_HISTOGRAMS = "optimizer_use_histograms";
+    public static final String DELEGATING_ROW_EXPRESSION_OPTIMIZER_ENABLED = "delegating_row_expression_optimizer_enabled";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -1937,6 +1938,11 @@ public final class SystemSessionProperties
                 booleanProperty(OPTIMIZER_USE_HISTOGRAMS,
                         "whether or not to use histograms in the CBO",
                         featuresConfig.isUseHistograms(),
+                        false),
+                booleanProperty(
+                        DELEGATING_ROW_EXPRESSION_OPTIMIZER_ENABLED,
+                        "Enable delegating row optimizer",
+                        featuresConfig.isDelegatingRowExpressionOptimizerEnabled(),
                         false));
     }
 
@@ -3228,5 +3234,10 @@ public final class SystemSessionProperties
     public static boolean shouldOptimizerUseHistograms(Session session)
     {
         return session.getSystemProperty(OPTIMIZER_USE_HISTOGRAMS, Boolean.class);
+    }
+
+    public static boolean isDelegatingRowExpressionOptimizerEnabled(Session session)
+    {
+        return session.getSystemProperty(DELEGATING_ROW_EXPRESSION_OPTIMIZER_ENABLED, Boolean.class);
     }
 }
