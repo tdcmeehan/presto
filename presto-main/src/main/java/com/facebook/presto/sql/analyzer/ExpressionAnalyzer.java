@@ -1107,6 +1107,7 @@ public class ExpressionAnalyzer
 
             ImmutableList<TypeSignatureProvider> argumentTypes = argumentTypesBuilder.build();
             FunctionHandle function = resolveFunction(sessionFunctions, transactionId, node, argumentTypes, functionAndTypeResolver);
+            checkState(function != null, "Function implementation is missing: %s", node.getName());
             FunctionMetadata functionMetadata = functionAndTypeResolver.getFunctionMetadata(function);
 
             if (node.getOrderBy().isPresent()) {
