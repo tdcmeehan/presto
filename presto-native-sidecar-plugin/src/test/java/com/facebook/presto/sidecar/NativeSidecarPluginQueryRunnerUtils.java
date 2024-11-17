@@ -25,7 +25,7 @@ public class NativeSidecarPluginQueryRunnerUtils
     {
         queryRunner.installCoordinatorPlugin(new NativeSidecarPlugin());
         queryRunner.loadSessionPropertyProvider(NativeSystemSessionPropertyProviderFactory.NAME);
-        queryRunner.getExpressionManager().addExpressionOptimizerFactory(new NativeExpressionOptimizerFactory(ClassLoader.getSystemClassLoader()));
+//        queryRunner.getExpressionManager().addExpressionOptimizerFactory(new NativeExpressionOptimizerFactory(ClassLoader.getSystemClassLoader()));
         queryRunner.getExpressionManager().loadExpressions(ImmutableMap.<String, String>builder().put("expression-manager-factory.name", "native").build());
     }
 }
