@@ -11,11 +11,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.json.JsonCodecFactory;
 import com.facebook.airlift.json.JsonObjectMapperProvider;
+import com.facebook.plugin.arrow.ArrowColumnHandle;
+import com.facebook.plugin.arrow.ArrowTableHandle;
 import com.facebook.presto.common.type.StandardTypes;
 import com.facebook.presto.common.type.Type;
 import com.fasterxml.jackson.databind.DeserializationContext;

@@ -12,11 +12,17 @@
  * limitations under the License.
  */
 
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
+import com.facebook.airlift.log.Logger;
+import com.facebook.airlift.log.Logging;
+import com.facebook.plugin.arrow.TestingArrowFlightPlugin;
 import com.facebook.presto.Session;
 import com.facebook.presto.tests.DistributedQueryRunner;
 import com.google.common.collect.ImmutableMap;
+import org.apache.arrow.flight.FlightServer;
+import org.apache.arrow.flight.Location;
+import org.apache.arrow.memory.RootAllocator;
 
 import java.util.Map;
 
@@ -36,29 +42,59 @@ public class ArrowFlightQueryRunner
 
     private static DistributedQueryRunner createQueryRunner(Map<String, String> catalogProperties) throws Exception
     {
+        return createQueryRunner(ImmutableMap.of(), catalogProperties);
+    }
+
+    private static DistributedQueryRunner createQueryRunner(
+            Map<String, String> extraProperties,
+            Map<String, String> catalogProperties)
+            throws Exception
+    {
         Session session = testSessionBuilder()
                 .setCatalog("arrow")
                 .setSchema("tpch")
                 .build();
 
-        DistributedQueryRunner queryRunner = DistributedQueryRunner.builder(session).build();
+        DistributedQueryRunner queryRunner = DistributedQueryRunner.builder(session).setExtraProperties(extraProperties).build();
 
         try {
-            String connectorName = "arrow";
-            queryRunner.installPlugin(new ArrowPlugin(connectorName, new TestingArrowModule()));
+            queryRunner.installPlugin(new TestingArrowFlightPlugin());
 
             ImmutableMap.Builder<String, String> properties = ImmutableMap.<String, String>builder()
                     .putAll(catalogProperties)
                     .put("arrow-flight.server", "127.0.0.1")
-                    .put("arrow-flight.server-ssl-enabled", "true")
+                    .put("arrow-flight.server-ssl-enabled", "false")
                     .put("arrow-flight.server.verify", "false");
 
-            queryRunner.createCatalog(connectorName, connectorName, properties.build());
+            queryRunner.createCatalog("arrow", "arrow", properties.build());
 
             return queryRunner;
         }
         catch (Exception e) {
             throw new RuntimeException("Failed to create ArrowQueryRunner", e);
         }
+    }
+
+    public static void main(String[] args)
+            throws Exception
+    {
+        Logging.initialize();
+
+        RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Location serverLocation = Location.forGrpcInsecure("127.0.0.1", 9443);
+        FlightServer server = FlightServer.builder(allocator, serverLocation, new TestingArrowServer(allocator)).build();
+
+        server.start();
+
+        Logger log = Logger.get(ArrowFlightQueryRunner.class);
+
+        log.info("Server listening on port " + server.getPort());
+
+        DistributedQueryRunner queryRunner = createQueryRunner(
+                ImmutableMap.of("http-server.http.port", "8080"),
+                ImmutableMap.of("arrow-flight.server.port", String.valueOf(9443)));
+        Thread.sleep(10);
+        log.info("======== SERVER STARTED ========");
+        log.info("\n====\n%s\n====", queryRunner.getCoordinator().getBaseUrl());
     }
 }

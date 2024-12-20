@@ -12,8 +12,11 @@
  * limitations under the License.
  */
 
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
+import com.facebook.plugin.arrow.ArrowColumnHandle;
+import com.facebook.plugin.arrow.ArrowTableHandle;
+import com.facebook.plugin.arrow.ArrowTableLayoutHandle;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.BigintType;
 import com.facebook.presto.common.type.IntegerType;

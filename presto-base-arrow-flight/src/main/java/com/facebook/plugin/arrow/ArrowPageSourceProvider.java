@@ -33,11 +33,11 @@ public class ArrowPageSourceProvider
         implements ConnectorPageSourceProvider
 {
     private static final Logger logger = Logger.get(ArrowPageSourceProvider.class);
-    private final AbstractArrowFlightClientHandler clientHandler;
+    private final BaseArrowFlightClient clientHandler;
     private final ArrowBlockBuilder arrowBlockBuilder;
 
     @Inject
-    public ArrowPageSourceProvider(AbstractArrowFlightClientHandler clientHandler, ArrowBlockBuilder arrowBlockBuilder)
+    public ArrowPageSourceProvider(BaseArrowFlightClient clientHandler, ArrowBlockBuilder arrowBlockBuilder)
     {
         this.clientHandler = requireNonNull(clientHandler, "clientHandler is null");
         this.arrowBlockBuilder = requireNonNull(arrowBlockBuilder, "arrowBlockBuilder is null");

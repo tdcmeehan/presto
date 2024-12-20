@@ -12,11 +12,14 @@
  * limitations under the License.
  */
 
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
+import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.log.Logger;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.facebook.plugin.arrow.TestingArrowFlightRequest;
+import com.facebook.plugin.arrow.TestingArrowFlightResponse;
+import com.facebook.plugin.arrow.TestingH2DatabaseSetup;
+import com.google.common.collect.ImmutableList;
 import org.apache.arrow.adapter.jdbc.ArrowVectorIterator;
 import org.apache.arrow.adapter.jdbc.JdbcToArrow;
 import org.apache.arrow.adapter.jdbc.JdbcToArrowConfigBuilder;
@@ -45,7 +48,6 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -57,16 +59,21 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TimeZone;
 import java.util.concurrent.ThreadLocalRandom;
+
+import static com.facebook.airlift.json.JsonCodec.jsonCodec;
+import static com.facebook.presto.common.Utils.checkArgument;
 
 public class TestingArrowServer
         implements FlightProducer
 {
     private final RootAllocator allocator;
-    private final ObjectMapper objectMapper = new ObjectMapper();
     private final Connection connection;
     private static final Logger logger = Logger.get(TestingArrowServer.class);
+    private final JsonCodec<TestingArrowFlightRequest> requestCodec;
+    private final JsonCodec<TestingArrowFlightResponse> responseCodec;
 
     public TestingArrowServer(RootAllocator allocator) throws Exception
     {
@@ -74,26 +81,22 @@ public class TestingArrowServer
         String h2JdbcUrl = "jdbc:h2:mem:testdb" + System.nanoTime() + "_" + ThreadLocalRandom.current().nextInt() + ";DB_CLOSE_DELAY=-1";
         TestingH2DatabaseSetup.setup(h2JdbcUrl);
         this.connection = DriverManager.getConnection(h2JdbcUrl, "sa", "");
+        this.requestCodec = jsonCodec(TestingArrowFlightRequest.class);
+        this.responseCodec = jsonCodec(TestingArrowFlightResponse.class);
     }
 
     @Override
     public void getStream(CallContext callContext, Ticket ticket, ServerStreamListener serverStreamListener)
     {
         try (Statement stmt = connection.createStatement()) {
-            // Convert ticket bytes to String and parse into JSON
-            String ticketString = new String(ticket.getBytes(), StandardCharsets.UTF_8);
-            JsonNode ticketJson = objectMapper.readTree(ticketString);
-
-            // Extract interaction properties and validate
-            JsonNode interactionProperties = ticketJson.get("interactionProperties");
-            if (interactionProperties == null || !interactionProperties.has("select_statement")) {
-                throw new IllegalArgumentException("Invalid ticket format: missing select_statement.");
-            }
+            TestingArrowFlightRequest request = requestCodec.fromJson(ticket.getBytes());
+            checkArgument(request != null, "Request is null");
+            checkArgument(request.getQuery().isPresent(), "Query is missing");
 
             // Extract and validate the SQL query
-            String query = interactionProperties.get("select_statement").asText();
-            if (query == null || query.trim().isEmpty()) {
-                throw new IllegalArgumentException("Query cannot be null or empty.");
+            String query = request.getQuery().get();
+            if (query.trim().isEmpty()) {
+                throw new IllegalArgumentException("Query cannot be empty.");
             }
 
             logger.info("Executing query: " + query);
@@ -152,18 +155,19 @@ public class TestingArrowServer
     public FlightInfo getFlightInfo(CallContext callContext, FlightDescriptor flightDescriptor)
     {
         try {
-            String jsonRequest = new String(flightDescriptor.getCommand(), StandardCharsets.UTF_8);
-            JsonNode rootNode = objectMapper.readTree(jsonRequest);
+            TestingArrowFlightRequest request = requestCodec.fromJson(flightDescriptor.getCommand());
+            checkArgument(request != null, "Request is null");
 
-            String schemaName = rootNode.get("interactionProperties").get("schema_name").asText(null);
-            String tableName = rootNode.get("interactionProperties").get("table_name").asText(null);
-            String selectStatement = rootNode.get("interactionProperties").get("select_statement").asText(null);
+            checkArgument(request.getSchema().isPresent(), "Schema is missing");
+            String schemaName = request.getSchema().get();
+            Optional<String> tableName = request.getTable();
+            String selectStatement = request.getQuery().orElse(null);
 
             List<Field> fields = new ArrayList<>();
-            if (schemaName != null && tableName != null) {
+            if (tableName.isPresent()) {
                 String query = "SELECT * FROM INFORMATION_SCHEMA.COLUMNS " +
                         "WHERE TABLE_SCHEMA='" + schemaName.toUpperCase() + "' " +
-                        "AND TABLE_NAME='" + tableName.toUpperCase() + "'";
+                        "AND TABLE_NAME='" + tableName.get().toUpperCase() + "'";
 
                 try (ResultSet rs = connection.createStatement().executeQuery(query)) {
                     while (rs.next()) {
@@ -228,17 +232,15 @@ public class TestingArrowServer
     public void doAction(CallContext callContext, Action action, StreamListener<Result> streamListener)
     {
         try {
-            String jsonRequest = new String(action.getBody(), StandardCharsets.UTF_8);
-            JsonNode rootNode = objectMapper.readTree(jsonRequest);
-            String schemaName = rootNode.get("interactionProperties").get("schema_name").asText(null);
+            TestingArrowFlightRequest request = requestCodec.fromJson(action.getBody());
+            Optional<String> schemaName = request.getSchema();
 
             String query;
-            if (schemaName == null) {
+            if (!schemaName.isPresent()) {
                 query = "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA";
             }
             else {
-                schemaName = schemaName.toUpperCase();
-                query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='" + schemaName + "'";
+                query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='" + schemaName.get().toUpperCase() + "'";
             }
             ResultSet rs = connection.createStatement().executeQuery(query);
             List<String> names = new ArrayList<>();
@@ -246,8 +248,15 @@ public class TestingArrowServer
                 names.add(rs.getString(1));
             }
 
-            String jsonResponse = objectMapper.writeValueAsString(names);
-            streamListener.onNext(new Result(jsonResponse.getBytes(StandardCharsets.UTF_8)));
+            TestingArrowFlightResponse response;
+            if (!schemaName.isPresent()) {
+                response = new TestingArrowFlightResponse(names, ImmutableList.of());
+            }
+            else {
+                response = new TestingArrowFlightResponse(ImmutableList.of(), names);
+            }
+
+            streamListener.onNext(new Result(responseCodec.toJsonBytes(response)));
             streamListener.onCompleted();
         }
         catch (Exception e) {

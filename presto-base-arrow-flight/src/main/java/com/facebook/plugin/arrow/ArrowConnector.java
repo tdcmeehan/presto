@@ -34,7 +34,7 @@ public class ArrowConnector
     private final ConnectorPageSourceProvider pageSourceProvider;
     private final ConnectorHandleResolver handleResolver;
 
-    private final AbstractArrowFlightClientHandler arrowFlightClientHandler;
+    private final BaseArrowFlightClient arrowFlightClientHandler;
 
     @Inject
     public ArrowConnector(
@@ -42,7 +42,7 @@ public class ArrowConnector
             ConnectorHandleResolver handleResolver,
             ConnectorSplitManager splitManager,
             ConnectorPageSourceProvider pageSourceProvider,
-            AbstractArrowFlightClientHandler arrowFlightClientHandler)
+            BaseArrowFlightClient arrowFlightClientHandler)
     {
         this.metadata = requireNonNull(metadata, "Metadata is null");
         this.handleResolver = requireNonNull(handleResolver, "handleResolver is null");

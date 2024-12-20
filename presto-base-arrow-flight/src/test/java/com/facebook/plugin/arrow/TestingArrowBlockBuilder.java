@@ -30,17 +30,16 @@ public class TestingArrowBlockBuilder
 
         String nativeType = field.getMetadata().get("columnNativeType");
 
-        if ("CHAR".equals(nativeType) || "CHARACTER".equals(nativeType)) {
-            return CharType.createCharType(length);
-        }
-        else if ("VARCHAR".equals(nativeType)) {
-            return VarcharType.createVarcharType(length);
-        }
-        else if ("TIME".equals(nativeType)) {
-            return TimeType.TIME;
-        }
-        else {
-            return super.getPrestoTypeFromArrowField(field);
+        switch (nativeType) {
+            case "CHAR":
+            case "CHARACTER":
+                return CharType.createCharType(length);
+            case "VARCHAR":
+                return VarcharType.createVarcharType(length);
+            case "TIME":
+                return TimeType.TIME;
+            default:
+                return super.getPrestoTypeFromArrowField(field);
         }
     }
 }

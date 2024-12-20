@@ -13,13 +13,11 @@
  */
 package com.facebook.plugin.arrow;
 
-import com.facebook.presto.spi.connector.ConnectorMetadata;
-import com.facebook.presto.spi.connector.ConnectorSplitManager;
 import com.google.inject.Binder;
 import com.google.inject.Module;
 import com.google.inject.Scopes;
 
-import static com.facebook.airlift.configuration.ConfigBinder.configBinder;
+import static com.facebook.airlift.json.JsonCodecBinder.jsonCodecBinder;
 
 public class TestingArrowModule
         implements Module
@@ -27,10 +25,12 @@ public class TestingArrowModule
     @Override
     public void configure(Binder binder)
     {
-        configBinder(binder).bindConfig(TestingArrowFlightConfig.class);
-        binder.bind(ConnectorSplitManager.class).to(TestingArrowSplitManager.class).in(Scopes.SINGLETON);
-        binder.bind(AbstractArrowFlightClientHandler.class).to(TestingArrowFlightClientHandler.class).in(Scopes.SINGLETON);
-        binder.bind(ConnectorMetadata.class).to(TestingArrowMetadata.class).in(Scopes.SINGLETON);
+        // Concrete implementation of the ArrowFlightClient
+        binder.bind(BaseArrowFlightClient.class).to(TestingArrowFlightClient.class).in(Scopes.SINGLETON);
+        // Override the ArrowBlockBuilder with an implementation that handles h2 types
         binder.bind(ArrowBlockBuilder.class).to(TestingArrowBlockBuilder.class).in(Scopes.SINGLETON);
+        // Request/response objects
+        jsonCodecBinder(binder).bindJsonCodec(TestingArrowFlightRequest.class);
+        jsonCodecBinder(binder).bindJsonCodec(TestingArrowFlightResponse.class);
     }
 }

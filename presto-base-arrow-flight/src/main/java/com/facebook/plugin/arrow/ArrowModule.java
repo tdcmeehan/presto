@@ -15,7 +15,9 @@ package com.facebook.plugin.arrow;
 
 import com.facebook.presto.spi.ConnectorHandleResolver;
 import com.facebook.presto.spi.connector.Connector;
+import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.connector.ConnectorPageSourceProvider;
+import com.facebook.presto.spi.connector.ConnectorSplitManager;
 import com.google.inject.Binder;
 import com.google.inject.Module;
 import com.google.inject.Scopes;
@@ -36,11 +38,14 @@ public class ArrowModule
     public void configure(Binder binder)
     {
         configBinder(binder).bindConfig(ArrowFlightConfig.class);
+        binder.bind(ConnectorSplitManager.class).to(ArrowSplitManager.class).in(Scopes.SINGLETON);
+        binder.bind(ConnectorMetadata.class).to(ArrowMetadata.class).in(Scopes.SINGLETON);
         binder.bind(ArrowConnector.class).in(Scopes.SINGLETON);
         binder.bind(ArrowConnectorId.class).toInstance(new ArrowConnectorId(connectorId));
         binder.bind(ConnectorHandleResolver.class).to(ArrowHandleResolver.class).in(Scopes.SINGLETON);
         binder.bind(ArrowPageSourceProvider.class).in(Scopes.SINGLETON);
         binder.bind(ConnectorPageSourceProvider.class).to(ArrowPageSourceProvider.class).in(Scopes.SINGLETON);
         binder.bind(Connector.class).to(ArrowConnector.class).in(Scopes.SINGLETON);
+        binder.bind(ArrowBlockBuilder.class).to(ArrowBlockBuilder.class).in(Scopes.SINGLETON);
     }
 }

@@ -11,9 +11,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
 import com.facebook.airlift.log.Logger;
+import com.facebook.plugin.arrow.TestingH2DatabaseSetup;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.arrow.flight.Action;

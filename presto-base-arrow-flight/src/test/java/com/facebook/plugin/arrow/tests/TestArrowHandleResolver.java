@@ -11,8 +11,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
+import com.facebook.plugin.arrow.ArrowColumnHandle;
+import com.facebook.plugin.arrow.ArrowHandleResolver;
+import com.facebook.plugin.arrow.ArrowSplit;
+import com.facebook.plugin.arrow.ArrowTableHandle;
+import com.facebook.plugin.arrow.ArrowTableLayoutHandle;
+import com.facebook.plugin.arrow.ArrowTransactionHandle;
 import org.testng.annotations.Test;
 
 import static org.testng.Assert.assertEquals;

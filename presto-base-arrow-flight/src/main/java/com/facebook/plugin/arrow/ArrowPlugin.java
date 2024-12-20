@@ -26,14 +26,16 @@ import static java.util.Objects.requireNonNull;
 public class ArrowPlugin
         implements Plugin
 {
-    protected final String name;
-    protected final Module module;
+    private final String name;
+    private final Module module;
+    private final ImmutableList<Module> extraModules;
 
-    public ArrowPlugin(String name, Module module)
+    public ArrowPlugin(String name, Module module, Module... extraModules)
     {
         checkArgument(!isNullOrEmpty(name), "name is null or empty");
         this.name = name;
         this.module = requireNonNull(module, "module is null");
+        this.extraModules = ImmutableList.copyOf(requireNonNull(extraModules, "extraModules is null"));
     }
 
     private static ClassLoader getClassLoader()
@@ -44,6 +46,6 @@ public class ArrowPlugin
     @Override
     public Iterable<ConnectorFactory> getConnectorFactories()
     {
-        return ImmutableList.of(new ArrowConnectorFactory(name, module, getClassLoader()));
+        return ImmutableList.of(new ArrowConnectorFactory(name, module, extraModules, getClassLoader()));
     }
 }

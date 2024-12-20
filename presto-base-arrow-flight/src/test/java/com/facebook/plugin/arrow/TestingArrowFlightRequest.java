@@ -13,73 +13,63 @@
  */
 package com.facebook.plugin.arrow;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
 
-import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 
 public class TestingArrowFlightRequest
 {
-    private final String schema;
-    private final String table;
+    private final Optional<String> schema;
+    private final Optional<String> table;
     private final Optional<String> query;
-    private final TestingArrowFlightConfig testconfig;
 
-    public TestingArrowFlightRequest(ArrowFlightConfig config, TestingArrowFlightConfig testconfig, String schema, String table, Optional<String> query, int noOfPartitions)
+    @JsonCreator
+    public TestingArrowFlightRequest(
+            @JsonProperty("schema") Optional<String> schema,
+            @JsonProperty("table") Optional<String> table,
+            @JsonProperty("query") Optional<String> query)
     {
         this.schema = schema;
         this.table = table;
         this.query = query;
-        this.testconfig = testconfig;
     }
 
-    public TestingArrowFlightRequest(ArrowFlightConfig config, String schema, int noOfPartitions, TestingArrowFlightConfig testconfig)
+    public static TestingArrowFlightRequest createListSchemaRequest()
     {
-        this.schema = schema;
-        this.table = null;
-        this.query = Optional.empty();
-        this.testconfig = testconfig;
+        return new TestingArrowFlightRequest(Optional.empty(), Optional.empty(), Optional.empty());
     }
 
-    public String getSchema()
+    public static TestingArrowFlightRequest createListTablesRequest(String schema)
+    {
+        return new TestingArrowFlightRequest(Optional.of(schema), Optional.empty(), Optional.empty());
+    }
+
+    public static TestingArrowFlightRequest createDescribeTableRequest(String schema, String table)
+    {
+        return new TestingArrowFlightRequest(Optional.of(schema), Optional.of(table), Optional.empty());
+    }
+
+    public static TestingArrowFlightRequest createQueryRequest(String schema, String table, String query)
+    {
+        return new TestingArrowFlightRequest(Optional.of(schema), Optional.of(table), Optional.of(query));
+    }
+
+    @JsonProperty
+    public Optional<String> getSchema()
     {
         return schema;
     }
 
-    public String getTable()
+    @JsonProperty
+    public Optional<String> getTable()
     {
         return table;
     }
 
+    @JsonProperty
     public Optional<String> getQuery()
     {
         return query;
-    }
-
-    public TestingRequestData build()
-    {
-        TestingRequestData requestData = new TestingRequestData();
-        requestData.setInteractionProperties(createInteractionProperties());
-        return requestData;
-    }
-
-    public byte[] getCommand()
-    {
-        ObjectMapper objectMapper = new ObjectMapper();
-        objectMapper.configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
-        try {
-            String jsonString = objectMapper.writeValueAsString(build());
-            return jsonString.getBytes(StandardCharsets.UTF_8);
-        }
-        catch (JsonProcessingException e) {
-            throw new ArrowException(ArrowErrorCode.ARROW_INTERNAL_ERROR, "JSON request cannot be created.", e);
-        }
-    }
-
-    private TestingInteractionProperties createInteractionProperties()
-    {
-        return getQuery().isPresent() ? new TestingInteractionProperties(getQuery().get(), getSchema(), getTable()) : new TestingInteractionProperties(null, getSchema(), getTable());
     }
 }

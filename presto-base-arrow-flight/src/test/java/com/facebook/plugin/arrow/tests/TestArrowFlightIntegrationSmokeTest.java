@@ -11,31 +11,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.plugin.arrow;
+
+package com.facebook.plugin.arrow.tests;
 
 import com.facebook.airlift.log.Logger;
-import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.testing.QueryRunner;
-import com.facebook.presto.tests.AbstractTestQueryFramework;
+import com.facebook.presto.tests.AbstractTestIntegrationSmokeTest;
 import com.facebook.presto.tests.DistributedQueryRunner;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.memory.RootAllocator;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
-import org.testng.annotations.Test;
 
 import java.io.File;
 
-import static com.facebook.presto.common.type.BigintType.BIGINT;
-import static com.facebook.presto.common.type.VarcharType.VARCHAR;
-import static com.facebook.presto.testing.MaterializedResult.resultBuilder;
-import static com.facebook.presto.testing.assertions.Assert.assertEquals;
-
-public class TestArrowFlightQueriesWithDictionaryVector
-        extends AbstractTestQueryFramework
+public class TestArrowFlightIntegrationSmokeTest
+        extends AbstractTestIntegrationSmokeTest
 {
-    private static final Logger logger = Logger.get(TestArrowFlightQueriesWithDictionaryVector.class);
+    private static final Logger logger = Logger.get(TestArrowFlightIntegrationSmokeTest.class);
     private RootAllocator allocator;
     private FlightServer server;
     private Location serverLocation;
@@ -50,9 +44,8 @@ public class TestArrowFlightQueriesWithDictionaryVector
         File privateKeyFile = new File("src/test/resources/server.key");
 
         allocator = new RootAllocator(Long.MAX_VALUE);
-        serverLocation = Location.forGrpcTls("127.0.0.1", 9444);
-
-        server = FlightServer.builder(allocator, serverLocation, new TestingArrowServerUsingDictionaryVector(allocator))
+        serverLocation = Location.forGrpcTls("127.0.0.1", 9442);
+        server = FlightServer.builder(allocator, serverLocation, new TestingArrowServer(allocator))
                 .useTls(certChainFile, privateKeyFile)
                 .build();
 
@@ -64,31 +57,15 @@ public class TestArrowFlightQueriesWithDictionaryVector
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        return ArrowFlightQueryRunner.createQueryRunner(9444);
+        return ArrowFlightQueryRunner.createQueryRunner(9442);
     }
 
     @AfterClass(alwaysRun = true)
     public void close()
             throws InterruptedException
     {
-        allocator.close();
         server.close();
+        allocator.close();
         arrowFlightQueryRunner.close();
-    }
-
-    @Test
-    public void testDictionaryBlock()
-    {
-        // Retrieve the actual result from the query
-        MaterializedResult actual = computeActual("SELECT shipmode, orderkey FROM lineitem");
-        // Validate the row count first
-        assertEquals(actual.getRowCount(), 3);
-        // Now, validate each row
-        MaterializedResult expectedRow = resultBuilder(getSession(), VARCHAR, BIGINT)
-                .row("apple", 0L)
-                .row("banana", 1L)
-                .row("cherry", 2L)
-                .build();
-        assertEquals(expectedRow, actual);
     }
 }

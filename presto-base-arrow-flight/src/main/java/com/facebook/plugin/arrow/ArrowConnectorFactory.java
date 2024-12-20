@@ -24,16 +24,19 @@ import com.facebook.presto.spi.connector.ConnectorFactory;
 import com.facebook.presto.spi.function.FunctionMetadataManager;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
 import com.facebook.presto.spi.relation.RowExpressionService;
+import com.google.common.collect.ImmutableList;
 import com.google.inject.ConfigurationException;
 import com.google.inject.Injector;
 import com.google.inject.Module;
 
+import java.util.List;
 import java.util.Map;
 
 import static com.facebook.plugin.arrow.ArrowErrorCode.ARROW_INTERNAL_ERROR;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.base.Throwables.throwIfUnchecked;
+import static com.google.inject.util.Modules.override;
 import static java.util.Objects.requireNonNull;
 
 public class ArrowConnectorFactory
@@ -41,13 +44,15 @@ public class ArrowConnectorFactory
 {
     private final String name;
     private final Module module;
+    private final ImmutableList<Module> extraModules;
     private final ClassLoader classLoader;
 
-    public ArrowConnectorFactory(String name, Module module, ClassLoader classLoader)
+    public ArrowConnectorFactory(String name, Module module, List<Module> extraModules, ClassLoader classLoader)
     {
         checkArgument(!isNullOrEmpty(name), "name is null or empty");
         this.name = name;
         this.module = requireNonNull(module, "module is null");
+        this.extraModules = ImmutableList.copyOf(requireNonNull(extraModules, "extraModules is null"));
         this.classLoader = requireNonNull(classLoader, "classLoader is null");
     }
 
@@ -69,16 +74,17 @@ public class ArrowConnectorFactory
         requireNonNull(requiredConfig, "requiredConfig is null");
 
         try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {
-            Bootstrap app = new Bootstrap(
-                    binder -> {
+            Bootstrap app = new Bootstrap(ImmutableList.<Module>builder()
+                    .add(binder -> {
                         binder.bind(TypeManager.class).toInstance(context.getTypeManager());
                         binder.bind(FunctionMetadataManager.class).toInstance(context.getFunctionMetadataManager());
                         binder.bind(StandardFunctionResolution.class).toInstance(context.getStandardFunctionResolution());
                         binder.bind(RowExpressionService.class).toInstance(context.getRowExpressionService());
                         binder.bind(NodeManager.class).toInstance(context.getNodeManager());
-                    },
-                    new ArrowModule(catalogName),
-                    module);
+                    })
+                    .add(override(new ArrowModule(catalogName)).with(module))
+                    .addAll(extraModules)
+                    .build());
 
             Injector injector = app
                     .doNotInitializeLogging()

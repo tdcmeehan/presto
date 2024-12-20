@@ -20,21 +20,16 @@ import com.facebook.presto.common.type.Type;
 import com.facebook.presto.spi.ConnectorPageSource;
 import com.facebook.presto.spi.ConnectorSession;
 import org.apache.arrow.flight.FlightEndpoint;
-import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
-import java.io.IOException;
-import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 import static com.facebook.plugin.arrow.ArrowErrorCode.ARROW_FLIGHT_CLIENT_ERROR;
-import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.util.Objects.requireNonNull;
 
 public class ArrowPageSource
@@ -44,23 +39,24 @@ public class ArrowPageSource
     private final ArrowSplit split;
     private final List<ArrowColumnHandle> columnHandles;
     private final ArrowBlockBuilder arrowBlockBuilder;
+    private final FlightStream flightStream;
+    private final ClientClosingFlightStream flightStreamAndClient;
     private boolean completed;
     private int currentPosition;
     private VectorSchemaRoot vectorSchemaRoot;
-    private ArrowFlightClient flightClient;
-    private FlightStream flightStream;
 
     public ArrowPageSource(
             ArrowSplit split,
             List<ArrowColumnHandle> columnHandles,
-            AbstractArrowFlightClientHandler clientHandler,
+            BaseArrowFlightClient clientHandler,
             ConnectorSession connectorSession,
             ArrowBlockBuilder arrowBlockBuilder)
     {
         this.columnHandles = requireNonNull(columnHandles, "columnHandles is null");
         this.split = requireNonNull(split, "split is null");
         this.arrowBlockBuilder = requireNonNull(arrowBlockBuilder, "arrowBlockBuilder is null");
-        getFlightStream(clientHandler, getTicket(ByteBuffer.wrap(split.getFlightEndpoint())), connectorSession);
+        flightStreamAndClient = clientHandler.getFlightStream(split, getTicket(ByteBuffer.wrap(split.getFlightEndpoint())), connectorSession);
+        flightStream = flightStreamAndClient.getFlightStream();
     }
 
     private Ticket getTicket(ByteBuffer byteArray)
@@ -70,34 +66,6 @@ public class ArrowPageSource
         }
         catch (Exception e) {
             throw new ArrowException(ARROW_FLIGHT_CLIENT_ERROR, e.getMessage(), e);
-        }
-    }
-
-    private void getFlightStream(AbstractArrowFlightClientHandler clientHandler, Ticket ticket, ConnectorSession connectorSession)
-    {
-        try {
-            Optional<String> uri = getLocationUrls(ByteBuffer.wrap(split.getFlightEndpoint())).stream().findFirst();
-            flightClient = createArrowFlightClient(clientHandler, uri);
-            flightStream = flightClient.getFlightClient().getStream(ticket, clientHandler.getCallOptions(connectorSession));
-        }
-        catch (FlightRuntimeException | IOException | URISyntaxException e) {
-            throw new ArrowException(ARROW_FLIGHT_CLIENT_ERROR, e.getMessage(), e);
-        }
-    }
-
-    public List<String> getLocationUrls(ByteBuffer byteArray)
-            throws IOException, URISyntaxException
-    {
-        return FlightEndpoint.deserialize(byteArray).getLocations().stream().map(location -> location.getUri().toString()).collect(toImmutableList());
-    }
-
-    private ArrowFlightClient createArrowFlightClient(AbstractArrowFlightClientHandler clientHandler, Optional<String> uri)
-    {
-        if (uri.isPresent()) {
-            return clientHandler.createArrowFlightClient(uri.get());
-        }
-        else {
-            return clientHandler.createArrowFlightClient();
         }
     }
 
@@ -163,22 +131,12 @@ public class ArrowPageSource
             completed = true;
         }
 
-        if (flightStream != null) {
-            try {
-                flightStream.close();
-            }
-            catch (Exception e) {
-                logger.error(e);
-            }
-        }
         try {
-            if (flightClient != null) {
-                flightClient.close();
-                flightClient = null;
-            }
+            flightStreamAndClient.close();
         }
-        catch (Exception ex) {
-            logger.error("Failed to close the flight client: %s", ex.getMessage(), ex);
+        catch (Exception e) {
+            logger.error(e, "Error closing flight stream");
+            throw new ArrowException(ARROW_FLIGHT_CLIENT_ERROR, e.getMessage(), e);
         }
     }
 }

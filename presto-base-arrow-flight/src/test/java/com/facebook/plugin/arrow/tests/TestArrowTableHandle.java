@@ -11,13 +11,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
 import com.facebook.airlift.testing.EquivalenceTester;
+import com.facebook.plugin.arrow.ArrowTableHandle;
 import org.testng.annotations.Test;
 
-import static com.facebook.plugin.arrow.ArrowMetadataUtil.TABLE_CODEC;
-import static com.facebook.plugin.arrow.ArrowMetadataUtil.assertJsonRoundTrip;
+import static com.facebook.plugin.arrow.tests.ArrowMetadataUtil.TABLE_CODEC;
+import static com.facebook.plugin.arrow.tests.ArrowMetadataUtil.assertJsonRoundTrip;
 
 public class TestArrowTableHandle
 {

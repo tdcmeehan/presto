@@ -11,7 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
 import com.facebook.airlift.log.Logger;
 import com.facebook.presto.Session;

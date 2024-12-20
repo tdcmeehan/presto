@@ -11,8 +11,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
+import com.facebook.plugin.arrow.ArrowColumnHandle;
 import com.facebook.presto.common.type.IntegerType;
 import com.facebook.presto.spi.ColumnMetadata;
 import org.testng.annotations.Test;

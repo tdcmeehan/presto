@@ -30,9 +30,10 @@ import com.facebook.presto.spi.SchemaTablePrefix;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+
+import javax.inject.Inject;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,26 +47,33 @@ import static com.facebook.plugin.arrow.ArrowErrorCode.ARROW_FLIGHT_METADATA_ERR
 import static com.google.common.base.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 
-public abstract class AbstractArrowMetadata
+public class ArrowMetadata
         implements ConnectorMetadata
 {
-    private static final Logger logger = Logger.get(AbstractArrowMetadata.class);
+    private static final Logger logger = Logger.get(ArrowMetadata.class);
     private final ArrowFlightConfig config;
-    private final AbstractArrowFlightClientHandler clientHandler;
+    private final BaseArrowFlightClient clientHandler;
     private final ArrowBlockBuilder arrowBlockBuilder;
 
-    public AbstractArrowMetadata(ArrowFlightConfig config, AbstractArrowFlightClientHandler clientHandler, ArrowBlockBuilder arrowBlockBuilder)
+    @Inject
+    public ArrowMetadata(ArrowFlightConfig config, BaseArrowFlightClient clientHandler, ArrowBlockBuilder arrowBlockBuilder)
     {
         this.config = requireNonNull(config, "config is null");
         this.clientHandler = requireNonNull(clientHandler, "clientHandler is null");
         this.arrowBlockBuilder = requireNonNull(arrowBlockBuilder, "arrowPageBuilder is null");
     }
 
-    protected abstract FlightDescriptor getFlightDescriptor(String schema, String table);
+    @Override
+    public final List<String> listSchemaNames(ConnectorSession session)
+    {
+        return clientHandler.listSchemaNames(session);
+    }
 
-    protected abstract String getDataSourceSpecificSchemaName(ArrowFlightConfig config, String schemaName);
-
-    protected abstract String getDataSourceSpecificTableName(ArrowFlightConfig config, String tableName);
+    @Override
+    public final List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
+    {
+        return clientHandler.listTables(session, schemaName);
+    }
 
     @Override
     public ConnectorTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName)
@@ -83,12 +91,9 @@ public abstract class AbstractArrowMetadata
     public List<Field> getColumnsList(String schema, String table, ConnectorSession connectorSession)
     {
         try {
-            String dataSourceSpecificSchemaName = getDataSourceSpecificSchemaName(config, schema);
-            String dataSourceSpecificTableName = getDataSourceSpecificTableName(config, table);
-            FlightDescriptor flightDescriptor = getFlightDescriptor(
-                    dataSourceSpecificSchemaName, dataSourceSpecificTableName);
-
-            Schema flightSchema = clientHandler.getSchema(flightDescriptor, connectorSession);
+            String dataSourceSpecificSchemaName = schema;
+            String dataSourceSpecificTableName = table;
+            Schema flightSchema = clientHandler.getSchemaForTable(dataSourceSpecificSchemaName, dataSourceSpecificTableName, connectorSession);
             return flightSchema.getFields();
         }
         catch (Exception e) {
@@ -103,8 +108,8 @@ public abstract class AbstractArrowMetadata
 
         String schemaValue = ((ArrowTableHandle) tableHandle).getSchema();
         String tableValue = ((ArrowTableHandle) tableHandle).getTable();
-        String dbSpecificSchemaValue = getDataSourceSpecificSchemaName(config, schemaValue);
-        String dBSpecificTableName = getDataSourceSpecificTableName(config, tableValue);
+        String dbSpecificSchemaValue = schemaValue;
+        String dBSpecificTableName = tableValue;
         List<Field> columnList = getColumnsList(dbSpecificSchemaValue, dBSpecificTableName, session);
 
         for (Field field : columnList) {

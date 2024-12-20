@@ -19,38 +19,35 @@ import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.FixedSplitSource;
 import com.facebook.presto.spi.connector.ConnectorSplitManager;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
-import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightInfo;
+
+import javax.inject.Inject;
 
 import java.util.List;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.util.Objects.requireNonNull;
 
-public abstract class AbstractArrowSplitManager
+public class ArrowSplitManager
         implements ConnectorSplitManager
 {
-    private final AbstractArrowFlightClientHandler clientHandler;
+    private final BaseArrowFlightClient clientHandler;
 
     private ArrowFlightConfig arrowFlightConfig;
 
-    public AbstractArrowSplitManager(AbstractArrowFlightClientHandler clientHandler, ArrowFlightConfig arrowFlightConfig)
+    @Inject
+    public ArrowSplitManager(BaseArrowFlightClient clientHandler, ArrowFlightConfig arrowFlightConfig)
     {
         this.clientHandler = requireNonNull(clientHandler, "clientHandler is null");
         this.arrowFlightConfig = requireNonNull(arrowFlightConfig, "arrowFlightConfig is null");
     }
-
-    protected abstract FlightDescriptor getFlightDescriptor(ArrowTableLayoutHandle tableLayoutHandle);
 
     @Override
     public ConnectorSplitSource getSplits(ConnectorTransactionHandle transactionHandle, ConnectorSession session, ConnectorTableLayoutHandle layout, SplitSchedulingContext splitSchedulingContext)
     {
         ArrowTableLayoutHandle tableLayoutHandle = (ArrowTableLayoutHandle) layout;
         ArrowTableHandle tableHandle = tableLayoutHandle.getTableHandle();
-        FlightDescriptor flightDescriptor = getFlightDescriptor(
-                tableLayoutHandle);
-
-        FlightInfo flightInfo = clientHandler.getFlightInfo(flightDescriptor, session);
+        FlightInfo flightInfo = clientHandler.getFlightInfoForTableScan(tableLayoutHandle, session);
         List<ArrowSplit> splits = flightInfo.getEndpoints()
                 .stream()
                 .map(info -> new ArrowSplit(

@@ -12,8 +12,11 @@
  * limitations under the License.
  */
 
-package com.facebook.plugin.arrow;
+package com.facebook.plugin.arrow.tests;
 
+import com.facebook.plugin.arrow.ArrowConnectorFactory;
+import com.facebook.plugin.arrow.ArrowPlugin;
+import com.facebook.plugin.arrow.TestingArrowFlightPlugin;
 import com.facebook.presto.spi.connector.ConnectorFactory;
 import org.testng.annotations.Test;
 
@@ -25,8 +28,7 @@ public class TestArrowPlugin
     @Test
     public void testStartup()
     {
-        ArrowModule testModule = new ArrowModule("arrow-flight");
-        ArrowPlugin plugin = new ArrowPlugin("arrow-flight", testModule);
+        ArrowPlugin plugin = new TestingArrowFlightPlugin();
         ConnectorFactory factory = getOnlyElement(plugin.getConnectorFactories());
         assertInstanceOf(factory, ArrowConnectorFactory.class);
     }
