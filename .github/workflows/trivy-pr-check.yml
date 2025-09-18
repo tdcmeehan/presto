@@ -1,0 +1,54 @@
+name: Trivy PR Security Check
+on: [pull_request]
+
+jobs:
+  trivy-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Scan base branch
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'base'
+          format: 'json'
+          output: 'base-results.json'
+          exit-code: '0'  # Don't fail on base branch issues
+
+      - name: Scan PR branch
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'pr'
+          format: 'json'
+          output: 'pr-results.json'
+          exit-code: '0'
+
+      - name: Compare and fail on new CVEs
+        run: |
+          # Extract CVE IDs from both scans
+          base_cves=$(cat base-results.json | jq -r '.Results[]?.Vulnerabilities[]?.VulnerabilityID' | sort -u)
+          pr_cves=$(cat pr-results.json | jq -r '.Results[]?.Vulnerabilities[]?.VulnerabilityID' | sort -u)
+
+          # Find new CVEs in PR
+          new_cves=$(comm -13 <(echo "$base_cves") <(echo "$pr_cves"))
+
+          if [ ! -z "$new_cves" ]; then
+            echo "New vulnerabilities introduced in PR:"
+            echo "$new_cves"
+            cat pr-results.json | jq '.Results[]?.Vulnerabilities[]? | select(.VulnerabilityID | IN($new_cves))'
+            exit 1
+          else
+            echo "No new vulnerabilities introduced"
+          fi
