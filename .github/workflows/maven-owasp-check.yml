@@ -1,0 +1,139 @@
+name: Maven OWASP Dependency Check
+on: [pull_request]
+
+jobs:
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Cache OWASP NVD database
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: owasp-nvd-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            owasp-nvd-${{ runner.os }}-
+
+      - name: Run OWASP check on base branch
+        working-directory: base
+        run: |
+          mvn org.owasp:dependency-check-maven:10.0.4:aggregate \
+            -DskipTests \
+            -Dformat=JSON \
+            -DprettyPrint=true \
+            -DfailBuildOnCVSS=11 \
+            -DossindexAnalyzerEnabled=true \
+            -DnvdApiAnalyzerEnabled=false \
+            -DnodeAnalyzerEnabled=false \
+            -DassemblyAnalyzerEnabled=false \
+            -DcentralAnalyzerEnabled=false \
+            -DnuspecAnalyzerEnabled=false \
+            -DautoUpdate=false \
+            -DnvdValidForHours=8760 \
+            -DdataDirectory=~/.m2/repository/org/owasp/dependency-check-data \
+            || true  # Don't fail, we just want the report
+
+          # Copy aggregated report from root target directory
+          cp target/dependency-check-report.json ../base-report.json 2>/dev/null || echo "No aggregated report found"
+
+      - name: Run OWASP check on PR branch
+        working-directory: pr
+        run: |
+          mvn org.owasp:dependency-check-maven:10.0.4:aggregate \
+            -DskipTests \
+            -Dformat=JSON \
+            -DprettyPrint=true \
+            -DfailBuildOnCVSS=11 \
+            -DossindexAnalyzerEnabled=true \
+            -DnvdApiAnalyzerEnabled=false \
+            -DnodeAnalyzerEnabled=false \
+            -DassemblyAnalyzerEnabled=false \
+            -DcentralAnalyzerEnabled=false \
+            -DnuspecAnalyzerEnabled=false \
+            -DautoUpdate=false \
+            -DnvdValidForHours=8760 \
+            -DdataDirectory=~/.m2/repository/org/owasp/dependency-check-data \
+            || true  # Don't fail, we just want the report
+
+          # Copy aggregated report from root target directory
+          cp target/dependency-check-report.json ../pr-report.json 2>/dev/null || echo "No aggregated report found"
+
+      - name: Compare vulnerabilities
+        run: |
+          echo "=== Extracting vulnerabilities from reports ==="
+
+          # Extract CVEs from base branch (only CVE format)
+          if [ -f base-report.json ]; then
+            base_cves=$(cat base-report.json | jq -r '.dependencies[].vulnerabilities[]?.name' 2>/dev/null | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
+            echo "Base CVEs found: $(echo "$base_cves" | grep -c .)"
+          else
+            echo "No base report found"
+            base_cves=""
+          fi
+
+          # Extract CVEs from PR branch (only CVE format)
+          if [ -f pr-report.json ]; then
+            pr_cves=$(cat pr-report.json | jq -r '.dependencies[].vulnerabilities[]?.name' 2>/dev/null | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
+            echo "PR CVEs found: $(echo "$pr_cves" | grep -c .)"
+
+            # Look specifically for hudi
+            echo "=== Hudi-related vulnerabilities in PR ==="
+            cat pr-report.json | jq '.dependencies[] | select(.fileName | contains("hudi"))'
+          else
+            echo "No PR report found"
+            pr_cves=""
+          fi
+
+          # Find new CVEs
+          if [ -n "$base_cves" ] && [ -n "$pr_cves" ]; then
+            new_cves=$(comm -13 <(echo "$base_cves") <(echo "$pr_cves"))
+
+            if [ -n "$new_cves" ]; then
+              echo "❌ New vulnerabilities introduced:"
+              echo "$new_cves"
+
+              # Show details for each new CVE
+              for cve in $new_cves; do
+                echo "=== Details for $cve ==="
+                cat pr-report.json | jq ".dependencies[].vulnerabilities[] | select(.name == \"$cve\")"
+              done
+
+              exit 1
+            else
+              echo "✅ No new vulnerabilities introduced"
+            fi
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-reports
+          path: |
+            base-report.json
+            pr-report.json
