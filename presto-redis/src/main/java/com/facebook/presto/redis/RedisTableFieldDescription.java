@@ -115,9 +115,14 @@ public final class RedisTableFieldDescription
                 false);
     }
 
-    ColumnMetadata getColumnMetadata()
+    ColumnMetadata getColumnMetadata(String name)
     {
-        return new ColumnMetadata(getName(), getType(), getComment(), isHidden());
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(getType())
+                .setComment(getComment())
+                .setHidden(isHidden())
+                .build();
     }
 
     @Override

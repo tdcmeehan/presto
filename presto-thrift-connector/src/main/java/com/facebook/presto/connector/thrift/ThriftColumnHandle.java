@@ -18,8 +18,7 @@ import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-
-import javax.annotation.Nullable;
+import jakarta.annotation.Nullable;
 
 import java.util.Objects;
 
@@ -48,7 +47,7 @@ public final class ThriftColumnHandle
 
     public ThriftColumnHandle(ColumnMetadata columnMetadata)
     {
-        this(columnMetadata.getName(), columnMetadata.getType(), columnMetadata.getComment(), columnMetadata.isHidden());
+        this(columnMetadata.getName(), columnMetadata.getType(), columnMetadata.getComment().orElse(null), columnMetadata.isHidden());
     }
 
     @JsonProperty
@@ -78,7 +77,12 @@ public final class ThriftColumnHandle
 
     public ColumnMetadata toColumnMetadata()
     {
-        return new ColumnMetadata(columnName, columnType, comment, hidden);
+        return ColumnMetadata.builder()
+                .setName(columnName)
+                .setType(columnType)
+                .setComment(comment)
+                .setHidden(hidden)
+                .build();
     }
 
     @Override

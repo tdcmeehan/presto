@@ -13,16 +13,17 @@
  */
 package com.facebook.presto.server.protocol;
 
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.dispatcher.DispatchInfo;
 import com.facebook.presto.spi.QueryId;
 import com.google.common.util.concurrent.ListenableFuture;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 
-import javax.ws.rs.core.Response;
-import javax.ws.rs.core.UriInfo;
-
+import java.net.URI;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 public interface ExecutingQueryResponseProvider
 {
@@ -47,6 +48,9 @@ public interface ExecutingQueryResponseProvider
      * @param compressionEnabled enable compression
      * @param nestedDataSerializationEnabled enable nested data serialization
      * @param binaryResults generate results in binary format, rather than JSON
+     * @param retryUrl optional retry URL for cross-cluster retry
+     * @param retryExpirationEpochTime optional retry expiration time
+     * @param isRetryQuery true if this query is already a retry query
      * @return the ExecutingStatement's Response, if available
      */
     Optional<ListenableFuture<Response>> waitForExecutingResponse(
@@ -60,5 +64,9 @@ public interface ExecutingQueryResponseProvider
             DataSize targetResultSize,
             boolean compressionEnabled,
             boolean nestedDataSerializationEnabled,
-            boolean binaryResults);
+            boolean binaryResults,
+            long durationUntilExpirationMs,
+            Optional<URI> retryUrl,
+            OptionalLong retryExpirationEpochTime,
+            boolean isRetryQuery);
 }

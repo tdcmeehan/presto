@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.orc;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.common.Page;
 import com.facebook.presto.common.RuntimeStats;
 import com.facebook.presto.common.block.BlockBuilder;
@@ -22,7 +23,6 @@ import com.facebook.presto.orc.metadata.CompressionKind;
 import com.facebook.presto.orc.metadata.RowGroupIndex;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import io.airlift.units.DataSize;
 import org.joda.time.DateTimeZone;
 import org.testng.annotations.Test;
 
@@ -32,12 +32,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.orc.NoOpOrcWriterStats.NOOP_WRITER_STATS;
 import static com.facebook.presto.orc.NoopOrcAggregatedMemoryContext.NOOP_ORC_AGGREGATED_MEMORY_CONTEXT;
 import static com.facebook.presto.orc.OrcTester.createOrcWriter;
 import static com.facebook.presto.orc.metadata.Stream.StreamKind.ROW_INDEX;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
 
@@ -140,7 +140,8 @@ public class TestOrcFileIntrospection
                 DwrfEncryptionProvider.NO_ENCRYPTION,
                 DwrfKeyProvider.EMPTY,
                 new RuntimeStats(),
-                Optional.of(introspector));
+                Optional.of(introspector),
+                tempFile.getFile().lastModified());
 
         OrcSelectiveRecordReader recordReader = reader.createSelectiveRecordReader(
                 ImmutableMap.of(0, type),

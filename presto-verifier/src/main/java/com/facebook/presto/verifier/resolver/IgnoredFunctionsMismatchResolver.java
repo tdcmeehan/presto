@@ -16,20 +16,21 @@ package com.facebook.presto.verifier.resolver;
 import com.facebook.presto.common.CatalogSchemaName;
 import com.facebook.presto.sql.tree.AstVisitor;
 import com.facebook.presto.sql.tree.FunctionCall;
+import com.facebook.presto.sql.tree.Identifier;
 import com.facebook.presto.sql.tree.Node;
 import com.facebook.presto.sql.tree.QualifiedName;
 import com.facebook.presto.verifier.framework.DataMatchResult;
 import com.facebook.presto.verifier.framework.QueryBundle;
-import com.google.common.base.Splitter;
+import jakarta.inject.Inject;
 
-import javax.inject.Inject;
-
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
-import static com.facebook.presto.metadata.BuiltInTypeAndFunctionNamespaceManager.DEFAULT_NAMESPACE;
+import static com.facebook.presto.metadata.BuiltInTypeAndFunctionNamespaceManager.JAVA_BUILTIN_NAMESPACE;
 import static com.facebook.presto.verifier.framework.DataMatchResult.MatchType.COLUMN_MISMATCH;
 import static com.facebook.presto.verifier.framework.DataMatchResult.MatchType.ROW_COUNT_MISMATCH;
 import static com.google.common.base.Preconditions.checkArgument;
@@ -87,13 +88,15 @@ public class IgnoredFunctionsMismatchResolver
 
     private static String normalizeFunctionName(String name)
     {
-        return normalizeFunctionName(QualifiedName.of(Splitter.on(".").splitToList(name)));
+        return normalizeFunctionName(QualifiedName.of(Arrays.stream(name.split("\\."))
+                .map(Identifier::new)
+                .collect(Collectors.toList())));
     }
 
     private static String normalizeFunctionName(QualifiedName name)
     {
         if (name.getParts().size() == 3 &&
-                new CatalogSchemaName(name.getParts().get(0), name.getParts().get(1)).equals(DEFAULT_NAMESPACE)) {
+                new CatalogSchemaName(name.getParts().get(0), name.getParts().get(1)).equals(JAVA_BUILTIN_NAMESPACE)) {
             return name.getSuffix();
         }
         return name.toString();

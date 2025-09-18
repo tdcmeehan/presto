@@ -41,17 +41,17 @@ public interface ConnectorHandleResolver
         throw new UnsupportedOperationException();
     }
 
+    default Class<? extends ConnectorDeleteTableHandle> getDeleteTableHandleClass()
+    {
+        throw new UnsupportedOperationException();
+    }
+
     default Class<? extends ConnectorPartitioningHandle> getPartitioningHandleClass()
     {
         throw new UnsupportedOperationException();
     }
 
     default Class<? extends ConnectorTransactionHandle> getTransactionHandleClass()
-    {
-        throw new UnsupportedOperationException();
-    }
-
-    default Class<? extends ConnectorMetadataUpdateHandle> getMetadataUpdateHandleClass()
     {
         throw new UnsupportedOperationException();
     }

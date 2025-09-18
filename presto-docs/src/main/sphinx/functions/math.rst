@@ -40,6 +40,41 @@ Mathematical Functions
 
         SELECT cosine_similarity(MAP(ARRAY['a'], ARRAY[1.0]), MAP(ARRAY['a'], ARRAY[2.0])); -- 1.0
 
+.. function:: cosine_similarity(x, y) -> double
+
+    Returns the cosine similarity between the arrays ``x`` and ``y``.
+    If the input arrays have different sizes or if the input arrays contain a null, the function throws user error::
+
+        SELECT cosine_similarity(ARRAY[1.2], ARRAY[2.0]); -- 1.0
+
+.. function:: l2_squared(array(real), array(real)) -> real
+
+    Returns the squared `Euclidean distance <https://en.wikipedia.org/wiki/Euclidean_distance>`_ between the vectors represented as array(real).
+    If the input arrays have different sizes or if the input arrays contain a null, the function throws user error::
+
+        SELECT l2_squared(ARRAY[1.0], ARRAY[2.0]); -- 1.0
+
+.. function:: l2_squared(array(double), array(double)) -> double
+
+    Returns the squared `Euclidean distance <https://en.wikipedia.org/wiki/Euclidean_distance>`_ between the vectors represented as array(double).
+    If the input arrays have different sizes or if the input arrays contain a null, the function throws user error::
+
+        SELECT l2_squared(ARRAY[1.0], ARRAY[2.0]); -- 1.0
+
+.. function:: dot_product(array(real), array(real)) -> real
+
+    Returns the dot product of two vectors represented as array(real).
+    If the input arrays have different sizes or if the input arrays contain a null, the function throws user error::
+
+        SELECT dot_product(ARRAY[1.0, 2.0], ARRAY[3.0, 4.0]); -- 11.0
+
+.. function:: dot_product(array(double), array(double)) -> double
+
+    Returns the dot product of two vectors represented as array(double).
+    If the input arrays have different sizes or if the input arrays contain a null, the function throws user error::
+
+        SELECT dot_product(ARRAY[1.0, 2.0], ARRAY[3.0, 4.0]); -- 11.0
+
 .. function:: degrees(x) -> double
 
     Converts angle ``x`` in radians to degrees.
@@ -168,8 +203,16 @@ Mathematical Functions
 .. function:: width_bucket(x, bins) -> bigint
 
     Returns the bin number of ``x`` according to the bins specified by the
-    array ``bins``. The ``bins`` parameter must be an array of doubles and is
-    assumed to be in sorted ascending order.
+    array ``bins``. The ``bins`` parameter must be an array of doubles, should not
+    contain ``null`` or non-finite elements, and is assumed to be in sorted ascending order.
+
+    Note: The function returns an error if it encounters a ``null`` or non-finite
+    element in ``bins``, but due to the binary search algorithm some such elements
+    might go unnoticed and the function will return a result.
+
+.. function:: factorial(x) -> bigint
+
+    Returns the factorial of ``x``.
 
 Probability Functions: cdf
 --------------------------
@@ -264,7 +307,7 @@ Probability Functions: inverse_cdf
 
 .. function:: inverse_f_cdf(df1, df2, p) -> double
 
-    Compute the inverse of the F cdf with a given df1 (numerator degrees of freedom) and df2 (denominator degrees of freedom) parameters 
+    Compute the inverse of the F cdf with a given df1 (numerator degrees of freedom) and df2 (denominator degrees of freedom) parameters
     for the cumulative probability (p): P(N < n). The numerator and denominator df parameters must be positive real numbers.
     The probability p must lie on the interval [0, 1].
 

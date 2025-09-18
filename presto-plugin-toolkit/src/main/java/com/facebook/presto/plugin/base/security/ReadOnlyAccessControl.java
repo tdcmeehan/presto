@@ -14,6 +14,7 @@
 package com.facebook.presto.plugin.base.security;
 
 import com.facebook.presto.common.Subfield;
+import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.connector.ConnectorAccessControl;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
@@ -22,9 +23,11 @@ import com.facebook.presto.spi.security.ConnectorIdentity;
 import com.facebook.presto.spi.security.PrestoPrincipal;
 import com.facebook.presto.spi.security.Privilege;
 
+import java.util.List;
 import java.util.Set;
 
 import static com.facebook.presto.spi.security.AccessDeniedException.denyGrantTablePrivilege;
+import static com.facebook.presto.spi.security.AccessDeniedException.denyRenameView;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyRevokeTablePrivilege;
 import static com.facebook.presto.spi.security.AccessDeniedException.denyTruncateTable;
 
@@ -43,6 +46,12 @@ public class ReadOnlyAccessControl
     }
 
     @Override
+    public void checkCanShowCreateTable(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
+    {
+        // allow
+    }
+
+    @Override
     public void checkCanShowTablesMetadata(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, String schemaName)
     {
     }
@@ -51,6 +60,18 @@ public class ReadOnlyAccessControl
     public Set<SchemaTableName> filterTables(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, Set<SchemaTableName> tableNames)
     {
         return tableNames;
+    }
+
+    @Override
+    public void checkCanShowColumnsMetadata(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
+    {
+        // allow
+    }
+
+    @Override
+    public List<ColumnMetadata> filterColumns(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName, List<ColumnMetadata> columns)
+    {
+        return columns;
     }
 
     @Override
@@ -69,6 +90,12 @@ public class ReadOnlyAccessControl
     public void checkCanCreateViewWithSelectFromColumns(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName, Set<String> columnNames)
     {
         // allow
+    }
+
+    @Override
+    public void checkCanRenameView(ConnectorTransactionHandle transaction, ConnectorIdentity identity, AccessControlContext context, SchemaTableName viewName, SchemaTableName newViewName)
+    {
+        denyRenameView(viewName.toString(), newViewName.toString());
     }
 
     @Override

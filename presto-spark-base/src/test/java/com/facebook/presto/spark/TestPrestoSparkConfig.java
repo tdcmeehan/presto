@@ -14,18 +14,18 @@
 package com.facebook.presto.spark;
 
 import com.facebook.airlift.configuration.testing.ConfigAssertions;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.google.common.collect.ImmutableMap;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 import org.testng.annotations.Test;
 
 import java.util.Map;
 
 import static com.facebook.airlift.configuration.testing.ConfigAssertions.assertFullMapping;
 import static com.facebook.airlift.configuration.testing.ConfigAssertions.assertRecordedDefaults;
-import static io.airlift.units.DataSize.Unit.GIGABYTE;
-import static io.airlift.units.DataSize.Unit.KILOBYTE;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
+import static com.facebook.airlift.units.DataSize.Unit.GIGABYTE;
+import static com.facebook.airlift.units.DataSize.Unit.KILOBYTE;
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.concurrent.TimeUnit.MINUTES;
 
 public class TestPrestoSparkConfig
@@ -67,7 +67,10 @@ public class TestPrestoSparkConfig
                 .setHashPartitionCountAllocationStrategyEnabled(false)
                 .setNativeExecutionBroadcastBasePath(null)
                 .setNativeTerminateWithCoreWhenUnresponsiveEnabled(false)
-                .setNativeTerminateWithCoreTimeout(new Duration(5, MINUTES)));
+                .setNativeTerminateWithCoreTimeout(new Duration(5, MINUTES))
+                .setDynamicPrestoMemoryPoolTuningEnabled(false)
+                .setDynamicPrestoMemoryPoolTuningFraction(0.7)
+                .setAttemptNumberToApplyDynamicMemoryPoolTuning(1));
     }
 
     @Test
@@ -108,6 +111,9 @@ public class TestPrestoSparkConfig
                 .put("native-execution-broadcast-base-path", "/tmp/broadcast_path")
                 .put("native-terminate-with-core-when-unresponsive-enabled", "true")
                 .put("native-terminate-with-core-timeout", "1m")
+                .put("spark.dynamic-presto-memory-pool-tuning-enabled", "true")
+                .put("spark.dynamic-presto-memory-pool-tuning-fraction", "0.8")
+                .put("spark.attempt-number-to-apply-dynamic-memory-pool-tuning", "0")
                 .build();
         PrestoSparkConfig expected = new PrestoSparkConfig()
                 .setSparkPartitionCountAutoTuneEnabled(false)
@@ -143,7 +149,10 @@ public class TestPrestoSparkConfig
                 .setExecutorAllocationStrategyEnabled(true)
                 .setNativeExecutionBroadcastBasePath("/tmp/broadcast_path")
                 .setNativeTerminateWithCoreWhenUnresponsiveEnabled(true)
-                .setNativeTerminateWithCoreTimeout(new Duration(1, MINUTES));
+                .setNativeTerminateWithCoreTimeout(new Duration(1, MINUTES))
+                .setDynamicPrestoMemoryPoolTuningEnabled(true)
+                .setDynamicPrestoMemoryPoolTuningFraction(0.8)
+                .setAttemptNumberToApplyDynamicMemoryPoolTuning(0);
         assertFullMapping(properties, expected);
     }
 }

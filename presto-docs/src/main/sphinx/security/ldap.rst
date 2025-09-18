@@ -51,8 +51,8 @@ Presto Coordinator Node Configuration
 You must make the following changes to the environment prior to configuring the
 Presto coordinator to use LDAP authentication and HTTPS.
 
- * :ref:`ldap_server`
- * :ref:`server_java_keystore`
+* :ref:`ldap_server`
+* :ref:`server_java_keystore`
 
 You also need to make changes to the Presto configuration files.
 LDAP authentication is configured on the coordinator in two parts.
@@ -85,6 +85,7 @@ Property                                                Description
                                                         Should be set to ``true``. Default value is
                                                         ``false``.
 ``http-server.https.port``                              HTTPS server port.
+``http-server.http2.enabled``                           Enables HTTP2 server on the worker.
 ``http-server.https.keystore.path``                     The location of the Java Keystore file that will be
                                                         used to secure TLS.
 ``http-server.https.keystore.key``                      The password for the keystore. This must match the
@@ -317,3 +318,37 @@ with the appropriate :abbr:`SAN (Subject Alternative Name)` added.
 Adding a SAN to this certificate is required in cases where ``https://`` uses IP address in the URL rather
 than the domain contained in the coordinator's certificate, and the certificate does not contain the
 :abbr:`SAN (Subject Alternative Name)` parameter with the matching IP address as an alternative attribute.
+
+No console from which to read password
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If you use the command line options ``--user`` and ``--password`` along with
+supplying the query statements to execute using ``--file`` or ``--execute`` command line options as below -
+
+.. code-block:: none
+
+    ./presto \
+    --server https://presto-coordinator.example.com:8443 \
+    --execute "select * from tpch.tiny.nation"
+    --user <LDAP user> \
+    --password
+
+    OR
+
+    ./presto \
+    --server https://presto-coordinator.example.com:8443 \
+    --file input_queries.txt
+    --user <LDAP user> \
+    --password > output.txt
+
+The following error might be displayed:
+
+.. code-block:: none
+
+    java.lang.RuntimeException: No console from which to read password
+
+To avoid this error, export the password using the ``PRESTO_PASSWORD`` environment variable:
+
+.. code-block:: none
+
+    export PRESTO_PASSWORD=<password>

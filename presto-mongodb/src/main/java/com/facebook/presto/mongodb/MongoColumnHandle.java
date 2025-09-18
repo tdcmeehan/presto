@@ -65,7 +65,20 @@ public class MongoColumnHandle
 
     public ColumnMetadata toColumnMetadata()
     {
-        return new ColumnMetadata(name, type, null, hidden);
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(type)
+                .setHidden(hidden)
+                .build();
+    }
+
+    public ColumnMetadata toColumnMetadata(String name)
+    {
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(type)
+                .setHidden(hidden)
+                .build();
     }
 
     public Document getDocument()

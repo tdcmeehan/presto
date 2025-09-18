@@ -13,7 +13,10 @@
  */
 package com.facebook.presto.tests;
 
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.Session;
+import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.common.RuntimeStats;
 import com.facebook.presto.cost.StatsAndCosts;
 import com.facebook.presto.dispatcher.DispatchManager;
@@ -40,8 +43,6 @@ import com.google.common.base.Stopwatch;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 import org.intellij.lang.annotations.Language;
 import org.joda.time.DateTime;
 import org.testng.annotations.AfterClass;
@@ -63,6 +64,7 @@ import static com.facebook.presto.execution.TestQueryRunnerUtil.createQuery;
 import static com.facebook.presto.execution.TestQueryRunnerUtil.waitForQueryState;
 import static com.facebook.presto.execution.resourceGroups.db.H2TestUtil.getSimpleQueryRunner;
 import static com.facebook.presto.operator.BlockedReason.WAITING_FOR_MEMORY;
+import static com.facebook.presto.spi.StandardErrorCode.ABANDONED_QUERY;
 import static com.facebook.presto.spi.StandardErrorCode.EXCEEDED_CPU_LIMIT;
 import static com.facebook.presto.spi.StandardErrorCode.EXCEEDED_GLOBAL_MEMORY_LIMIT;
 import static com.facebook.presto.spi.StandardErrorCode.EXCEEDED_OUTPUT_POSITIONS_LIMIT;
@@ -220,6 +222,8 @@ public class TestQueryManager
             BasicQueryInfo queryInfo = queryManager.getQueryInfo(queryId);
             assertEquals(queryInfo.getState(), FAILED);
             assertEquals(queryInfo.getErrorCode(), EXCEEDED_CPU_LIMIT.toErrorCode());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getSchema(), TEST_SESSION.getSchema());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getCatalog(), TEST_SESSION.getCatalog());
         }
     }
 
@@ -234,6 +238,8 @@ public class TestQueryManager
             BasicQueryInfo queryInfo = queryManager.getQueryInfo(queryId);
             assertEquals(queryInfo.getState(), FAILED);
             assertEquals(queryInfo.getErrorCode(), EXCEEDED_SCAN_RAW_BYTES_READ_LIMIT.toErrorCode());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getSchema(), TEST_SESSION.getSchema());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getCatalog(), TEST_SESSION.getCatalog());
         }
     }
 
@@ -248,6 +254,8 @@ public class TestQueryManager
             BasicQueryInfo queryInfo = queryManager.getQueryInfo(queryId);
             assertEquals(queryInfo.getState(), FAILED);
             assertEquals(queryInfo.getErrorCode(), EXCEEDED_OUTPUT_POSITIONS_LIMIT.toErrorCode());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getSchema(), TEST_SESSION.getSchema());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getCatalog(), TEST_SESSION.getCatalog());
         }
     }
 
@@ -262,6 +270,28 @@ public class TestQueryManager
             BasicQueryInfo queryInfo = queryManager.getQueryInfo(queryId);
             assertEquals(queryInfo.getState(), FAILED);
             assertEquals(queryInfo.getErrorCode(), EXCEEDED_OUTPUT_SIZE_LIMIT.toErrorCode());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getSchema(), TEST_SESSION.getSchema());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getCatalog(), TEST_SESSION.getCatalog());
+        }
+    }
+
+    @Test(timeOut = 60_000L)
+    public void testQueryClientTimeoutExceeded()
+            throws Exception
+    {
+        Session session = Session.builder(TEST_SESSION)
+                .setSystemProperty(SystemSessionProperties.QUERY_CLIENT_TIMEOUT, "1s")
+                .build();
+
+        try (DistributedQueryRunner queryRunner = builder().setSingleExtraProperty("query.client.timeout", "3m").build()) {
+            QueryId queryId = createQuery(queryRunner, session, "SELECT COUNT(*) FROM lineitem");
+            waitForQueryState(queryRunner, queryId, FAILED);
+            QueryManager queryManager = queryRunner.getCoordinator().getQueryManager();
+            BasicQueryInfo queryInfo = queryManager.getQueryInfo(queryId);
+            assertEquals(queryInfo.getState(), FAILED);
+            assertEquals(queryInfo.getErrorCode(), ABANDONED_QUERY.toErrorCode());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getSchema(), session.getSchema());
+            assertEquals(queryManager.getQuerySession(queryId).getAccessControlContext().getCatalog(), session.getCatalog());
         }
     }
 
@@ -344,9 +374,15 @@ public class TestQueryManager
         }
 
         @Override
-        public DateTime getCreateTime()
+        public long getCreateTimeInMillis()
         {
-            return info.getQueryStats().getCreateTime();
+            return info.getQueryStats().getCreateTimeInMillis();
+        }
+
+        @Override
+        public Duration getQueuedTime()
+        {
+            return info.getQueryStats().getQueuedTime();
         }
 
         @Override
@@ -356,15 +392,15 @@ public class TestQueryManager
         }
 
         @Override
-        public DataSize getRawInputDataSize()
+        public long getRawInputDataSizeInBytes()
         {
-            return info.getQueryStats().getRawInputDataSize();
+            return info.getQueryStats().getRawInputDataSize().toBytes();
         }
 
         @Override
-        public DataSize getOutputDataSize()
+        public long getOutputDataSizeInBytes()
         {
-            return info.getQueryStats().getOutputDataSize();
+            return info.getQueryStats().getOutputDataSize().toBytes();
         }
 
         @Override
@@ -416,10 +452,10 @@ public class TestQueryManager
                 Optional.empty(),
                 Optional.empty(),
                 new QueryStats(
-                        DateTime.parse("1991-09-06T05:00-05:30"),
-                        DateTime.parse("1991-09-06T05:01-05:30"),
-                        DateTime.parse("1991-09-06T05:02-05:30"),
-                        DateTime.parse("1991-09-06T06:00-05:30"),
+                        DateTime.parse("1991-09-06T05:00-05:30").getMillis(),
+                        DateTime.parse("1991-09-06T05:01-05:30").getMillis(),
+                        DateTime.parse("1991-09-06T05:02-05:30").getMillis(),
+                        DateTime.parse("1991-09-06T06:00-05:30").getMillis(),
                         Duration.valueOf("8m"),
                         Duration.valueOf("5m"),
                         Duration.valueOf("7m"),
@@ -439,6 +475,14 @@ public class TestQueryManager
                         17,
                         18,
                         34,
+                        19,
+                        100,
+                        17,
+                        18,
+                        19,
+                        100,
+                        17,
+                        18,
                         19,
                         20.0,
                         43.0,

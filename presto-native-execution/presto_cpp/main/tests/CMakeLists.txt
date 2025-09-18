@@ -14,15 +14,23 @@ add_executable(
   AnnouncerTest.cpp
   CoordinatorDiscovererTest.cpp
   HttpServerWrapper.cpp
-  MutableConfigs.cpp
   PeriodicMemoryCheckerTest.cpp
   PrestoExchangeSourceTest.cpp
   PrestoTaskTest.cpp
+  PrestoToVeloxQueryConfigTest.cpp
   QueryContextCacheTest.cpp
   ServerOperationTest.cpp
   SessionPropertiesTest.cpp
   TaskManagerTest.cpp
-  QueryContextManagerTest.cpp)
+  QueryContextManagerTest.cpp
+  TaskInfoTest.cpp
+  TaskStatusTest.cpp
+  TaskUpdateRequestTest.cpp)
+
+if(DEFINED PRESTO_MEMORY_CHECKER_TYPE AND PRESTO_MEMORY_CHECKER_TYPE STREQUAL
+                                          "LINUX_MEMORY_CHECKER")
+  target_sources(presto_server_test PRIVATE LinuxMemoryCheckerTest.cpp)
+endif()
 
 add_test(
   NAME presto_server_test
@@ -43,10 +51,17 @@ target_link_libraries(
   velox_functions_prestosql
   velox_aggregates
   velox_hive_partition_function
+  presto_mutable_configs
   ${RE2}
   GTest::gmock
   GTest::gtest
   GTest::gtest_main)
+
+# Clang requires explicit linking with libatomic.
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"
+   AND "${CMAKE_CXX_COMPILER_VERSION}" VERSION_GREATER_EQUAL 15)
+  target_link_libraries(presto_server_test atomic)
+endif()
 
 set_property(TARGET presto_server_test PROPERTY JOB_POOL_LINK
                                                 presto_link_job_pool)

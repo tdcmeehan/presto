@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.orc;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.orc.metadata.CompressionKind;
 import com.facebook.presto.orc.stream.SharedBuffer;
 import com.facebook.presto.orc.writer.CompressionBufferPool;
@@ -20,7 +21,6 @@ import com.google.common.collect.ImmutableList;
 import io.airlift.slice.BasicSliceInput;
 import io.airlift.slice.DynamicSliceOutput;
 import io.airlift.slice.Slice;
-import io.airlift.units.DataSize;
 import org.testng.annotations.Test;
 
 import java.io.ByteArrayInputStream;
@@ -33,13 +33,13 @@ import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
 
+import static com.facebook.airlift.units.DataSize.Unit.BYTE;
+import static com.facebook.airlift.units.DataSize.Unit.KILOBYTE;
 import static com.facebook.presto.common.array.Arrays.ensureCapacity;
 import static com.facebook.presto.orc.NoopOrcLocalMemoryContext.NOOP_ORC_LOCAL_MEMORY_CONTEXT;
 import static com.facebook.presto.orc.metadata.CompressionKind.ZSTD;
 import static io.airlift.slice.Slices.EMPTY_SLICE;
 import static io.airlift.slice.Slices.wrappedBuffer;
-import static io.airlift.units.DataSize.Unit.BYTE;
-import static io.airlift.units.DataSize.Unit.KILOBYTE;
 import static java.util.Collections.reverse;
 import static java.util.stream.Collectors.toList;
 import static org.testng.Assert.assertEquals;
@@ -58,24 +58,43 @@ public class TestOrcOutputBuffer
     @Test
     public void testWriteHugeByteChucks()
     {
+        // compression buffer size should be at least 2x smaller than the size of test data
         int size = 1024 * 1024;
         byte[] largeByteArray = new byte[size];
         Arrays.fill(largeByteArray, (byte) 0xA);
-        ColumnWriterOptions columnWriterOptions = ColumnWriterOptions.builder().setCompressionKind(CompressionKind.NONE).build();
+        ColumnWriterOptions columnWriterOptions = ColumnWriterOptions.builder()
+                .setCompressionKind(CompressionKind.NONE)
+                .setCompressionMaxBufferSize(DataSize.valueOf("256kB"))
+                .build();
         OrcOutputBuffer orcOutputBuffer = new OrcOutputBuffer(columnWriterOptions, Optional.empty());
 
+        // write size-10 bytes from offset 10
         DynamicSliceOutput output = new DynamicSliceOutput(size);
         orcOutputBuffer.writeBytes(largeByteArray, 10, size - 10);
         orcOutputBuffer.flush();
         assertEquals(orcOutputBuffer.writeDataTo(output), size - 10);
         assertEquals(output.slice(), wrappedBuffer(largeByteArray, 10, size - 10));
+        assertEquals(orcOutputBuffer.size(), size - 10);
 
         orcOutputBuffer.reset();
         output.reset();
+
+        // write size-100 bytes from offset 100
         orcOutputBuffer.writeBytes(wrappedBuffer(largeByteArray), 100, size - 100);
         orcOutputBuffer.flush();
         assertEquals(orcOutputBuffer.writeDataTo(output), size - 100);
         assertEquals(output.slice(), wrappedBuffer(largeByteArray, 100, size - 100));
+        assertEquals(orcOutputBuffer.size(), size - 100);
+
+        orcOutputBuffer.reset();
+        output.reset();
+
+        // write all bytes
+        orcOutputBuffer.writeBytes(wrappedBuffer(largeByteArray), 0, size);
+        orcOutputBuffer.flush();
+        assertEquals(orcOutputBuffer.writeDataTo(output), size);
+        assertEquals(output.slice(), wrappedBuffer(largeByteArray));
+        assertEquals(orcOutputBuffer.size(), size);
     }
 
     @Test

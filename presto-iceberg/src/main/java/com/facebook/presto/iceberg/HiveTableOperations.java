@@ -13,9 +13,11 @@
  */
 package com.facebook.presto.iceberg;
 
+import com.facebook.airlift.concurrent.NotThreadSafe;
 import com.facebook.airlift.log.Logger;
 import com.facebook.presto.hive.HdfsContext;
 import com.facebook.presto.hive.HdfsEnvironment;
+import com.facebook.presto.hive.UnknownTableTypeException;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.HivePrivilegeInfo;
 import com.facebook.presto.hive.metastore.MetastoreContext;
@@ -28,14 +30,18 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableNotFoundException;
 import com.facebook.presto.spi.security.PrestoPrincipal;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.Sets;
+import jakarta.annotation.Nullable;
 import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
 import org.apache.hadoop.mapred.FileInputFormat;
 import org.apache.hadoop.mapred.FileOutputFormat;
+import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.LocationProviders;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadata.MetadataLogEntry;
@@ -47,9 +53,6 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.util.Tasks;
-
-import javax.annotation.Nullable;
-import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.FileNotFoundException;
 import java.util.HashMap;
@@ -105,7 +108,8 @@ public class HiveTableOperations
     private final String tableName;
     private final Optional<String> owner;
     private final Optional<String> location;
-    private final FileIO fileIO;
+    private final HdfsFileIO fileIO;
+
     private final IcebergHiveTableOperationsConfig config;
 
     private TableMetadata currentMetadata;
@@ -121,10 +125,11 @@ public class HiveTableOperations
             HdfsEnvironment hdfsEnvironment,
             HdfsContext hdfsContext,
             IcebergHiveTableOperationsConfig config,
+            ManifestFileCache manifestFileCache,
             String database,
             String table)
     {
-        this(new HdfsFileIO(hdfsEnvironment, hdfsContext),
+        this(new HdfsFileIO(manifestFileCache, hdfsEnvironment, hdfsContext),
                 metastore,
                 metastoreContext,
                 config,
@@ -140,12 +145,13 @@ public class HiveTableOperations
             HdfsEnvironment hdfsEnvironment,
             HdfsContext hdfsContext,
             IcebergHiveTableOperationsConfig config,
+            ManifestFileCache manifestFileCache,
             String database,
             String table,
             String owner,
             String location)
     {
-        this(new HdfsFileIO(hdfsEnvironment, hdfsContext),
+        this(new HdfsFileIO(manifestFileCache, hdfsEnvironment, hdfsContext),
                 metastore,
                 metastoreContext,
                 config,
@@ -156,7 +162,7 @@ public class HiveTableOperations
     }
 
     private HiveTableOperations(
-            FileIO fileIO,
+            HdfsFileIO fileIO,
             ExtendedHiveMetastore metastore,
             MetastoreContext metastoreContext,
             IcebergHiveTableOperationsConfig config,
@@ -181,15 +187,16 @@ public class HiveTableOperations
     {
         if (commitLockCache == null) {
             commitLockCache = CacheBuilder.newBuilder()
-                .expireAfterAccess(evictionTimeout, TimeUnit.MILLISECONDS)
-                .build(
-                    new CacheLoader<String, ReentrantLock>() {
-                        @Override
-                        public ReentrantLock load(String fullName)
-                        {
-                            return new ReentrantLock();
-                        }
-                    });
+                    .expireAfterAccess(evictionTimeout, TimeUnit.MILLISECONDS)
+                    .build(
+                            new CacheLoader<String, ReentrantLock>()
+                            {
+                                @Override
+                                public ReentrantLock load(String fullName)
+                                {
+                                    return new ReentrantLock();
+                                }
+                            });
         }
     }
 
@@ -213,7 +220,7 @@ public class HiveTableOperations
         Table table = getTable();
 
         if (!isIcebergTable(table)) {
-            throw new UnknownTableTypeException(getSchemaTableName());
+            throw new UnknownTableTypeException("Not an Iceberg table: " + getSchemaTableName());
         }
 
         if (isPrestoView(table)) {
@@ -248,14 +255,19 @@ public class HiveTableOperations
         String newMetadataLocation = writeNewMetadata(metadata, version + 1);
 
         Table table;
+        Optional<Long> lockId = Optional.empty();
+        boolean useHMSLock = Optional.ofNullable(metadata.property(TableProperties.HIVE_LOCK_ENABLED, null))
+                .map(Boolean::parseBoolean)
+                .orElse(config.getLockingEnabled());
+        ReentrantLock tableLevelMutex = commitLockCache.getUnchecked(database + "." + tableName);
         // getting a process-level lock per table to avoid concurrent commit attempts to the same table from the same
         // JVM process, which would result in unnecessary and costly HMS lock acquisition requests
-        Optional<Long> lockId = Optional.empty();
-        ReentrantLock tableLevelMutex = commitLockCache.getUnchecked(database + "." + tableName);
         tableLevelMutex.lock();
         try {
             try {
-                lockId = metastore.lock(metastoreContext, database, tableName);
+                if (useHMSLock) {
+                    lockId = metastore.lock(metastoreContext, database, tableName);
+                }
                 if (base == null) {
                     String tableComment = metadata.properties().get(TABLE_COMMENT);
                     Map<String, String> parameters = new HashMap<>();
@@ -304,21 +316,18 @@ public class HiveTableOperations
             PrestoPrincipal owner = new PrestoPrincipal(USER, table.getOwner());
             PrincipalPrivileges privileges = new PrincipalPrivileges(
                     ImmutableMultimap.<String, HivePrivilegeInfo>builder()
-                        .put(table.getOwner(), new HivePrivilegeInfo(SELECT, true, owner, owner))
-                        .put(table.getOwner(), new HivePrivilegeInfo(INSERT, true, owner, owner))
-                        .put(table.getOwner(), new HivePrivilegeInfo(UPDATE, true, owner, owner))
-                        .put(table.getOwner(), new HivePrivilegeInfo(DELETE, true, owner, owner))
-                        .build(),
+                            .put(table.getOwner(), new HivePrivilegeInfo(SELECT, true, owner, owner))
+                            .put(table.getOwner(), new HivePrivilegeInfo(INSERT, true, owner, owner))
+                            .put(table.getOwner(), new HivePrivilegeInfo(UPDATE, true, owner, owner))
+                            .put(table.getOwner(), new HivePrivilegeInfo(DELETE, true, owner, owner))
+                            .build(),
                     ImmutableMultimap.of());
             if (base == null) {
                 metastore.createTable(metastoreContext, table, privileges, emptyList());
             }
             else {
                 PartitionStatistics tableStats = metastore.getTableStatistics(metastoreContext, database, tableName);
-                metastore.replaceTable(metastoreContext, database, tableName, table, privileges);
-
-                // attempt to put back previous table statistics
-                metastore.updateTableStatistics(metastoreContext, database, tableName, oldStats -> tableStats);
+                metastore.persistTable(metastoreContext, database, tableName, table, privileges, () -> tableStats, useHMSLock ? ImmutableMap.of() : hmsEnvContext(base.metadataFileLocation()));
             }
             deleteRemovedMetadataFiles(base, metadata);
         }
@@ -408,7 +417,7 @@ public class HiveTableOperations
                             config.getTableRefreshMaxRetryTime().toMillis(),
                             config.getTableRefreshBackoffScaleFactor())
                     .run(metadataLocation -> newMetadata.set(
-                            TableMetadataParser.read(fileIO, io().newInputFile(metadataLocation))));
+                            TableMetadataParser.read(fileIO, fileIO.newCachedInputFile(metadataLocation))));
         }
         catch (RuntimeException e) {
             throw new TableNotFoundException(getSchemaTableName(), "Table metadata is missing", e);
@@ -496,5 +505,20 @@ public class HiveTableOperations
                             log.warn("Delete failed for previous metadata file: %s", previousMetadataFile, exc))
                     .run(previousMetadataFile -> io().deleteFile(previousMetadataFile.file()));
         }
+    }
+
+    private Map<String, String> hmsEnvContext(String metadataLocation)
+    {
+        return ImmutableMap.of(
+                org.apache.iceberg.hive.HiveTableOperations.NO_LOCK_EXPECTED_KEY,
+                BaseMetastoreTableOperations.METADATA_LOCATION_PROP,
+                org.apache.iceberg.hive.HiveTableOperations.NO_LOCK_EXPECTED_VALUE,
+                metadataLocation);
+    }
+
+    @VisibleForTesting
+    public IcebergHiveTableOperationsConfig getConfig()
+    {
+        return config;
     }
 }

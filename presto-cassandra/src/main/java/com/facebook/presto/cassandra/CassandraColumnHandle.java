@@ -20,8 +20,7 @@ import com.facebook.presto.spi.ColumnMetadata;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.MoreObjects.ToStringHelper;
-
-import javax.annotation.Nullable;
+import jakarta.annotation.Nullable;
 
 import java.util.List;
 import java.util.Objects;
@@ -131,7 +130,20 @@ public class CassandraColumnHandle
 
     public ColumnMetadata getColumnMetadata()
     {
-        return new ColumnMetadata(CassandraCqlUtils.cqlNameToSqlName(name), cassandraType.getNativeType(), null, hidden);
+        return ColumnMetadata.builder()
+                .setName(CassandraCqlUtils.cqlNameToSqlName(name))
+                .setType(cassandraType.getNativeType())
+                .setHidden(hidden)
+                .build();
+    }
+
+    public ColumnMetadata getColumnMetadata(String name)
+    {
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(cassandraType.getNativeType())
+                .setHidden(hidden)
+                .build();
     }
 
     public Type getType()

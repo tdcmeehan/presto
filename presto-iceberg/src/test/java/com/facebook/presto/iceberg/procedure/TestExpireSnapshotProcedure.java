@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.facebook.presto.SystemSessionProperties.LEGACY_TIMESTAMP;
 import static com.facebook.presto.iceberg.CatalogType.HADOOP;
+import static com.facebook.presto.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
 import static com.facebook.presto.iceberg.IcebergQueryRunner.getIcebergDataDirectoryPath;
 import static java.lang.String.format;
 import static org.testng.Assert.assertEquals;
@@ -50,14 +51,13 @@ import static org.testng.Assert.assertTrue;
 public class TestExpireSnapshotProcedure
         extends AbstractTestQueryFramework
 {
-    public static final String ICEBERG_CATALOG = "test_hive";
     public static final String TEST_SCHEMA = "tpch";
 
     @Override
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        return IcebergQueryRunner.createIcebergQueryRunner(ImmutableMap.of(), HADOOP, ImmutableMap.of());
+        return IcebergQueryRunner.builder().setCatalogType(HADOOP).build().getQueryRunner();
     }
 
     public void dropTable(String tableName)
@@ -248,6 +248,7 @@ public class TestExpireSnapshotProcedure
 
     private Table loadTable(String tableName)
     {
+        tableName = normalizeIdentifier(tableName, ICEBERG_CATALOG);
         Catalog catalog = CatalogUtil.loadCatalog(HadoopCatalog.class.getName(), ICEBERG_CATALOG, getProperties(), new Configuration());
         return catalog.loadTable(TableIdentifier.of(TEST_SCHEMA, tableName));
     }

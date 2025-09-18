@@ -19,8 +19,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-
-import javax.annotation.concurrent.Immutable;
+import com.google.errorprone.annotations.Immutable;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -37,6 +36,7 @@ import static java.util.Objects.requireNonNull;
 @Immutable
 public class Table
 {
+    private final Optional<String> catalogName;
     private final String databaseName;
     private final String tableName;
     private final String owner;
@@ -50,6 +50,7 @@ public class Table
 
     @JsonCreator
     public Table(
+            @JsonProperty("catalogName") Optional<String> catalogName,
             @JsonProperty("databaseName") String databaseName,
             @JsonProperty("tableName") String tableName,
             @JsonProperty("owner") String owner,
@@ -61,6 +62,7 @@ public class Table
             @JsonProperty("viewOriginalText") Optional<String> viewOriginalText,
             @JsonProperty("viewExpandedText") Optional<String> viewExpandedText)
     {
+        this.catalogName = requireNonNull(catalogName, "catalogName is null");
         this.databaseName = requireNonNull(databaseName, "databaseName is null");
         this.tableName = requireNonNull(tableName, "tableName is null");
         this.owner = requireNonNull(owner, "owner is null");
@@ -73,6 +75,11 @@ public class Table
         this.viewExpandedText = requireNonNull(viewExpandedText, "viewExpandedText is null");
     }
 
+    @JsonProperty
+    public Optional<String> getCatalogName()
+    {
+        return catalogName;
+    }
     @JsonProperty
     public String getDatabaseName()
     {
@@ -160,6 +167,7 @@ public class Table
     public String toString()
     {
         return toStringHelper(this)
+                .add("catalogName", catalogName)
                 .add("databaseName", databaseName)
                 .add("tableName", tableName)
                 .add("owner", owner)
@@ -184,7 +192,8 @@ public class Table
         }
 
         Table table = (Table) o;
-        return Objects.equals(databaseName, table.databaseName) &&
+        return Objects.equals(catalogName, table.catalogName) &&
+                Objects.equals(databaseName, table.databaseName) &&
                 Objects.equals(tableName, table.tableName) &&
                 Objects.equals(owner, table.owner) &&
                 Objects.equals(tableType, table.tableType) &&
@@ -200,6 +209,7 @@ public class Table
     public int hashCode()
     {
         return Objects.hash(
+                catalogName,
                 databaseName,
                 tableName,
                 owner,
@@ -215,6 +225,7 @@ public class Table
     public static class Builder
     {
         private final Storage.Builder storageBuilder;
+        private Optional<String> catalogName = Optional.empty();
         private String databaseName;
         private String tableName;
         private String owner;
@@ -232,6 +243,7 @@ public class Table
 
         private Builder(Table table)
         {
+            catalogName = table.catalogName;
             databaseName = table.databaseName;
             tableName = table.tableName;
             owner = table.owner;
@@ -244,6 +256,11 @@ public class Table
             viewExpandedText = table.viewExpandedText;
         }
 
+        public Builder setCatalogName(Optional<String> catalogName)
+        {
+            this.catalogName = catalogName;
+            return this;
+        }
         public Builder setDatabaseName(String databaseName)
         {
             this.databaseName = databaseName;
@@ -324,6 +341,7 @@ public class Table
         public Table build()
         {
             return new Table(
+                    catalogName,
                     databaseName,
                     tableName,
                     owner,

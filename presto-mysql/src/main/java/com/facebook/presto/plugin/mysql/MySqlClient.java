@@ -23,44 +23,61 @@ import com.facebook.presto.plugin.jdbc.DriverConnectionFactory;
 import com.facebook.presto.plugin.jdbc.JdbcColumnHandle;
 import com.facebook.presto.plugin.jdbc.JdbcConnectorId;
 import com.facebook.presto.plugin.jdbc.JdbcIdentity;
+import com.facebook.presto.plugin.jdbc.JdbcSplit;
 import com.facebook.presto.plugin.jdbc.JdbcTableHandle;
+import com.facebook.presto.plugin.jdbc.JdbcTypeHandle;
+import com.facebook.presto.plugin.jdbc.QueryBuilder;
+import com.facebook.presto.plugin.jdbc.mapping.ReadMapping;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableMetadata;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.google.common.collect.ImmutableSet;
+import com.mysql.cj.jdbc.JdbcStatement;
 import com.mysql.jdbc.Driver;
-import com.mysql.jdbc.Statement;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLSyntaxErrorException;
 import java.util.Collection;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 
 import static com.facebook.presto.common.type.RealType.REAL;
+import static com.facebook.presto.common.type.StandardTypes.GEOMETRY;
 import static com.facebook.presto.common.type.TimeWithTimeZoneType.TIME_WITH_TIME_ZONE;
 import static com.facebook.presto.common.type.TimestampWithTimeZoneType.TIMESTAMP_WITH_TIME_ZONE;
 import static com.facebook.presto.common.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.common.type.Varchars.isVarcharType;
 import static com.facebook.presto.plugin.jdbc.DriverConnectionFactory.basicConnectionProperties;
 import static com.facebook.presto.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
+import static com.facebook.presto.plugin.jdbc.QueryBuilder.quote;
+import static com.facebook.presto.plugin.jdbc.mapping.StandardColumnMappings.geometryReadMapping;
 import static com.facebook.presto.spi.StandardErrorCode.ALREADY_EXISTS;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
-import static com.mysql.jdbc.SQLError.SQL_STATE_ER_TABLE_EXISTS_ERROR;
-import static com.mysql.jdbc.SQLError.SQL_STATE_SYNTAX_ERROR;
 import static java.lang.String.format;
 import static java.util.Locale.ENGLISH;
+import static java.util.function.Function.identity;
 
 public class MySqlClient
         extends BaseJdbcClient
 {
+    /**
+     * Error code corresponding to code thrown when a table already exists.
+     * The code is derived from the MySQL documentation.
+     *
+     * @see <a href="https://dev.mysql.com/doc/connector-j/en/connector-j-reference-error-sqlstates.html">MySQL documentation</a>
+     */
+    private static final String SQL_STATE_ER_TABLE_EXISTS_ERROR = "42S01";
+
     @Inject
     public MySqlClient(JdbcConnectorId connectorId, BaseJdbcConfig config, MySqlConfig mySqlConfig)
             throws SQLException
@@ -102,7 +119,7 @@ public class MySqlClient
             while (resultSet.next()) {
                 String schemaName = resultSet.getString("TABLE_CAT");
                 // skip internal schemas
-                if (!schemaName.equalsIgnoreCase("information_schema") && !schemaName.equalsIgnoreCase("mysql")) {
+                if (!listSchemasIgnoredSchemas.contains(schemaName.toLowerCase(ENGLISH))) {
                     schemaNames.add(schemaName);
                 }
             }
@@ -127,8 +144,8 @@ public class MySqlClient
             throws SQLException
     {
         PreparedStatement statement = connection.prepareStatement(sql);
-        if (statement.isWrapperFor(Statement.class)) {
-            statement.unwrap(Statement.class).enableStreamingResults();
+        if (statement.isWrapperFor(JdbcStatement.class)) {
+            statement.unwrap(JdbcStatement.class).enableStreamingResults();
         }
         return statement;
     }
@@ -192,6 +209,42 @@ public class MySqlClient
     }
 
     @Override
+    public PreparedStatement buildSql(ConnectorSession session, Connection connection, JdbcSplit split, List<JdbcColumnHandle> columnHandles)
+            throws SQLException
+    {
+        Map<String, String> columnExpressions = columnHandles.stream()
+                .filter(handle -> handle.getJdbcTypeHandle().getJdbcTypeName().equalsIgnoreCase(GEOMETRY))
+                .map(JdbcColumnHandle::getColumnName)
+                .collect(toImmutableMap(
+                        identity(),
+                        columnName -> "ST_AsBinary(" + quote(identifierQuote, columnName) + ")"));
+
+        return new QueryBuilder(identifierQuote).buildSql(
+                this,
+                session,
+                connection,
+                split.getCatalogName(),
+                split.getSchemaName(),
+                split.getTableName(),
+                columnHandles,
+                columnExpressions,
+                split.getTupleDomain(),
+                split.getAdditionalPredicate());
+    }
+
+    @Override
+    public Optional<ReadMapping> toPrestoType(ConnectorSession session, JdbcTypeHandle typeHandle)
+    {
+        String typeName = typeHandle.getJdbcTypeName();
+
+        if (typeName.equalsIgnoreCase(GEOMETRY)) {
+            return Optional.of(geometryReadMapping());
+        }
+
+        return super.toPrestoType(session, typeHandle);
+    }
+
+    @Override
     public void createTable(ConnectorSession session, ConnectorTableMetadata tableMetadata)
     {
         try {
@@ -220,11 +273,11 @@ public class MySqlClient
                     quoted(newColumnName));
             execute(connection, sql);
         }
-        catch (SQLException e) {
+        catch (SQLSyntaxErrorException e) {
             // MySQL versions earlier than 8 do not support the above RENAME COLUMN syntax
-            if (SQL_STATE_SYNTAX_ERROR.equals(e.getSQLState())) {
-                throw new PrestoException(NOT_SUPPORTED, format("Rename column not supported in catalog: '%s'", handle.getCatalogName()), e);
-            }
+            throw new PrestoException(NOT_SUPPORTED, format("Rename column not supported in catalog: '%s'", handle.getCatalogName()), e);
+        }
+        catch (SQLException e) {
             throw new PrestoException(JDBC_ERROR, e);
         }
     }
@@ -235,5 +288,11 @@ public class MySqlClient
         // MySQL doesn't support specifying the catalog name in a rename; by setting the
         // catalogName parameter to null it will be omitted in the alter table statement.
         super.renameTable(identity, null, oldTable, newTable);
+    }
+
+    @Override
+    public String normalizeIdentifier(ConnectorSession session, String identifier)
+    {
+        return caseSensitiveNameMatchingEnabled ? identifier : identifier.toLowerCase(ENGLISH);
     }
 }

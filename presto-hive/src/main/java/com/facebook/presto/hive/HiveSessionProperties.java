@@ -13,16 +13,15 @@
  */
 package com.facebook.presto.hive;
 
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.cache.CacheConfig;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.session.PropertyMetadata;
 import com.google.common.collect.ImmutableList;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
+import jakarta.inject.Inject;
 import org.apache.parquet.column.ParquetProperties;
-
-import javax.inject.Inject;
 
 import java.util.List;
 import java.util.Optional;
@@ -70,6 +69,7 @@ public final class HiveSessionProperties
     private static final String PARQUET_WRITER_VERSION = "parquet_writer_version";
     private static final String MAX_SPLIT_SIZE = "max_split_size";
     private static final String MAX_INITIAL_SPLIT_SIZE = "max_initial_split_size";
+    private static final String SYMLINK_OPTIMIZED_READER_ENABLED = "symlink_optimized_reader_enabled";
     public static final String RCFILE_OPTIMIZED_WRITER_ENABLED = "rcfile_optimized_writer_enabled";
     private static final String RCFILE_OPTIMIZED_WRITER_VALIDATE = "rcfile_optimized_writer_validate";
     private static final String SORTED_WRITING_ENABLED = "sorted_writing_enabled";
@@ -125,15 +125,19 @@ public final class HiveSessionProperties
     public static final String MAX_INITIAL_SPLITS = "max_initial_splits";
     public static final String FILE_SPLITTABLE = "file_splittable";
     private static final String HUDI_METADATA_ENABLED = "hudi_metadata_enabled";
+    private static final String HUDI_TABLES_USE_MERGED_VIEW = "hudi_tables_use_merged_view";
     private static final String READ_TABLE_CONSTRAINTS = "read_table_constraints";
     public static final String PARALLEL_PARSING_OF_PARTITION_VALUES_ENABLED = "parallel_parsing_of_partition_values_enabled";
     public static final String QUICK_STATS_ENABLED = "quick_stats_enabled";
     public static final String QUICK_STATS_INLINE_BUILD_TIMEOUT = "quick_stats_inline_build_timeout";
     public static final String QUICK_STATS_BACKGROUND_BUILD_TIMEOUT = "quick_stats_background_build_timeout";
     public static final String DYNAMIC_SPLIT_SIZES_ENABLED = "dynamic_split_sizes_enabled";
-    public static final String AFFINITY_SCHEDULING_FILE_SECTION_SIZE = "affinity_scheduling_file_section_size";
     public static final String SKIP_EMPTY_FILES = "skip_empty_files";
     public static final String LEGACY_TIMESTAMP_BUCKETING = "legacy_timestamp_bucketing";
+    public static final String OPTIMIZE_PARSING_OF_PARTITION_VALUES = "optimize_parsing_of_partition_values";
+    public static final String OPTIMIZE_PARSING_OF_PARTITION_VALUES_THRESHOLD = "optimize_parsing_of_partition_values_threshold";
+
+    public static final String NATIVE_STATS_BASED_FILTER_REORDER_DISABLED = "native_stats_based_filter_reorder_disabled";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -608,6 +612,11 @@ public final class HiveSessionProperties
                         "For Hudi tables prefer to fetch the list of file names, sizes and other metadata from the internal metadata table rather than storage",
                         hiveClientConfig.isHudiMetadataEnabled(),
                         false),
+                stringProperty(
+                        HUDI_TABLES_USE_MERGED_VIEW,
+                        "For Hudi tables, a comma-separated list in the form of <schema>.<table> which should use merged view to read data",
+                        hiveClientConfig.getHudiTablesUseMergedView(),
+                        false),
                 booleanProperty(
                         PARALLEL_PARSING_OF_PARTITION_VALUES_ENABLED,
                         "Enables parallel parsing of partition values from partition names using thread pool",
@@ -617,6 +626,11 @@ public final class HiveSessionProperties
                         QUICK_STATS_ENABLED,
                         "Use quick stats to resolve stats",
                         hiveClientConfig.isQuickStatsEnabled(),
+                        false),
+                booleanProperty(
+                        SYMLINK_OPTIMIZED_READER_ENABLED,
+                        "Experimental: Enable optimized SymlinkTextInputFormat reader",
+                        hiveClientConfig.isSymlinkOptimizedReaderEnabled(),
                         false),
                 new PropertyMetadata<>(
                         QUICK_STATS_INLINE_BUILD_TIMEOUT,
@@ -639,11 +653,6 @@ public final class HiveSessionProperties
                         false,
                         value -> Duration.valueOf((String) value),
                         Duration::toString),
-                dataSizeSessionProperty(
-                        AFFINITY_SCHEDULING_FILE_SECTION_SIZE,
-                        "Size of file section for affinity scheduling",
-                        hiveClientConfig.getAffinitySchedulingFileSectionSize(),
-                        false),
                 booleanProperty(
                         SKIP_EMPTY_FILES,
                         "If it is required empty files will be skipped",
@@ -653,7 +662,21 @@ public final class HiveSessionProperties
                         LEGACY_TIMESTAMP_BUCKETING,
                         "Use legacy timestamp bucketing algorithm (which is not Hive compatible) for table bucketed by timestamp type.",
                         hiveClientConfig.isLegacyTimestampBucketing(),
-                        false));
+                        false),
+                booleanProperty(
+                        OPTIMIZE_PARSING_OF_PARTITION_VALUES,
+                        "Optimize partition values parsing when number of candidates are large",
+                        hiveClientConfig.isOptimizeParsingOfPartitionValues(),
+                        false),
+                integerProperty(OPTIMIZE_PARSING_OF_PARTITION_VALUES_THRESHOLD,
+                        "When OPTIMIZE_PARSING_OF_PARTITION_VALUES is set to true, enable this optimizations when number of partitions exceed the threshold here",
+                        hiveClientConfig.getOptimizeParsingOfPartitionValuesThreshold(),
+                        false),
+                booleanProperty(
+                        NATIVE_STATS_BASED_FILTER_REORDER_DISABLED,
+                        "Native Execution only. Disable stats based filter reordering.",
+                        false,
+                        true));
     }
 
     public List<PropertyMetadata<?>> getSessionProperties()
@@ -1101,6 +1124,12 @@ public final class HiveSessionProperties
         return session.getProperty(HUDI_METADATA_ENABLED, Boolean.class);
     }
 
+    public static String getHudiTablesUseMergedView(ConnectorSession session)
+    {
+        String hudiTablesUseMergedView = session.getProperty(HUDI_TABLES_USE_MERGED_VIEW, String.class);
+        return hudiTablesUseMergedView == null ? "" : hudiTablesUseMergedView;
+    }
+
     public static boolean isReadTableConstraints(ConnectorSession session)
     {
         return session.getProperty(READ_TABLE_CONSTRAINTS, Boolean.class);
@@ -1126,11 +1155,6 @@ public final class HiveSessionProperties
         return session.getProperty(QUICK_STATS_BACKGROUND_BUILD_TIMEOUT, Duration.class);
     }
 
-    public static DataSize getAffinitySchedulingFileSectionSize(ConnectorSession session)
-    {
-        return session.getProperty(AFFINITY_SCHEDULING_FILE_SECTION_SIZE, DataSize.class);
-    }
-
     public static boolean isSkipEmptyFilesEnabled(ConnectorSession session)
     {
         return session.getProperty(SKIP_EMPTY_FILES, Boolean.class);
@@ -1139,5 +1163,20 @@ public final class HiveSessionProperties
     public static boolean isLegacyTimestampBucketing(ConnectorSession session)
     {
         return session.getProperty(LEGACY_TIMESTAMP_BUCKETING, Boolean.class);
+    }
+
+    public static boolean isOptimizeParsingOfPartitionValues(ConnectorSession session)
+    {
+        return session.getProperty(OPTIMIZE_PARSING_OF_PARTITION_VALUES, Boolean.class);
+    }
+
+    public static int getOptimizeParsingOfPartitionValuesThreshold(ConnectorSession session)
+    {
+        return session.getProperty(OPTIMIZE_PARSING_OF_PARTITION_VALUES_THRESHOLD, Integer.class);
+    }
+
+    public static boolean isSymlinkOptimizedReaderEnabled(ConnectorSession session)
+    {
+        return session.getProperty(SYMLINK_OPTIMIZED_READER_ENABLED, Boolean.class);
     }
 }

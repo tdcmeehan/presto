@@ -14,18 +14,24 @@
 package com.facebook.presto.sql.analyzer;
 
 import com.facebook.presto.common.QualifiedObjectName;
+import com.facebook.presto.common.SourceColumn;
 import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.transaction.TransactionId;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
+import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.analyzer.AccessControlInfo;
 import com.facebook.presto.spi.analyzer.AccessControlInfoForTable;
 import com.facebook.presto.spi.analyzer.AccessControlReferences;
 import com.facebook.presto.spi.analyzer.AccessControlRole;
+import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
+import com.facebook.presto.spi.eventlistener.OutputColumnMetadata;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.function.FunctionKind;
+import com.facebook.presto.spi.function.table.Argument;
+import com.facebook.presto.spi.function.table.ConnectorTableFunctionHandle;
 import com.facebook.presto.spi.security.AccessControl;
 import com.facebook.presto.spi.security.AccessControlContext;
 import com.facebook.presto.spi.security.AllowAllAccessControl;
@@ -51,17 +57,20 @@ import com.facebook.presto.sql.tree.SampledRelation;
 import com.facebook.presto.sql.tree.Statement;
 import com.facebook.presto.sql.tree.SubqueryExpression;
 import com.facebook.presto.sql.tree.Table;
+import com.facebook.presto.sql.tree.TableFunctionInvocation;
 import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Multimap;
-
-import javax.annotation.Nullable;
-import javax.annotation.concurrent.Immutable;
+import com.google.common.collect.Multiset;
+import com.google.errorprone.annotations.Immutable;
+import jakarta.annotation.Nullable;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
@@ -70,6 +79,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -157,6 +167,12 @@ public class Analysis
 
     private final Map<NodeRef<QuerySpecification>, List<GroupingOperation>> groupingOperations = new LinkedHashMap<>();
 
+    private final Multiset<RowFilterScopeEntry> rowFilterScopes = HashMultiset.create();
+    private final Map<NodeRef<Table>, List<Expression>> rowFilters = new LinkedHashMap<>();
+
+    private final Multiset<ColumnMaskScopeEntry> columnMaskScopes = HashMultiset.create();
+    private final Map<NodeRef<Table>, Map<String, Expression>> columnMasks = new LinkedHashMap<>();
+
     // for create table
     private Optional<QualifiedObjectName> createTableDestination = Optional.empty();
     private Map<String, Expression> createTableProperties = ImmutableMap.of();
@@ -189,6 +205,16 @@ public class Analysis
 
     // Keeps track of the subquery we are visiting, so we have access to base query information when processing materialized view status
     private Optional<QuerySpecification> currentQuerySpecification = Optional.empty();
+
+    // Maps each output Field to its originating SourceColumn(s) for column-level lineage tracking.
+    private final Multimap<Field, SourceColumn> originColumnDetails = ArrayListMultimap.create();
+
+    // Maps each analyzed Expression to the Field(s) it produces, supporting expression-level lineage.
+    private final Multimap<NodeRef<Expression>, Field> fieldLineage = ArrayListMultimap.create();
+
+    private Optional<List<OutputColumnMetadata>> updatedSourceColumns = Optional.empty();
+
+    private final Map<NodeRef<TableFunctionInvocation>, TableFunctionInvocationAnalysis> tableFunctionAnalyses = new LinkedHashMap<>();
 
     public Analysis(@Nullable Statement root, Map<NodeRef<Parameter>, Expression> parameters, boolean isDescribe)
     {
@@ -833,6 +859,11 @@ public class Analysis
         return accessControlReferences;
     }
 
+    public void addQueryAccessControlInfo(AccessControlInfo accessControlInfo)
+    {
+        accessControlReferences.setQueryAccessControlInfo(accessControlInfo);
+    }
+
     public void addAccessControlCheckForTable(AccessControlRole accessControlRole, AccessControlInfoForTable accessControlInfoForTable)
     {
         accessControlReferences.addTableReference(accessControlRole, accessControlInfoForTable);
@@ -992,6 +1023,101 @@ public class Analysis
             functionMap.get(functionHandle.getKind()).add(functionHandle.getName());
         }
         return functionMap.entrySet().stream().collect(toImmutableMap(Map.Entry::getKey, entry -> ImmutableSet.copyOf(entry.getValue())));
+    }
+
+    public boolean hasRowFilter(QualifiedObjectName table, String identity)
+    {
+        return rowFilterScopes.contains(new RowFilterScopeEntry(table, identity));
+    }
+
+    public void registerTableForRowFiltering(QualifiedObjectName table, String identity)
+    {
+        rowFilterScopes.add(new RowFilterScopeEntry(table, identity));
+    }
+
+    public void unregisterTableForRowFiltering(QualifiedObjectName table, String identity)
+    {
+        rowFilterScopes.remove(new RowFilterScopeEntry(table, identity));
+    }
+
+    public void addRowFilter(Table table, Expression filter)
+    {
+        rowFilters.computeIfAbsent(NodeRef.of(table), node -> new ArrayList<>())
+                .add(filter);
+    }
+
+    public List<Expression> getRowFilters(Table node)
+    {
+        return rowFilters.getOrDefault(NodeRef.of(node), ImmutableList.of());
+    }
+
+    public boolean hasColumnMask(QualifiedObjectName table, String column, String identity)
+    {
+        return columnMaskScopes.contains(new ColumnMaskScopeEntry(table, column, identity));
+    }
+
+    public void addSourceColumns(Field field, Set<SourceColumn> sourceColumn)
+    {
+        originColumnDetails.putAll(field, sourceColumn);
+    }
+
+    public Set<SourceColumn> getSourceColumns(Field field)
+    {
+        return ImmutableSet.copyOf(originColumnDetails.get(field));
+    }
+
+    public void addExpressionFields(Expression expression, Collection<Field> fields)
+    {
+        fieldLineage.putAll(NodeRef.of(expression), fields);
+    }
+
+    public Set<SourceColumn> getExpressionSourceColumns(Expression expression)
+    {
+        return fieldLineage.get(NodeRef.of(expression)).stream()
+                .flatMap(field -> getSourceColumns(field).stream())
+                .collect(toImmutableSet());
+    }
+
+    public void setUpdatedSourceColumns(Optional<List<OutputColumnMetadata>> targetColumns)
+    {
+        this.updatedSourceColumns = targetColumns;
+    }
+
+    public Optional<List<OutputColumnMetadata>> getUpdatedSourceColumns()
+    {
+        return updatedSourceColumns;
+    }
+
+    public void registerTableForColumnMasking(QualifiedObjectName table, String column, String identity)
+    {
+        columnMaskScopes.add(new ColumnMaskScopeEntry(table, column, identity));
+    }
+
+    public void unregisterTableForColumnMasking(QualifiedObjectName table, String column, String identity)
+    {
+        columnMaskScopes.remove(new ColumnMaskScopeEntry(table, column, identity));
+    }
+
+    public void addColumnMask(Table table, String column, Expression mask)
+    {
+        Map<String, Expression> masks = columnMasks.computeIfAbsent(NodeRef.of(table), node -> new LinkedHashMap<>());
+        checkArgument(!masks.containsKey(column), "Mask already exists for column %s", column);
+        masks.put(column, mask);
+    }
+
+    public Map<String, Expression> getColumnMasks(Table table)
+    {
+        return columnMasks.getOrDefault(NodeRef.of(table), ImmutableMap.of());
+    }
+
+    public void setTableFunctionAnalysis(TableFunctionInvocation node, TableFunctionInvocationAnalysis analysis)
+    {
+        tableFunctionAnalyses.put(NodeRef.of(node), analysis);
+    }
+
+    public TableFunctionInvocationAnalysis getTableFunctionAnalysis(TableFunctionInvocation node)
+    {
+        return tableFunctionAnalyses.get(NodeRef.of(node));
     }
 
     @Immutable
@@ -1175,6 +1301,126 @@ public class Analysis
         public boolean isFromView()
         {
             return isFromView;
+        }
+    }
+
+    private static class RowFilterScopeEntry
+    {
+        private final QualifiedObjectName table;
+        private final String identity;
+
+        public RowFilterScopeEntry(QualifiedObjectName table, String identity)
+        {
+            this.table = requireNonNull(table, "table is null");
+            this.identity = requireNonNull(identity, "identity is null");
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            RowFilterScopeEntry that = (RowFilterScopeEntry) o;
+            return table.equals(that.table) &&
+                    identity.equals(that.identity);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(table, identity);
+        }
+    }
+
+    private static class ColumnMaskScopeEntry
+    {
+        private final QualifiedObjectName table;
+        private final String column;
+        private final String identity;
+
+        public ColumnMaskScopeEntry(QualifiedObjectName table, String column, String identity)
+        {
+            this.table = requireNonNull(table, "table is null");
+            this.column = requireNonNull(column, "column is null");
+            this.identity = requireNonNull(identity, "identity is null");
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            ColumnMaskScopeEntry that = (ColumnMaskScopeEntry) o;
+            return table.equals(that.table) &&
+                    column.equals(that.column) &&
+                    identity.equals(that.identity);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(table, column, identity);
+        }
+    }
+
+    /**
+     * Encapsulates the result of analyzing a table function invocation.
+     * Includes the connector ID, function name, argument bindings, and the
+     * connector-specific table function handle needed for planning and execution.
+     */
+    public static class TableFunctionInvocationAnalysis
+    {
+        private final ConnectorId connectorId;
+        private final String functionName;
+        private final Map<String, Argument> arguments;
+        private final ConnectorTableFunctionHandle connectorTableFunctionHandle;
+        private final ConnectorTransactionHandle transactionHandle;
+
+        public TableFunctionInvocationAnalysis(
+                ConnectorId connectorId,
+                String functionName,
+                Map<String, Argument> arguments,
+                ConnectorTableFunctionHandle connectorTableFunctionHandle,
+                ConnectorTransactionHandle transactionHandle)
+        {
+            this.connectorId = requireNonNull(connectorId, "connectorId is null");
+            this.functionName = requireNonNull(functionName, "functionName is null");
+            this.arguments = ImmutableMap.copyOf(arguments);
+            this.connectorTableFunctionHandle = requireNonNull(connectorTableFunctionHandle, "connectorTableFunctionHandle is null");
+            this.transactionHandle = requireNonNull(transactionHandle, "transactionHandle is null");
+        }
+
+        public ConnectorId getConnectorId()
+        {
+            return connectorId;
+        }
+
+        public String getFunctionName()
+        {
+            return functionName;
+        }
+
+        public Map<String, Argument> getArguments()
+        {
+            return arguments;
+        }
+
+        public ConnectorTableFunctionHandle getConnectorTableFunctionHandle()
+        {
+            return connectorTableFunctionHandle;
+        }
+
+        public ConnectorTransactionHandle getTransactionHandle()
+        {
+            return transactionHandle;
         }
     }
 }

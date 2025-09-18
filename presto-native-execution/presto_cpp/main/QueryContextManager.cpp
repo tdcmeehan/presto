@@ -14,12 +14,11 @@
 
 #include "presto_cpp/main/QueryContextManager.h"
 #include <folly/executors/IOThreadPoolExecutor.h>
+#include "presto_cpp/main/PrestoToVeloxQueryConfig.h"
+#include "presto_cpp/main/SessionProperties.h"
 #include "presto_cpp/main/common/Configs.h"
-#include "presto_cpp/main/common/Counters.h"
-#include "velox/common/base/StatsReporter.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/core/QueryConfig.h"
-#include "velox/type/tz/TimeZoneMap.h"
 
 using namespace facebook::velox;
 
@@ -29,132 +28,67 @@ using facebook::presto::protocol::TaskId;
 namespace facebook::presto {
 namespace {
 
-// Update passed in query session configs with system configs. For any pairing
-// system/session configs if session config is present, it overrides system
-// config, otherwise system config is fed in queryConfigs. E.g.
-// "query.max-memory-per-node" system config and "query_max_memory_per_node"
-// session config is a pairing config. If system config is 7GB but session
-// config is not provided, then 7GB will be added to 'queryConfigs'. On the
-// other hand if system config is 7GB but session config is 4GB then 4GB will
-// be preserved in 'queryConfigs'.
-void updateFromSystemConfigs(
-    std::unordered_map<std::string, std::string>& queryConfigs) {
-  const auto& systemConfig = SystemConfig::instance();
-  static const std::unordered_map<std::string, std::string>
-      sessionSystemConfigMapping{
-          {core::QueryConfig::kQueryMaxMemoryPerNode,
-           std::string(SystemConfig::kQueryMaxMemoryPerNode)},
-          {core::QueryConfig::kSpillFileCreateConfig,
-           std::string(SystemConfig::kSpillerFileCreateConfig)}};
-
-  for (const auto& configNameEntry : sessionSystemConfigMapping) {
-    const auto& sessionName = configNameEntry.first;
-    const auto& systemConfigName = configNameEntry.second;
-    if (queryConfigs.count(sessionName) == 0) {
-      const auto propertyOpt = systemConfig->optionalProperty(systemConfigName);
-      if (propertyOpt.hasValue()) {
-        queryConfigs[sessionName] = propertyOpt.value();
-      }
-    }
-  }
+inline QueryId queryIdFromTaskId(const TaskId& taskId) {
+  return taskId.substr(0, taskId.find('.'));
 }
 
-std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
-toConnectorConfigs(const protocol::SessionRepresentation& session) {
-  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
-      connectorConfigs;
-  for (const auto& entry : session.catalogProperties) {
-    connectorConfigs.insert(
-        {entry.first,
-         std::unordered_map<std::string, std::string>(
-             entry.second.begin(), entry.second.end())});
-  }
-
-  return connectorConfigs;
-}
-
-void updateVeloxConfigs(
-    std::unordered_map<std::string, std::string>& configStrings) {
-  // If `legacy_timestamp` is true, the coordinator expects timestamp
-  // conversions without a timezone to be converted to the user's
-  // session_timezone.
-  auto it = configStrings.find("legacy_timestamp");
-  // `legacy_timestamp` default value is true in the coordinator.
-  if ((it == configStrings.end()) || (folly::to<bool>(it->second))) {
-    configStrings.emplace(
-        core::QueryConfig::kAdjustTimestampToTimezone, "true");
-  }
-  // TODO: remove this once cpu driver slicing config is turned on by default in
-  // Velox.
-  it = configStrings.find(core::QueryConfig::kDriverCpuTimeSliceLimitMs);
-  if (it == configStrings.end()) {
-    // Set it to 1 second to be aligned with Presto Java.
-    configStrings.emplace(
-        core::QueryConfig::kDriverCpuTimeSliceLimitMs, "1000");
-  }
-}
-
-void updateVeloxConnectorConfigs(
-    std::unordered_map<
-        std::string,
-        std::unordered_map<std::string, std::string>>& connectorConfigStrings) {
-  const auto& systemConfig = SystemConfig::instance();
-
-  for (auto& entry : connectorConfigStrings) {
-    auto& connectorConfig = entry.second;
-
-    // Do not retain cache if `node_selection_strategy` is explicitly set to
-    // `NO_PREFERENCE`.
-    auto it = connectorConfig.find("node_selection_strategy");
-    if (it != connectorConfig.end() && it->second == "NO_PREFERENCE") {
-      connectorConfig.emplace(
-          connector::hive::HiveConfig::kCacheNoRetentionSession, "true");
-    }
-  }
-}
 } // namespace
 
 QueryContextManager::QueryContextManager(
     folly::Executor* driverExecutor,
     folly::Executor* spillerExecutor)
-    : driverExecutor_(driverExecutor),
-      spillerExecutor_(spillerExecutor),
-      sessionProperties_(SessionProperties()) {}
+    : driverExecutor_(driverExecutor), spillerExecutor_(spillerExecutor) {}
 
 std::shared_ptr<velox::core::QueryCtx>
 QueryContextManager::findOrCreateQueryCtx(
     const protocol::TaskId& taskId,
-    const protocol::SessionRepresentation& session) {
+    const protocol::TaskUpdateRequest& taskUpdateRequest) {
   return findOrCreateQueryCtx(
-      taskId, toVeloxConfigs(session), toConnectorConfigs(session));
+      taskId,
+      toVeloxConfigs(taskUpdateRequest.session),
+      toConnectorConfigs(taskUpdateRequest));
+}
+
+bool QueryContextManager::queryHasStartedTasks(
+    const protocol::TaskId& taskId) const {
+  return queryContextCache_.rlock()->hasStartedTasks(queryIdFromTaskId(taskId));
+}
+
+void QueryContextManager::setQueryHasStartedTasks(
+    const protocol::TaskId& taskId) {
+  queryContextCache_.wlock()->setHasStartedTasks(queryIdFromTaskId(taskId));
+}
+
+std::shared_ptr<core::QueryCtx> QueryContextManager::createAndCacheQueryCtx(
+    QueryContextCache& cache,
+    const QueryId& queryId,
+    velox::core::QueryConfig&& queryConfig,
+    std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>&&
+        connectorConfigs,
+    std::shared_ptr<memory::MemoryPool>&& pool) {
+  auto queryCtx = core::QueryCtx::create(
+      driverExecutor_,
+      std::move(queryConfig),
+      std::move(connectorConfigs),
+      cache::AsyncDataCache::getInstance(),
+      std::move(pool),
+      spillerExecutor_,
+      queryId);
+  return cache.insert(queryId, std::move(queryCtx));
 }
 
 std::shared_ptr<core::QueryCtx> QueryContextManager::findOrCreateQueryCtx(
     const TaskId& taskId,
-    std::unordered_map<std::string, std::string>&& configStrings,
-    std::unordered_map<
-        std::string,
-        std::unordered_map<std::string, std::string>>&&
-        connectorConfigStrings) {
-  QueryId queryId = taskId.substr(0, taskId.find('.'));
+    velox::core::QueryConfig&& queryConfig,
+    std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>&&
+        connectorConfigs) {
+  const QueryId queryId{queryIdFromTaskId(taskId)};
 
   auto lockedCache = queryContextCache_.wlock();
   if (auto queryCtx = lockedCache->get(queryId)) {
     return queryCtx;
   }
 
-  updateVeloxConfigs(configStrings);
-  updateVeloxConnectorConfigs(connectorConfigStrings);
-
-  std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>
-      connectorConfigs;
-  for (auto& entry : connectorConfigStrings) {
-    connectorConfigs.insert(
-        {entry.first,
-         std::make_shared<config::ConfigBase>(std::move(entry.second))});
-  }
-
-  velox::core::QueryConfig queryConfig{std::move(configStrings)};
   // NOTE: the monotonically increasing 'poolId' is appended to 'queryId' to
   // ensure that the name of root memory pool instance is always unique. In some
   // edge case, we found some background activities such as the long-running
@@ -162,28 +96,35 @@ std::shared_ptr<core::QueryCtx> QueryContextManager::findOrCreateQueryCtx(
   // though the query ctx has been evicted out of the cache. The query ctx cache
   // is still indexed by the query id.
   static std::atomic_uint64_t poolId{0};
+  std::optional<memory::MemoryPool::DebugOptions> poolDbgOpts;
+  auto debugMemoryPoolNameRegex = queryConfig.debugMemoryPoolNameRegex();
+  if (!debugMemoryPoolNameRegex.empty()) {
+    poolDbgOpts = memory::MemoryPool::DebugOptions{
+        .debugPoolNameRegex = std::move(debugMemoryPoolNameRegex),
+        .debugPoolWarnThresholdBytes =
+            queryConfig.debugMemoryPoolWarnThresholdBytes()};
+  }
   auto pool = memory::MemoryManager::getInstance()->addRootPool(
       fmt::format("{}_{}", queryId, poolId++),
-      queryConfig.queryMaxMemoryPerNode());
+      queryConfig.queryMaxMemoryPerNode(),
+      nullptr,
+      poolDbgOpts);
 
-  auto queryCtx = core::QueryCtx::create(
-      driverExecutor_,
+  return createAndCacheQueryCtx(
+      *lockedCache,
+      queryId,
       std::move(queryConfig),
-      connectorConfigs,
-      cache::AsyncDataCache::getInstance(),
-      std::move(pool),
-      spillerExecutor_,
-      queryId);
-
-  return lockedCache->insert(queryId, queryCtx);
+      std::move(connectorConfigs),
+      std::move(pool));
 }
 
 void QueryContextManager::visitAllContexts(
-    std::function<void(const protocol::QueryId&, const velox::core::QueryCtx*)>
-        visitor) const {
+    const std::function<
+        void(const protocol::QueryId&, const velox::core::QueryCtx*)>& visitor)
+    const {
   auto lockedCache = queryContextCache_.rlock();
   for (const auto& it : lockedCache->ctxs()) {
-    if (const auto queryCtxSP = it.second.first.lock()) {
+    if (const auto queryCtxSP = it.second.queryCtx.lock()) {
       visitor(it.first, queryCtxSP.get());
     }
   }
@@ -196,28 +137,6 @@ void QueryContextManager::testingClearCache() {
 void QueryContextCache::testingClear() {
   queryCtxs_.clear();
   queryIds_.clear();
-}
-
-std::unordered_map<std::string, std::string>
-QueryContextManager::toVeloxConfigs(
-    const protocol::SessionRepresentation& session) {
-  // Use base velox query config as the starting point and add Presto session
-  // properties on top of it.
-  auto configs = BaseVeloxQueryConfig::instance()->values();
-  for (const auto& it : session.systemProperties) {
-    configs[sessionProperties_.toVeloxConfig(it.first)] = it.second;
-    sessionProperties_.updateVeloxConfig(it.first, it.second);
-  }
-
-  // If there's a timeZoneKey, convert to timezone name and add to the
-  // configs. Throws if timeZoneKey can't be resolved.
-  if (session.timeZoneKey != 0) {
-    configs.emplace(
-        velox::core::QueryConfig::kSessionTimezone,
-        velox::tz::getTimeZoneName(session.timeZoneKey));
-  }
-  updateFromSystemConfigs(configs);
-  return configs;
 }
 
 } // namespace facebook::presto

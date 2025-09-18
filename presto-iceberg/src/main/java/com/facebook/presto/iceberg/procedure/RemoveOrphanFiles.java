@@ -27,6 +27,7 @@ import com.facebook.presto.spi.procedure.Procedure;
 import com.facebook.presto.spi.procedure.Procedure.Argument;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import jakarta.inject.Inject;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
@@ -39,7 +40,6 @@ import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 
-import javax.inject.Inject;
 import javax.inject.Provider;
 
 import java.io.IOException;
@@ -82,7 +82,7 @@ public class RemoveOrphanFiles
 
     @Inject
     public RemoveOrphanFiles(IcebergMetadataFactory metadataFactory,
-                             HdfsEnvironment hdfsEnvironment)
+            HdfsEnvironment hdfsEnvironment)
     {
         this.metadataFactory = requireNonNull(metadataFactory, "metadataFactory is null");
         this.hdfsEnvironment = requireNonNull(hdfsEnvironment, "hdfsEnvironment is null");
@@ -225,7 +225,7 @@ public class RemoveOrphanFiles
             case DATA:
                 return ManifestFiles.read(manifest, table.io());
             case DELETES:
-                ManifestFiles.readDeleteManifest(manifest, table.io(), table.specs());
+                return ManifestFiles.readDeleteManifest(manifest, table.io(), table.specs());
             default:
                 throw new PrestoException(ICEBERG_UNKNOWN_MANIFEST_TYPE, "Unknown manifest file content: " + manifest.content());
         }

@@ -15,6 +15,9 @@ package com.facebook.presto.operator;
 
 import com.facebook.airlift.http.client.HttpClient;
 import com.facebook.airlift.http.client.testing.TestingHttpClient;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
+import com.facebook.presto.CompressionCodec;
 import com.facebook.presto.common.Page;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.execution.Location;
@@ -31,8 +34,6 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableList;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.BeforeMethod;
@@ -46,13 +47,13 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import static com.facebook.airlift.concurrent.Threads.daemonThreadsNamed;
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.SessionTestUtils.TEST_SESSION;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.operator.ExchangeOperator.REMOTE_CONNECTOR_ID;
 import static com.facebook.presto.operator.PageAssertions.assertPageEquals;
 import static com.facebook.presto.operator.TestingTaskBuffer.PAGE;
 import static com.facebook.presto.testing.TestingTaskContext.createTaskContext;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
@@ -63,7 +64,7 @@ import static org.testng.Assert.assertTrue;
 public class TestExchangeOperator
 {
     private static final List<Type> TYPES = ImmutableList.of(VARCHAR);
-    private static final PagesSerdeFactory SERDE_FACTORY = new TestingPagesSerdeFactory();
+    private static final PagesSerdeFactory SERDE_FACTORY = new TestingPagesSerdeFactory(CompressionCodec.LZ4);
 
     private static final String TASK_1_ID = "task1.0.0.0.0";
     private static final String TASK_2_ID = "task2.0.0.0.0";
@@ -93,8 +94,7 @@ public class TestExchangeOperator
                 new Duration(1, TimeUnit.MINUTES),
                 true,
                 0.2,
-                httpClient,
-                new TestingDriftClient<>(),
+                new HttpShuffleClientProvider(httpClient),
                 scheduler,
                 systemMemoryUsageListener,
                 pageBufferClientCallbackExecutor);
@@ -263,7 +263,7 @@ public class TestExchangeOperator
                 .addDriverContext();
 
         SourceOperator operator = operatorFactory.createOperator(driverContext);
-        assertEquals(operator.getOperatorContext().getOperatorStats().getSystemMemoryReservation().toBytes(), 0);
+        assertEquals(operator.getOperatorContext().getOperatorStats().getSystemMemoryReservationInBytes(), 0);
         return operator;
     }
 
@@ -318,7 +318,7 @@ public class TestExchangeOperator
             assertPageEquals(TYPES, page, PAGE);
         }
 
-        assertEquals(operator.getOperatorContext().getOperatorStats().getSystemMemoryReservation().toBytes(), 0);
+        assertEquals(operator.getOperatorContext().getOperatorStats().getSystemMemoryReservationInBytes(), 0);
 
         return outputPages;
     }
@@ -341,6 +341,6 @@ public class TestExchangeOperator
         assertEquals(operator.isFinished(), true);
         assertEquals(operator.needsInput(), false);
         assertNull(operator.getOutput());
-        assertEquals(operator.getOperatorContext().getOperatorStats().getSystemMemoryReservation().toBytes(), 0);
+        assertEquals(operator.getOperatorContext().getOperatorStats().getSystemMemoryReservationInBytes(), 0);
     }
 }

@@ -13,11 +13,11 @@
  */
 package com.facebook.presto.resourceGroups.db;
 
-import com.mysql.jdbc.jdbc2.optional.MysqlDataSource;
+import com.mysql.cj.jdbc.MysqlDataSource;
+import jakarta.inject.Inject;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.sqlobject.SqlObjectPlugin;
 
-import javax.inject.Inject;
 import javax.inject.Provider;
 
 import static java.util.Objects.requireNonNull;

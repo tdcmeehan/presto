@@ -66,12 +66,16 @@ statement
         ALTER (COLUMN)? column=identifier SET NOT NULL                 #alterColumnSetNotNull
     | ALTER TABLE (IF EXISTS)? tableName=qualifiedName
         ALTER (COLUMN)? column=identifier DROP NOT NULL                #alterColumnDropNotNull
+    | ALTER TABLE (IF EXISTS)? tableName=qualifiedName
+        SET PROPERTIES properties                                      #setTableProperties
     | ANALYZE qualifiedName (WITH properties)?                         #analyze
     | CREATE TYPE qualifiedName AS (
         '(' sqlParameterDeclaration (',' sqlParameterDeclaration)* ')'
         | type)                                                        #createType
     | CREATE (OR REPLACE)? VIEW qualifiedName
             (SECURITY (DEFINER | INVOKER))? AS query                   #createView
+    | ALTER VIEW (IF EXISTS)? from=qualifiedName
+        RENAME TO to=qualifiedName                                     #renameView
     | DROP VIEW (IF EXISTS)? qualifiedName                             #dropView
     | CREATE MATERIALIZED VIEW (IF NOT EXISTS)? qualifiedName
         (COMMENT string)?
@@ -114,6 +118,7 @@ statement
     | EXPLAIN ANALYZE? VERBOSE?
         ('(' explainOption (',' explainOption)* ')')? statement        #explain
     | SHOW CREATE TABLE qualifiedName                                  #showCreateTable
+    | SHOW CREATE SCHEMA qualifiedName                                 #showCreateSchema
     | SHOW CREATE VIEW qualifiedName                                   #showCreateView
     | SHOW CREATE MATERIALIZED VIEW qualifiedName                      #showCreateMaterializedView
     | SHOW CREATE FUNCTION qualifiedName types?                        #showCreateFunction
@@ -341,6 +346,7 @@ relationPrimary
     | UNNEST '(' expression (',' expression)* ')' (WITH ORDINALITY)?  #unnest
     | LATERAL '(' query ')'                                           #lateral
     | '(' relation ')'                                                #parenthesizedRelation
+    | TABLE '(' tableFunctionCall ')'                                 #tableFunctionInvocation
     ;
 
 expression
@@ -467,6 +473,40 @@ type
     | ROW '(' identifier type (',' identifier type)* ')'
     | baseType ('(' typeParameter (',' typeParameter)* ')')?
     | INTERVAL from=intervalField TO to=intervalField
+    ;
+
+tableFunctionCall
+    : qualifiedName '(' (tableFunctionArgument (',' tableFunctionArgument)*)?
+      (COPARTITION copartitionTables (',' copartitionTables)*)? ')'
+    ;
+
+tableFunctionArgument
+    : (identifier '=>')? (tableArgument | descriptorArgument | expression) // descriptor before expression to avoid parsing descriptor as a function call
+    ;
+
+tableArgument
+    : tableArgumentRelation
+        (PARTITION BY ('(' (expression (',' expression)*)? ')' | expression))?
+        (PRUNE WHEN EMPTY | KEEP WHEN EMPTY)?
+        (ORDER BY ('(' sortItem (',' sortItem)* ')' | sortItem))?
+    ;
+
+tableArgumentRelation
+    : TABLE '(' qualifiedName ')' (AS? identifier columnAliases?)?  #tableArgumentTable
+    | TABLE '(' query ')' (AS? identifier columnAliases?)?          #tableArgumentQuery
+    ;
+
+descriptorArgument
+    : DESCRIPTOR '(' descriptorField (',' descriptorField)* ')'
+    | CAST '(' NULL AS DESCRIPTOR ')'
+    ;
+
+descriptorField
+    : identifier type?
+    ;
+
+copartitionTables
+    : '(' qualifiedName ',' qualifiedName (',' qualifiedName)* ')'
     ;
 
 typeParameter
@@ -628,20 +668,20 @@ nonReserved
     // IMPORTANT: this rule must only contain tokens. Nested rules are not supported. See SqlParser.exitNonReserved
     : ADD | ADMIN | ALL | ANALYZE | ANY | ARRAY | ASC | AT
     | BEFORE | BERNOULLI
-    | CALL | CALLED | CASCADE | CATALOGS | COLUMN | COLUMNS | COMMENT | COMMIT | COMMITTED | CURRENT | CURRENT_ROLE
-    | DATA | DATE | DAY | DEFINER | DESC | DETERMINISTIC | DISABLED | DISTRIBUTED
-    | ENABLED | ENFORCED | EXCLUDING | EXPLAIN | EXTERNAL
+    | CALL | CALLED | CASCADE | CATALOGS | COLUMN | COLUMNS | COMMENT | COMMIT | COMMITTED | COPARTITION | CURRENT | CURRENT_ROLE
+    | DATA | DATE | DAY | DEFINER | DESC | DESCRIPTOR | DETERMINISTIC | DISABLED | DISTRIBUTED
+    | EMPTY | ENABLED | ENFORCED | EXCLUDING | EXPLAIN | EXTERNAL
     | FETCH | FILTER | FIRST | FOLLOWING | FORMAT | FUNCTION | FUNCTIONS
     | GRANT | GRANTED | GRANTS | GRAPHVIZ | GROUPS
     | HOUR
     | IF | IGNORE | INCLUDING | INPUT | INTERVAL | INVOKER | IO | ISOLATION
     | JSON
-    | KEY
+    | KEEP | KEY
     | LANGUAGE | LAST | LATERAL | LEVEL | LIMIT | LOGICAL
     | MAP | MATERIALIZED | MINUTE | MONTH
     | NAME | NFC | NFD | NFKC | NFKD | NO | NONE | NULLIF | NULLS
     | OF | OFFSET | ONLY | OPTION | ORDINALITY | OUTPUT | OVER
-    | PARTITION | PARTITIONS | POSITION | PRECEDING | PRIMARY | PRIVILEGES | PROPERTIES
+    | PARTITION | PARTITIONS | POSITION | PRECEDING | PRIMARY | PRIVILEGES | PROPERTIES | PRUNE
     | RANGE | READ | REFRESH | RELY | RENAME | REPEATABLE | REPLACE | RESET | RESPECT | RESTRICT | RETURN | RETURNS | REVOKE | ROLE | ROLES | ROLLBACK | ROW | ROWS
     | SCHEMA | SCHEMAS | SECOND | SECURITY | SERIALIZABLE | SESSION | SET | SETS | SQL
     | SHOW | SOME | START | STATS | SUBSTRING | SYSTEM | SYSTEM_TIME | SYSTEM_VERSION
@@ -681,6 +721,7 @@ COMMIT: 'COMMIT';
 COMMITTED: 'COMMITTED';
 CONSTRAINT: 'CONSTRAINT';
 CREATE: 'CREATE';
+COPARTITION: 'COPARTITION';
 CROSS: 'CROSS';
 CUBE: 'CUBE';
 CURRENT: 'CURRENT';
@@ -697,12 +738,14 @@ DEFINER: 'DEFINER';
 DELETE: 'DELETE';
 DESC: 'DESC';
 DESCRIBE: 'DESCRIBE';
+DESCRIPTOR: 'DESCRIPTOR';
 DETERMINISTIC: 'DETERMINISTIC';
 DISABLED: 'DISABLED';
 DISTINCT: 'DISTINCT';
 DISTRIBUTED: 'DISTRIBUTED';
 DROP: 'DROP';
 ELSE: 'ELSE';
+EMPTY: 'EMPTY';
 ENABLED: 'ENABLED';
 END: 'END';
 ENFORCED: 'ENFORCED';
@@ -750,6 +793,7 @@ IS: 'IS';
 ISOLATION: 'ISOLATION';
 JSON: 'JSON';
 JOIN: 'JOIN';
+KEEP: 'KEEP';
 KEY: 'KEY';
 LANGUAGE: 'LANGUAGE';
 LAST: 'LAST';
@@ -797,6 +841,7 @@ PREPARE: 'PREPARE';
 PRIMARY: 'PRIMARY';
 PRIVILEGES: 'PRIVILEGES';
 PROPERTIES: 'PROPERTIES';
+PRUNE: 'PRUNE';
 RANGE: 'RANGE';
 READ: 'READ';
 RECURSIVE: 'RECURSIVE';

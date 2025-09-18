@@ -58,6 +58,11 @@ Functions
     T-digest and array of values between 0 and 1 which represent the quantiles
     to return.
 
+.. function:: quantiles_at_values(tdigest<double>, values) -> array<double>
+
+    Returns an array of approximate quantile numbers between 0 and 1 from the T-digest
+    and array of ``values``.
+
 .. function:: trimmed_mean(tdigest<double>, lower_quantile, upper_quantile) -> double
 
     Returns an estimate of the mean, excluding portions of the distribution
@@ -97,6 +102,7 @@ Functions
 
     This function is particularly useful for adding externally-created tdigests to Presto.
 
- .. function:: merge_tdigest(array<tdigest<double>>) -> tdigest<double>
-     Returns a merged ``tdigest`` of the T-digests in an array. This is the
-     scalar complement to the aggregation function ``merge``.
+.. function:: merge_tdigest(array<tdigest<double>>) -> tdigest<double>
+
+    Returns a merged ``tdigest`` of the T-digests in an array. This is the
+    scalar complement to the aggregation function ``merge``.

@@ -43,8 +43,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMultimap;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -232,7 +231,7 @@ public class DeltaMetadata
     }
 
     @Override
-    public List<ConnectorTableLayoutResult> getTableLayouts(
+    public ConnectorTableLayoutResult getTableLayoutForConstraint(
             ConnectorSession session,
             ConnectorTableHandle table,
             Constraint<ColumnHandle> constraint,
@@ -260,7 +259,7 @@ public class DeltaMetadata
                 ImmutableList.of(),
                 Optional.empty());
 
-        return ImmutableList.of(new ConnectorTableLayoutResult(newLayout, unenforcedPredicate));
+        return new ConnectorTableLayoutResult(newLayout, unenforcedPredicate);
     }
 
     @Override
@@ -280,7 +279,8 @@ public class DeltaMetadata
     @Override
     public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
     {
-        List<String> schemaNames = schemaName.<List<String>>map(ImmutableList::of).orElse(listSchemaNames(session));
+        List<String> schemaNames = schemaName.<List<String>>map(ImmutableList::of)
+                .orElseGet(() -> listSchemaNames(session));
         ImmutableList.Builder<SchemaTableName> tableNames = ImmutableList.builder();
         for (String schema : schemaNames) {
             for (String tableName : metastore.getAllTables(metastoreContext(session), schema).orElse(emptyList())) {
@@ -332,7 +332,7 @@ public class DeltaMetadata
         }
 
         List<ColumnMetadata> columnMetadata = tableHandle.getDeltaTable().getColumns().stream()
-                .map(this::getColumnMetadata)
+                .map(column -> getColumnMetadata(session, column))
                 .collect(Collectors.toList());
 
         return new ConnectorTableMetadata(tableName, columnMetadata);
@@ -347,7 +347,10 @@ public class DeltaMetadata
     private ColumnMetadata getColumnMetadata(ColumnHandle columnHandle)
     {
         DeltaColumnHandle deltaColumnHandle = (DeltaColumnHandle) columnHandle;
-        return new ColumnMetadata(deltaColumnHandle.getName(), typeManager.getType(deltaColumnHandle.getDataType()));
+        return ColumnMetadata.builder()
+                .setName(deltaColumnHandle.getName())
+                .setType(typeManager.getType(deltaColumnHandle.getDataType()))
+                .build();
     }
 
     private List<SchemaTableName> listTables(ConnectorSession session, SchemaTablePrefix prefix)
@@ -358,9 +361,12 @@ public class DeltaMetadata
         return ImmutableList.of(new SchemaTableName(prefix.getSchemaName(), prefix.getTableName()));
     }
 
-    private ColumnMetadata getColumnMetadata(DeltaColumn deltaColumn)
+    private ColumnMetadata getColumnMetadata(ConnectorSession session, DeltaColumn deltaColumn)
     {
-        return new ColumnMetadata(deltaColumn.getName(), typeManager.getType(deltaColumn.getType()));
+        return ColumnMetadata.builder()
+                .setName(normalizeIdentifier(session, deltaColumn.getName()))
+                .setType(typeManager.getType(deltaColumn.getType()))
+                .build();
     }
 
     private MetastoreContext metastoreContext(ConnectorSession session)

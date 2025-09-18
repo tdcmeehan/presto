@@ -22,14 +22,23 @@ using [Velox](https://github.com/facebookincubator/velox).
 Dependency installation scripts based on the operating system are
 available inside `presto/presto-native-execution/scripts`.
 
-* MacOS: `setup-macos.sh`
+* macOS: `setup-macos.sh`
 * CentOS Stream 9: `setup-centos.sh`
 * Ubuntu: `setup-ubuntu.sh`
 
-Create a directory say `dependencies` and invoke one of these scripts from
-this folder. All the dependencies are installed in the system default location eg: `/usr/local`.
-To change the installation location specify a path using the `INSTALL_PREFIX` environment variable.
-For example, change the location if the default location cannot be written to by the user running the setup script.
+The above setup scripts use the `DEPENDENCY_DIR` environment variable to set the
+location to download and build packages. This defaults to `deps-download` in the current
+working directory.
+
+Use `INSTALL_PREFIX` to set the install directory of the packages. This defaults to
+`deps-install` in the current working directory on macOS and to the default install
+location (for example, `/usr/local`) on Linux.
+Using the default install location `/usr/local` on macOS is discouraged because this
+location is owned by `root`.
+
+Manually add the `INSTALL_PREFIX` value in the IDE or bash environment, so subsequent
+Prestissimo builds can use the installed packages. Say
+`export INSTALL_PREFIX=/Users/$USERNAME/presto/presto-native-execution/deps-install` to `~/.zshrc`.
 
 The following libraries are installed by the above setup scripts.
 The Velox library installs other
@@ -41,7 +50,7 @@ not listed below.
 | [Velox](https://github.com/facebookincubator/velox)  | Latest  |
 | [CMake](https://cmake.org/) | Minimum `3.10` |
 | [gperf](https://www.gnu.org/software/gperf) |`v3.1`|
-| [proxygen](https://github.com/facebook/proxygen) |`v2024.04.01.00`|
+| [proxygen](https://github.com/facebook/proxygen) |`v2024.07.01.00`|
 
 Prestissimo sources the Velox scripts and the configuration for the installation
 location and other configuration applies to Prestissimo. Please make sure to also
@@ -56,33 +65,45 @@ The supported architectures are `x86_64 (avx, sse)`, and `AArch64 (apple-m1+crc,
 Prestissimo can be built by a variety of compilers (and versions) but not all.
 Compilers (and versions) not mentioned are known to not work or have not been tried.
 
+#### Minimum required
+| OS | compiler |
+| -- | -------- |
+| Ubuntu 22.04 | `gcc11` |
+| macOS | `clang15` |
+| CentOS 9/RHEL 9 | `gcc11` |
+
 #### Recommended
 | OS | compiler |
 | -- | -------- |
 | CentOS 9/RHEL 9 | `gcc12` |
 | Ubuntu 22.04 | `gcc11` |
-| MacOS | `clang15` |
-
-#### Older alternatives
-| OS | compiler |
-| -- | -------- |
-| Ubuntu 20.04 | `gcc9` |
-| MacOS | `clang14` |
+| macOS | `clang15 (or later)` |
 
 ### Build Prestissimo
-#### Parquet and S3 Supprt
-To enable Parquet and S3 support, set `PRESTO_ENABLE_PARQUET = "ON"`,
-`PRESTO_ENABLE_S3 = "ON"` in the environment.
+#### Parquet and S3 Support
+Parquet support is enabled by default. To disable it, add `-DPRESTO_ENABLE_PARQUET=OFF`
+to the `EXTRA_CMAKE_FLAGS` environment variable.
+
+`export EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS -DPRESTO_ENABLE_PARQUET=OFF"`
+
+To enable S3 support, add `-DPRESTO_ENABLE_S3=ON` to the `EXTRA_CMAKE_FLAGS`
+environment variable.
+
+`export EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DPRESTO_ENABLE_S3=ON"`
 
 S3 support needs the [AWS SDK C++](https://github.com/aws/aws-sdk-cpp) library.
-This dependency can be installed by running the script below from the
-`presto/presto-native-execution` directory.
+This dependency can be installed by running the target platform build script
+from the `presto/presto-native-execution` directory.
 
-`./velox/scripts/setup-adapters.sh aws`
+`./velox/scripts/setup-centos9.sh install_aws_deps`
+    Or
+`./velox/scripts/setup-ubuntu.sh install_aws_deps`
 
 #### JWT Authentication
-To enable JWT authentication support, set `PRESTO_ENABLE_JWT = "ON"` in
-the environment.
+To enable JWT authentication support, add `-DPRESTO_ENABLE_JWT=ON` to the
+`EXTRA_CMAKE_FLAGS` environment variable.
+
+`export EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DPRESTO_ENABLE_JWT=ON"`
 
 JWT authentication support needs the [JWT CPP](https://github.com/Thalhammer/jwt-cpp) library.
 This dependency can be installed by running the script below from the
@@ -99,14 +120,42 @@ follow these steps:
 
 *CMake flags:* `PRESTO_STATS_REPORTER_TYPE=PROMETHEUS`
 
+`export EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DPRESTO_STATS_REPORTER_TYPE=PROMETHEUS"`
+
 *Runtime configuration:* `runtime-metrics-collection-enabled=true`
 
 * After installing the above dependencies, from the
 `presto/presto-native-execution` directory, run `make`
-* For development, use
-`make debug` to build a non-optimized debug version.
-* Use `make unittest` to build
-and run tests.
+* For development, use `make debug` to build a non-optimized debug version.
+* Use `make unittest` to build and run tests.
+
+#### Arrow Flight Connector
+To enable Arrow Flight connector support, add to the `EXTRA_CMAKE_FLAGS` environment variable:
+`export EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DPRESTO_ENABLE_ARROW_FLIGHT_CONNECTOR=ON"`
+
+The Arrow Flight connector requires the Arrow Flight library. You can install this dependency
+by running the following script from the `presto/presto-native-execution` directory:
+
+`./scripts/setup-adapters.sh arrow_flight`
+
+#### Nvidia cuDF GPU Support
+
+To enable support with [cuDF](https://github.com/facebookincubator/velox/tree/main/velox/experimental/cudf),
+add to the `EXTRA_CMAKE_FLAGS` environment variable:
+`export EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DPRESTO_ENABLE_CUDF=ON"`
+
+In some environments, the CUDA_ARCHITECTURES and CUDA_COMPILER location must be explicitly set.
+The make command will look like:
+
+`CUDA_ARCHITECTURES=80 CUDA_COMPILER=/usr/local/cuda/bin/nvcc EXTRA_CMAKE_FLAGS=" -DPRESTO_ENABLE_CUDF=ON" make`
+
+The required dependencies are bundled from the Velox setup scripts.
+
+#### Spatial type and function support
+Spatial type and function support is enabled by default. To disable it, add to `EXTRA_CMAKE_FLAGS` environment variable:
+`export EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -PRESTO_ENABLE_SPATIAL=OFF"`
+
+The spatial support adds new types (OGC geometry types) and functionality for spatial calculations.
 
 ### Makefile Targets
 A reminder of the available Makefile targets can be obtained using `make help`
@@ -167,11 +216,22 @@ Run IcebergExternalWorkerQueryRunner,
       `$DATA_DIR/iceberg_data/<file_format>/<catalog_type>`. Here `file_format` could be `PARQUET | ORC | AVRO` and `catalog_type` could be `HIVE | HADOOP | NESSIE | REST`.
   * Use classpath of module: choose `presto-native-execution` module.
 
+Run NativeSidecarPluginQueryRunner:
+* Edit/Create `NativeSidecarPluginQueryRunner` Application Run/Debug Configuration (alter paths accordingly).
+  * Main class: `com.facebook.presto.sidecar.NativeSidecarPluginQueryRunner`.
+  * VM options : `-ea -Xmx5G -XX:+ExitOnOutOfMemoryError -Duser.timezone=America/Bahia_Banderas -Dhive.security=legacy`.
+  * Working directory: `$MODULE_DIR$`
+  * Environment variables: `PRESTO_SERVER=/Users/<user>/git/presto/presto-native-execution/cmake-build-debug/presto_cpp/main/presto_server;DATA_DIR=/Users/<user>/Desktop/data;WORKER_COUNT=0`
+  * Use classpath of module: choose `presto-native-sidecar-plugin` module.
+
 Run CLion:
 * File->Close Project if any is open.
 * Open `presto/presto-native-execution` directory as CMake project and wait till CLion loads/generates cmake files, symbols, etc.
 * Edit configuration for `presto_server` module (alter paths accordingly).
   * Program arguments: `--logtostderr=1 --v=1 --etc_dir=/Users/<user>/git/presto/presto-native-execution/etc`
+  * Working directory: `/Users/<user>/git/presto/presto-native-execution`
+* For sidecar, Edit configuration for `presto_server` module (alter paths accordingly).
+  * Program arguments: `--logtostderr=1 --v=1 --etc_dir=/Users/<user>/git/presto/presto-native-execution/etc_sidecar`
   * Working directory: `/Users/<user>/git/presto/presto-native-execution`
 * Edit menu CLion->Preferences->Build, Execution, Deployment->CMake
   * CMake options: `-DVELOX_BUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug`
@@ -182,7 +242,7 @@ Run CLion:
 * To enable clang format you need
   * Open any h or cpp file in the editor and select `Enable ClangFormat` by clicking `4 spaces` rectangle in the status bar (bottom right) which is next to `UTF-8` bar.
 
-    ![ScreenShot](cl_clangformat_switcherenable.png)
+    ![ScreenShot](docs/images/cl_clangformat_switcherenable.png)
 
 ### Run Presto Coordinator + Worker
 * Note that everything below can be done without using IDEs by running command line commands (not in this readme).
@@ -190,12 +250,24 @@ Run CLion:
   * For Hive, Run `HiveExternalWorkerQueryRunner` from IntelliJ and wait until it starts (`======== SERVER STARTED ========` is displayed in the log output).
   * For Iceberg, Run `IcebergExternalWorkerQueryRunner` from IntelliJ and wait until it starts (`======== SERVER STARTED ========` is displayed in the log output).
 * Scroll up the log output and find `Discovery URL http://127.0.0.1:50555`. The port is 'random' with every start.
-* Copy that port (or the whole URL) to the `discovery.uri` field in `presto/presto-native-execution/etc/config.properties` for the worker to discover the Coordinator.
+* Copy that port (or the whole URL) to the `discovery.uri` field in `presto/presto-native-execution/etc/config.properties` for the worker to announce itself to the Coordinator.
 * In CLion run "presto_server" module. Connection success will be indicated by `Announcement succeeded: 202` line in the log output.
-* Two ways to run Presto client to start executing queries on the running local setup:
-  1. In command line from presto root directory run the presto client:
-      * `java -jar presto-cli/target/presto-cli-*-executable.jar --catalog hive --schema tpch`
-  2. Run `Presto Client` Application (see above on how to create and setup the configuration) inside IntelliJ
+* See **Run Presto Client** to start executing queries on the running local setup.
+
+### Run Presto Coordinator + Sidecar
+* Note that everything below can be done without using IDEs by running command line commands (not in this readme).
+* Add a property `presto.default-namespace=native.default` to `presto-native-execution/etc/config.properties`.
+* Run `NativeSidecarPluginQueryRunner` from IntelliJ and wait until it starts (`======== SERVER STARTED ========` is displayed in the log output).
+* Scroll up the log output and find `Discovery URL http://127.0.0.1:50555`. The port is 'random' with every startup.
+* Copy that port (or the whole URL) to the `discovery.uri` field in`presto/presto-native-execution/etc_sidecar/config.properties` for the sidecar to announce itself to the Coordinator.
+* In CLion run "presto_server" module. Connection success will be indicated by `Announcement succeeded: 202` line in the log output.
+* See **Run Presto Client** to start executing queries on the running local setup.
+
+### Run Presto Client
+* Run the following command from the presto root directory to start the Presto client:
+    ```
+    java -jar presto-cli/target/presto-cli-*-executable.jar --catalog hive --schema tpch
+    ```
 * You can start from `show tables;` and `describe table;` queries and execute more queries as needed.
 
 ### Run Integration (End to End or E2E) Tests

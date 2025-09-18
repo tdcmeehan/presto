@@ -18,10 +18,12 @@ import com.facebook.presto.common.block.Block;
 import com.facebook.presto.iceberg.IcebergColumnHandle;
 import com.facebook.presto.spi.ConnectorPageSource;
 import io.airlift.slice.Slice;
+import jakarta.annotation.Nullable;
 import org.roaringbitmap.longlong.ImmutableLongBitmapDataProvider;
 import org.roaringbitmap.longlong.LongBitmapDataProvider;
 
 import java.util.List;
+import java.util.Optional;
 
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
@@ -32,10 +34,13 @@ public final class PositionDeleteFilter
         implements DeleteFilter
 {
     private final ImmutableLongBitmapDataProvider deletedRows;
+    @Nullable
+    private final String deleteFilePath;
 
-    public PositionDeleteFilter(ImmutableLongBitmapDataProvider deletedRows)
+    public PositionDeleteFilter(ImmutableLongBitmapDataProvider deletedRows, @Nullable String deleteFilePath)
     {
         this.deletedRows = requireNonNull(deletedRows, "deletedRows is null");
+        this.deleteFilePath = deleteFilePath;
     }
 
     @Override
@@ -46,6 +51,11 @@ public final class PositionDeleteFilter
             long filePos = BIGINT.getLong(page.getBlock(filePosChannel), position);
             return !deletedRows.contains(filePos);
         };
+    }
+
+    public Optional<String> getDeleteFilePath()
+    {
+        return Optional.ofNullable(deleteFilePath);
     }
 
     private static int rowPositionChannel(List<IcebergColumnHandle> columns)

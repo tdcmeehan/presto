@@ -31,8 +31,7 @@ import com.facebook.presto.spi.SchemaTablePrefix;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
@@ -86,7 +85,8 @@ public class AtopMetadata
     }
 
     @Override
-    public List<ConnectorTableLayoutResult> getTableLayouts(ConnectorSession session,
+    public ConnectorTableLayoutResult getTableLayoutForConstraint(
+            ConnectorSession session,
             ConnectorTableHandle table,
             Constraint<ColumnHandle> constraint,
             Optional<Set<ColumnHandle>> desiredColumns)
@@ -105,7 +105,7 @@ public class AtopMetadata
         }
         AtopTableLayoutHandle layoutHandle = new AtopTableLayoutHandle(tableHandle, startTimeDomain, endTimeDomain);
         ConnectorTableLayout tableLayout = getTableLayout(session, layoutHandle);
-        return ImmutableList.of(new ConnectorTableLayoutResult(tableLayout, constraint.getSummary()));
+        return new ConnectorTableLayoutResult(tableLayout, constraint.getSummary());
     }
 
     @Override
@@ -120,7 +120,10 @@ public class AtopMetadata
         AtopTableHandle atopTableHandle = (AtopTableHandle) tableHandle;
         ImmutableList.Builder<ColumnMetadata> columns = ImmutableList.builder();
         for (AtopColumn column : atopTableHandle.getTable().getColumns()) {
-            columns.add(new ColumnMetadata(column.getName(), typeManager.getType(column.getType())));
+            columns.add(ColumnMetadata.builder()
+                    .setName(normalizeIdentifier(session, column.getName()))
+                    .setType(typeManager.getType(column.getType()))
+                    .build());
         }
         SchemaTableName schemaTableName = new SchemaTableName(atopTableHandle.getSchema(), atopTableHandle.getTable().getName());
         return new ConnectorTableMetadata(schemaTableName, columns.build());

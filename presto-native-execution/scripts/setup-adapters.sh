@@ -15,13 +15,20 @@
 set -eufx -o pipefail
 
 SCRIPT_DIR=$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")
-if [ -f "${SCRIPT_DIR}/setup-helper-functions.sh" ]
+if [ -f "${SCRIPT_DIR}/setup-common.sh" ]
 then
-  source "${SCRIPT_DIR}/setup-helper-functions.sh"
+  source "${SCRIPT_DIR}/setup-common.sh"
 else
-  source "${SCRIPT_DIR}/../velox/scripts/setup-helper-functions.sh"
+  source "${SCRIPT_DIR}/../velox/scripts/setup-common.sh"
 fi
 DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)}
+
+OS=$(uname)
+if [ "$OS" = "Darwin" ]; then
+  export INSTALL_PREFIX=${INSTALL_PREFIX:-"$(pwd)/deps-install"}
+else
+  export INSTALL_PREFIX=${INSTALL_PREFIX:-"/usr/local"}
+fi
 
 function install_jwt_cpp {
   github_checkout Thalhammer/jwt-cpp v0.6.0 --depth 1
@@ -35,15 +42,26 @@ function install_prometheus_cpp {
   cmake_install -DBUILD_SHARED_LIBS=ON -DENABLE_PUSH=OFF -DENABLE_COMPRESSION=OFF
 }
 
+function install_arrow_flight {
+  # Velox provides an install for the Arrow library. Rebuild with the original Velox options and
+  # Arrow Flight enabled. The Velox version of Arrow is used.
+  # NOTE: benchmarks are on due to a compilation error with v15.0.0, once updated that can be removed
+  # see https://github.com/apache/arrow/issues/41617
+  EXTRA_ARROW_OPTIONS=" -DARROW_FLIGHT=ON -DARROW_BUILD_BENCHMARKS=ON -DgRPC_SOURCE=BUNDLED -DProtobuf_SOURCE=BUNDLED "
+  install_arrow
+}
+
 cd "${DEPENDENCY_DIR}" || exit
 
 install_jwt=0
 install_prometheus_cpp=0
+install_arrow_flight=0
 
 if [ "$#" -eq 0 ]; then
     # Install all adapters by default
     install_jwt=1
     install_prometheus_cpp=1
+    install_arrow_flight=1
 fi
 
 while [[ $# -gt 0 ]]; do
@@ -56,6 +74,10 @@ while [[ $# -gt 0 ]]; do
       install_prometheus_cpp=1;
       shift
           ;;
+    arrow_flight)
+      install_arrow_flight=1;
+      shift
+      ;;
     *)
       echo "ERROR: Unknown option $1! will be ignored!"
       shift
@@ -70,6 +92,10 @@ fi
 
 if [ $install_prometheus_cpp -eq 1 ]; then
   install_prometheus_cpp
+fi
+
+if [ $install_arrow_flight -eq 1 ]; then
+  install_arrow_flight
 fi
 
 _ret=$?

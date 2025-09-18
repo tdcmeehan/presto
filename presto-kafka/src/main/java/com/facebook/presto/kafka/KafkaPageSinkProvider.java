@@ -26,8 +26,7 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.connector.ConnectorPageSinkProvider;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
 import com.google.common.collect.ImmutableList;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -42,11 +41,11 @@ public class KafkaPageSinkProvider
         implements ConnectorPageSinkProvider
 {
     private final DispatchingRowEncoderFactory encoderFactory;
-    private final PlainTextKafkaProducerFactory producerFactory;
+    private final KafkaProducerFactory producerFactory;
     private final KafkaClusterMetadataSupplier kafkaClusterMetadataSupplier;
 
     @Inject
-    public KafkaPageSinkProvider(DispatchingRowEncoderFactory encoderFactory, PlainTextKafkaProducerFactory producerFactory, KafkaClusterMetadataSupplier kafkaClusterMetadataSupplier)
+    public KafkaPageSinkProvider(DispatchingRowEncoderFactory encoderFactory, KafkaProducerFactory producerFactory, KafkaClusterMetadataSupplier kafkaClusterMetadataSupplier)
     {
         this.encoderFactory = requireNonNull(encoderFactory, "encoderFactory is null");
         this.producerFactory = requireNonNull(producerFactory, "producerFactory is null");

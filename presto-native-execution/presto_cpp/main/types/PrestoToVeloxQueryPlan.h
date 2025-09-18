@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <vector>
 #include "presto_cpp/main/operators/ShuffleInterface.h"
-#include "presto_cpp/presto_protocol/presto_protocol.h"
+#include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
 #include "velox/core/Expressions.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/PlanNode.h"
@@ -24,7 +24,6 @@
 #include "presto_cpp/main/types/PrestoTaskId.h"
 #include "presto_cpp/main/types/PrestoToVeloxExpr.h"
 #include "presto_cpp/main/types/TypeParser.h"
-#include "presto_cpp/presto_protocol/presto_protocol.h"
 
 namespace facebook::presto {
 
@@ -112,6 +111,21 @@ class VeloxQueryPlanConverterBase {
       const protocol::TaskId& taskId);
 
   velox::core::PlanNodePtr toVeloxQueryPlan(
+      const std::shared_ptr<const protocol::SpatialJoinNode>& node,
+      const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
+      const protocol::TaskId& taskId);
+
+  std::shared_ptr<const velox::core::IndexLookupJoinNode> toVeloxQueryPlan(
+      const std::shared_ptr<const protocol::IndexJoinNode>& node,
+      const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
+      const protocol::TaskId& taskId);
+
+  std::shared_ptr<const velox::core::TableScanNode> toVeloxQueryPlan(
+      const std::shared_ptr<const protocol::IndexSourceNode>& node,
+      const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
+      const protocol::TaskId& taskId);
+
+  velox::core::PlanNodePtr toVeloxQueryPlan(
       const std::shared_ptr<const protocol::MarkDistinctNode>& node,
       const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
       const protocol::TaskId& taskId);
@@ -138,6 +152,11 @@ class VeloxQueryPlanConverterBase {
 
   std::shared_ptr<const velox::core::TableWriteNode> toVeloxQueryPlan(
       const std::shared_ptr<const protocol::TableWriterNode>& node,
+      const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
+      const protocol::TaskId& taskId);
+
+  std::shared_ptr<const velox::core::TableWriteNode> toVeloxQueryPlan(
+      const std::shared_ptr<const protocol::DeleteNode>& node,
       const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
       const protocol::TaskId& taskId);
 
@@ -190,7 +209,7 @@ class VeloxQueryPlanConverterBase {
   velox::VectorPtr evaluateConstantExpression(
       const velox::core::TypedExprPtr& expression);
 
-  std::shared_ptr<velox::core::AggregationNode> generateAggregationNode(
+  std::optional<velox::core::ColumnStatsSpec> toColumnStatsSpec(
       const std::shared_ptr<protocol::StatisticAggregations>&
           statisticsAggregation,
       velox::core::AggregationNode::Step step,
@@ -272,4 +291,16 @@ class VeloxBatchQueryPlanConverter : public VeloxQueryPlanConverterBase {
 };
 
 void registerPrestoPlanNodeSerDe();
+
+void parseSqlFunctionHandle(
+    const std::shared_ptr<protocol::SqlFunctionHandle>& sqlFunction,
+    std::vector<velox::TypePtr>& rawInputTypes,
+    TypeParser& typeParser);
+
+void parseIndexLookupCondition(
+    const std::shared_ptr<protocol::RowExpression>& filter,
+    const VeloxExprConverter& exprConverter,
+    bool acceptConstant,
+    std::vector<velox::core::IndexLookupConditionPtr>& joinConditionPtrs,
+    std::vector<velox::core::TypedExprPtr>& unsupportedConditions);
 } // namespace facebook::presto

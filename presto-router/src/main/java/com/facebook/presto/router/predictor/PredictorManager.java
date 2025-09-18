@@ -17,10 +17,10 @@ import com.facebook.airlift.log.Logger;
 import com.facebook.presto.router.RouterConfig;
 import com.facebook.presto.router.spec.RouterSpec;
 import com.facebook.presto.spi.PrestoException;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.net.URI;
+import java.nio.file.Paths;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -45,7 +45,7 @@ public class PredictorManager
     @Inject
     public PredictorManager(RemoteQueryFactory remoteQueryFactory, RouterConfig config)
     {
-        RouterSpec routerSpec = parseRouterConfig(config)
+        RouterSpec routerSpec = parseRouterConfig(Paths.get(config.getConfigFile()))
                 .orElseThrow(() -> new PrestoException(CONFIGURATION_INVALID, "Failed to load router config"));
 
         this.remoteQueryFactory = requireNonNull(remoteQueryFactory, "");

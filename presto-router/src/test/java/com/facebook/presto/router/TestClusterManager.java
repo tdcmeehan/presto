@@ -24,9 +24,13 @@ import com.facebook.airlift.log.Logging;
 import com.facebook.airlift.node.testing.TestingNodeModule;
 import com.facebook.presto.execution.QueryState;
 import com.facebook.presto.jdbc.PrestoResultSet;
-import com.facebook.presto.router.cluster.ClusterStatusTracker;
+import com.facebook.presto.router.cluster.ClusterManager;
+import com.facebook.presto.router.cluster.ClusterManager.ClusterStatusTracker;
+import com.facebook.presto.router.cluster.RemoteInfoFactory;
+import com.facebook.presto.router.scheduler.CustomSchedulerManager;
+import com.facebook.presto.router.security.RouterSecurityModule;
+import com.facebook.presto.router.spec.RouterSpec;
 import com.facebook.presto.server.testing.TestingPrestoServer;
-import com.facebook.presto.tpch.TpchPlugin;
 import com.google.common.collect.ImmutableList;
 import com.google.inject.Injector;
 import org.testng.annotations.AfterClass;
@@ -34,26 +38,30 @@ import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeoutException;
 
-import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.facebook.presto.router.TestingRouterUtil.createConnection;
+import static com.facebook.presto.router.TestingRouterUtil.createPrestoServer;
+import static com.facebook.presto.router.TestingRouterUtil.getConfigFile;
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
-import static java.lang.String.format;
-import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.nio.file.Files.setLastModifiedTime;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 
+@Test(singleThreaded = true)
 public class TestClusterManager
 {
     private static final int NUM_CLUSTERS = 3;
@@ -64,6 +72,9 @@ public class TestClusterManager
     private HttpServerInfo httpServerInfo;
     private ClusterStatusTracker clusterStatusTracker;
     private File configFile;
+    private RemoteInfoFactory remoteInfoFactory;
+    private CustomSchedulerManager schedulerManager;
+    private URI httpServerUri;
 
     @BeforeClass
     public void setup()
@@ -71,25 +82,34 @@ public class TestClusterManager
     {
         Logging.initialize();
 
-        // set up server
-        ImmutableList.Builder builder = ImmutableList.builder();
+        // Set up servers
+        ImmutableList.Builder<TestingPrestoServer> builder = ImmutableList.builder();
         for (int i = 0; i < NUM_CLUSTERS; ++i) {
             builder.add(createPrestoServer());
         }
         prestoServers = builder.build();
-        configFile = getConfigFile(prestoServers);
+        Path tempFile = Files.createTempFile("temp-config", ".json");
+        configFile = getConfigFile(prestoServers, tempFile.toFile());
 
         Bootstrap app = new Bootstrap(
                 new TestingNodeModule("test"),
-                new TestingHttpServerModule(), new JsonModule(),
+                new TestingHttpServerModule(),
+                new JsonModule(),
                 new JaxrsModule(true),
-                new RouterModule());
+                new RouterSecurityModule(),
+                new RouterModule(Optional.empty()));
 
-        Injector injector = app.doNotInitializeLogging().setRequiredConfigurationProperty("router.config-file", configFile.getAbsolutePath()).quiet().initialize();
+        Injector injector = app.doNotInitializeLogging()
+                .setRequiredConfigurationProperty("router.config-file", configFile.getAbsolutePath())
+                .setRequiredConfigurationProperty("presto.version", "test")
+                .quiet().initialize();
 
         lifeCycleManager = injector.getInstance(LifeCycleManager.class);
         httpServerInfo = injector.getInstance(HttpServerInfo.class);
         clusterStatusTracker = injector.getInstance(ClusterStatusTracker.class);
+        schedulerManager = injector.getInstance(CustomSchedulerManager.class);
+        httpServerUri = httpServerInfo.getHttpUri();
+        remoteInfoFactory = injector.getInstance(RemoteInfoFactory.class);
     }
 
     @AfterClass(alwaysRun = true)
@@ -102,29 +122,84 @@ public class TestClusterManager
         lifeCycleManager.stop();
     }
 
-    @Test(enabled = false)
+    @Test
     public void testQuery()
             throws Exception
     {
-        String sql = "SELECT row_number() OVER () n FROM tpch.tiny.orders";
         for (int i = 0; i < NUM_QUERIES; ++i) {
-            try (Connection connection = createConnection(httpServerInfo.getHttpUri());
-                    Statement statement = connection.createStatement();
-                    ResultSet rs = statement.executeQuery(sql)) {
-                long count = 0;
-                long sum = 0;
-                while (rs.next()) {
-                    count++;
-                    sum += rs.getLong("n");
-                }
-                assertEquals(count, 15000);
-                assertEquals(sum, (count / 2) * (1 + count));
-            }
+            runAndAssertQueryResults(httpServerUri);
         }
-
         sleepUninterruptibly(10, SECONDS);
         assertEquals(clusterStatusTracker.getAllQueryInfos().size(), NUM_QUERIES);
         assertQueryState();
+    }
+
+    static void runAndAssertQueryResults(URI uri)
+            throws SQLException
+    {
+        String sql = "SELECT row_number() OVER () n FROM tpch.tiny.orders";
+        try (Connection connection = createConnection(uri);
+                Statement statement = connection.createStatement();
+                ResultSet rs = statement.executeQuery(sql)) {
+            long count = 0;
+            long sum = 0;
+            while (rs.next()) {
+                count++;
+                sum += rs.getLong("n");
+            }
+            assertEquals(count, 15000);
+            assertEquals(sum, (count / 2) * (1 + count));
+        }
+    }
+
+    @Test
+    public void testConfigReload()
+            throws Exception
+    {
+        Path tempDirPath = Files.createTempDirectory("tempdir");
+        Path tempFile = Files.createTempFile(tempDirPath, "new-config", ".json");
+        File newConfig = getConfigFile(prestoServers, tempFile.toFile());
+        RouterConfig newRouterConfig = new RouterConfig();
+        newRouterConfig.setConfigFile(newConfig.getAbsolutePath());
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        try (ClusterManager barrierClusterManager = new BarrierClusterManager(newRouterConfig, remoteInfoFactory, barrier, schedulerManager)) {
+            // the file watching service has a few second initial delay before it starts detecting
+            // file updates, so we need to first wait until the barrier is properly being triggered
+            // by setting the file last-modified-time until we get the expected synchronization
+            while (true) {
+                setLastModifiedTime(newConfig.toPath(), FileTime.from(Instant.now()));
+                try {
+                    barrier.await(1, SECONDS);
+                    break;
+                }
+                catch (TimeoutException e) {
+                    barrier.reset();
+                }
+            }
+            assertEquals(barrierClusterManager.getAllClusters().size(), 3);
+
+            Path configFilePath = newConfig.toPath();
+            String originalConfigContent = new String(Files.readAllBytes(configFilePath));
+
+            JsonCodec<RouterSpec> jsonCodec = JsonCodec.jsonCodec(RouterSpec.class);
+            RouterSpec spec = jsonCodec.fromJson(originalConfigContent);
+            RouterSpec newSpec = new RouterSpec(
+                    ImmutableList.of(),
+                    spec.getSelectors(),
+                    Optional.ofNullable(spec.getSchedulerType()),
+                    spec.getPredictorUri(),
+                    Optional.empty());
+
+            Files.write(newConfig.toPath(), jsonCodec.toBytes(newSpec));
+            barrier.await(10, SECONDS);
+
+            assertEquals(barrierClusterManager.getAllClusters().size(), 0);
+
+            Files.write(newConfig.toPath(), originalConfigContent.getBytes());
+            barrier.await(10, SECONDS);
+
+            assertEquals(barrierClusterManager.getAllClusters().size(), 3);
+        }
     }
 
     private void assertQueryState()
@@ -149,46 +224,5 @@ public class TestClusterManager
             }
         }
         assertEquals(total, NUM_QUERIES);
-    }
-
-    private static TestingPrestoServer createPrestoServer()
-            throws Exception
-    {
-        TestingPrestoServer server = new TestingPrestoServer();
-        server.installPlugin(new TpchPlugin());
-        server.createCatalog("tpch", "tpch");
-        server.refreshNodes();
-
-        return server;
-    }
-
-    private File getConfigFile(List<TestingPrestoServer> servers)
-            throws IOException
-    {
-        // setup router config file
-        File tempFile = File.createTempFile("router", "json");
-        FileOutputStream fileOutputStream = new FileOutputStream(tempFile);
-        String configTemplate = new String(Files.readAllBytes(Paths.get(getResourceFilePath("simple-router-template.json"))));
-        fileOutputStream.write(configTemplate.replaceAll("\\$\\{SERVERS}", getClusterList(servers)).getBytes(UTF_8));
-        fileOutputStream.close();
-        return tempFile;
-    }
-
-    private static String getClusterList(List<TestingPrestoServer> servers)
-    {
-        JsonCodec<List<URI>> codec = JsonCodec.listJsonCodec(URI.class);
-        return codec.toJson(servers.stream().map(TestingPrestoServer::getBaseUrl).collect(toImmutableList()));
-    }
-
-    private static Connection createConnection(URI uri)
-            throws SQLException
-    {
-        String url = format("jdbc:presto://%s:%s", uri.getHost(), uri.getPort());
-        return DriverManager.getConnection(url, "test", null);
-    }
-
-    private String getResourceFilePath(String fileName)
-    {
-        return this.getClass().getClassLoader().getResource(fileName).getPath();
     }
 }

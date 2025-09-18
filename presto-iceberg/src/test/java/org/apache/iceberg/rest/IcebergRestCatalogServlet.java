@@ -14,19 +14,21 @@
 package org.apache.iceberg.rest;
 
 import com.facebook.airlift.log.Logger;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.MalformedJwtException;
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.HttpHeaders;
 import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.io.CharStreams;
-import org.apache.iceberg.rest.RESTCatalogAdapter.HTTPMethod;
+import org.apache.iceberg.rest.HTTPRequest.HTTPMethod;
 import org.apache.iceberg.rest.RESTCatalogAdapter.Route;
 import org.apache.iceberg.rest.responses.ErrorResponse;
 import org.apache.iceberg.util.Pair;
-
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -39,8 +41,8 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static jakarta.servlet.http.HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
 import static java.lang.String.format;
-import static javax.servlet.http.HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
 
 /**
  * The IcebergRestCatalogServlet provides a servlet implementation used in combination with a
@@ -94,6 +96,14 @@ public class IcebergRestCatalogServlet
         response.setStatus(HttpServletResponse.SC_OK);
         responseHeaders.forEach(response::setHeader);
 
+        String token = context.headers.get("Authorization");
+        if (token != null && isRestUserSessionToken(token) && !isAuthorizedRestUserSessionToken(token)) {
+            context.errorResponse = ErrorResponse.builder()
+                    .responseCode(HttpServletResponse.SC_FORBIDDEN)
+                    .withMessage("User not authorized")
+                    .build();
+        }
+
         if (context.error().isPresent()) {
             response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
             RESTObjectMapper.mapper().writeValue(response.getWriter(), context.error().get());
@@ -101,22 +111,26 @@ public class IcebergRestCatalogServlet
         }
 
         try {
+            HTTPRequest request = restCatalogAdapter.buildRequest(
+                    context.method(),
+                    context.path(),
+                    context.queryParams(),
+                    context.headers(),
+                    context.body());
             Object responseBody =
                     restCatalogAdapter.execute(
-                            context.method(),
-                            context.path(),
-                            context.queryParams(),
-                            context.body(),
+                            request,
                             context.route().responseClass(),
-                            context.headers(),
-                            handle(response));
+                            handleResponseError(response),
+                            handleResponseHeader(response));
 
             if (responseBody != null) {
                 RESTObjectMapper.mapper().writeValue(response.getWriter(), responseBody);
             }
         }
         catch (RESTException e) {
-            if (context.route() == Route.LOAD_TABLE && e.getLocalizedMessage().contains("NoSuchTableException")) {
+            if ((context.route() == Route.LOAD_TABLE && e.getLocalizedMessage().contains("NoSuchTableException")) ||
+                    (context.route() == Route.LOAD_VIEW && e.getLocalizedMessage().contains("NoSuchViewException"))) {
                 // Suppress stack trace for load_table requests, most of which occur immediately
                 // preceding a create_table request
                 LOG.warn("Table at endpoint %s does not exist", context.path());
@@ -132,7 +146,15 @@ public class IcebergRestCatalogServlet
         }
     }
 
-    protected Consumer<ErrorResponse> handle(HttpServletResponse response)
+    private Consumer<Map<String, String>> handleResponseHeader(HttpServletResponse response)
+    {
+        return (responseHeaders) -> {
+            LOG.error("Unexpected response header: %s", responseHeaders);
+            throw new RuntimeException("Unexpected response header: " + responseHeaders);
+        };
+    }
+
+    protected Consumer<ErrorResponse> handleResponseError(HttpServletResponse response)
     {
         return (errorResponse) -> {
             response.setStatus(errorResponse.code());
@@ -143,6 +165,33 @@ public class IcebergRestCatalogServlet
                 throw new UncheckedIOException(e);
             }
         };
+    }
+
+    protected Claims getTokenClaims(String token)
+    {
+        token = token.replaceAll("Bearer token-exchange-token:sub=", "");
+        return Jwts.parserBuilder().build().parseClaimsJwt(token).getBody();
+    }
+
+    protected boolean isRestUserSessionToken(String token)
+    {
+        try {
+            getTokenClaims(token);
+        }
+        catch (MalformedJwtException mje) {
+            // Not a json web token
+            return false;
+        }
+        return true;
+    }
+
+    protected boolean isAuthorizedRestUserSessionToken(String jwt)
+    {
+        Claims jwtClaims = getTokenClaims(jwt);
+        return jwtClaims.getSubject().equals("user") &&
+                jwtClaims.getIssuer().equals("testversion") &&
+                jwtClaims.get("user").equals("user") &&
+                jwtClaims.get("source").equals("test");
     }
 
     public static class ServletRequestContext

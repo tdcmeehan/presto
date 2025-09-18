@@ -45,8 +45,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.io.BaseEncoding;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
@@ -159,11 +158,15 @@ public class ElasticsearchMetadata
     }
 
     @Override
-    public List<ConnectorTableLayoutResult> getTableLayouts(ConnectorSession session, ConnectorTableHandle table, Constraint<ColumnHandle> constraint, Optional<Set<ColumnHandle>> desiredColumns)
+    public ConnectorTableLayoutResult getTableLayoutForConstraint(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            Constraint<ColumnHandle> constraint,
+            Optional<Set<ColumnHandle>> desiredColumns)
     {
         ElasticsearchTableHandle handle = (ElasticsearchTableHandle) table;
         ConnectorTableLayout layout = new ConnectorTableLayout(new ElasticsearchTableLayoutHandle(handle, constraint.getSummary()));
-        return ImmutableList.of(new ConnectorTableLayoutResult(layout, constraint.getSummary()));
+        return new ConnectorTableLayoutResult(layout, constraint.getSummary());
     }
 
     @Override
@@ -182,26 +185,26 @@ public class ElasticsearchMetadata
                     new SchemaTableName(handle.getSchema(), handle.getIndex()),
                     ImmutableList.of(queryResultColumnMetadata));
         }
-        return getTableMetadata(handle.getSchema(), handle.getIndex());
+        return getTableMetadata(session, handle.getSchema(), handle.getIndex());
     }
 
-    private ConnectorTableMetadata getTableMetadata(String schemaName, String tableName)
+    private ConnectorTableMetadata getTableMetadata(ConnectorSession session, String schemaName, String tableName)
     {
-        InternalTableMetadata internalTableMetadata = makeInternalTableMetadata(schemaName, tableName);
+        InternalTableMetadata internalTableMetadata = makeInternalTableMetadata(session, schemaName, tableName);
         return new ConnectorTableMetadata(new SchemaTableName(schemaName, tableName), internalTableMetadata.getColumnMetadata());
     }
 
-    private InternalTableMetadata makeInternalTableMetadata(ConnectorTableHandle table)
+    private InternalTableMetadata makeInternalTableMetadata(ConnectorSession session, ConnectorTableHandle table)
     {
         ElasticsearchTableHandle handle = (ElasticsearchTableHandle) table;
-        return makeInternalTableMetadata(handle.getSchema(), handle.getIndex());
+        return makeInternalTableMetadata(session, handle.getSchema(), handle.getIndex());
     }
 
-    private InternalTableMetadata makeInternalTableMetadata(String schema, String tableName)
+    private InternalTableMetadata makeInternalTableMetadata(ConnectorSession session, String schema, String tableName)
     {
         IndexMetadata metadata = client.getIndexMetadata(tableName);
         List<IndexMetadata.Field> fields = getColumnFields(metadata);
-        return new InternalTableMetadata(new SchemaTableName(schema, tableName), makeColumnMetadata(fields), makeColumnHandles(fields));
+        return new InternalTableMetadata(new SchemaTableName(schema, tableName), makeColumnMetadata(session, fields), makeColumnHandles(fields));
     }
 
     private List<IndexMetadata.Field> getColumnFields(IndexMetadata metadata)
@@ -222,7 +225,7 @@ public class ElasticsearchMetadata
         return result.build();
     }
 
-    private List<ColumnMetadata> makeColumnMetadata(List<IndexMetadata.Field> fields)
+    private List<ColumnMetadata> makeColumnMetadata(ConnectorSession session, List<IndexMetadata.Field> fields)
     {
         ImmutableList.Builder<ColumnMetadata> result = ImmutableList.builder();
 
@@ -231,7 +234,7 @@ public class ElasticsearchMetadata
         }
 
         for (IndexMetadata.Field field : fields) {
-            result.add(new ColumnMetadata(field.getName(), toPrestoType(field)));
+            result.add(ColumnMetadata.builder().setName(normalizeIdentifier(session, field.getName())).setType(toPrestoType(field)).build());
         }
         return result.build();
     }
@@ -374,7 +377,7 @@ public class ElasticsearchMetadata
             return queryTableColumns;
         }
 
-        InternalTableMetadata tableMetadata = makeInternalTableMetadata(tableHandle);
+        InternalTableMetadata tableMetadata = makeInternalTableMetadata(session, tableHandle);
         return tableMetadata.getColumnHandles();
     }
 
@@ -411,12 +414,12 @@ public class ElasticsearchMetadata
         }
 
         if (prefix.getSchemaName() != null && prefix.getTableName() != null) {
-            ConnectorTableMetadata metadata = getTableMetadata(prefix.getSchemaName(), prefix.getTableName());
+            ConnectorTableMetadata metadata = getTableMetadata(session, prefix.getSchemaName(), prefix.getTableName());
             return ImmutableMap.of(metadata.getTable(), metadata.getColumns());
         }
 
         return listTables(session, prefix.getSchemaName()).stream()
-                .map(name -> getTableMetadata(name.getSchemaName(), name.getTableName()))
+                .map(name -> getTableMetadata(session, name.getSchemaName(), name.getTableName()))
                 .collect(toImmutableMap(ConnectorTableMetadata::getTable, ConnectorTableMetadata::getColumns));
     }
 

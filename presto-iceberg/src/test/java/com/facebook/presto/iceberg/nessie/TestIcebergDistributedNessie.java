@@ -18,11 +18,11 @@ import com.facebook.presto.iceberg.IcebergQueryRunner;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.testing.containers.NessieContainer;
 import com.google.common.collect.ImmutableMap;
+import org.apache.hadoop.fs.Path;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
-import java.io.File;
 import java.util.Map;
 
 import static com.facebook.presto.iceberg.CatalogType.NESSIE;
@@ -43,7 +43,7 @@ public class TestIcebergDistributedNessie
     @Override
     protected Map<String, String> getProperties()
     {
-        File metastoreDir = getCatalogDirectory();
+        Path metastoreDir = getCatalogDirectory();
         return ImmutableMap.of("warehouse", metastoreDir.toString(), "uri", nessieContainer.getRestApiUri());
     }
 
@@ -69,7 +69,10 @@ public class TestIcebergDistributedNessie
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        return IcebergQueryRunner.createIcebergQueryRunner(ImmutableMap.of(), nessieConnectorProperties(nessieContainer.getRestApiUri()));
+        return IcebergQueryRunner.builder()
+                .setCatalogType(NESSIE)
+                .setExtraConnectorProperties(nessieConnectorProperties(nessieContainer.getRestApiUri()))
+                .build().getQueryRunner();
     }
 
     @Override
@@ -79,5 +82,13 @@ public class TestIcebergDistributedNessie
         assertThatThrownBy(() -> super.testExpireSnapshotWithDeletedEntries())
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageMatching("Cannot expire snapshots: GC is disabled .*");
+    }
+
+    @Test
+    public void testUnknownConnectorNotThrown()
+    {
+        // Checks an Unknown connector exception is not thrown when trying to explore through JDBC an Iceberg catalog of type Nessie
+        assertQuerySucceeds("select * from system.jdbc.schemas where TABLE_CATALOG = 'iceberg'");
+        assertQuerySucceeds("select * from system.jdbc.tables where TABLE_CAT = 'iceberg' and TABLE_SCHEM = 'tpch'");
     }
 }

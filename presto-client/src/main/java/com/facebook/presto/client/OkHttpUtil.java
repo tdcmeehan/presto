@@ -16,6 +16,7 @@ package com.facebook.presto.client;
 import com.facebook.airlift.security.pem.PemReader;
 import com.google.common.base.CharMatcher;
 import com.google.common.net.HostAndPort;
+import okhttp.internal.tls.LegacyHostnameVerifier;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.Credentials;
@@ -33,14 +34,15 @@ import javax.net.ssl.X509TrustManager;
 import javax.security.auth.x500.X500Principal;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.CookieManager;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
+import java.nio.file.Paths;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
+import java.security.SecureRandom;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
@@ -55,6 +57,7 @@ import static com.google.common.net.HttpHeaders.AUTHORIZATION;
 import static com.google.common.net.HttpHeaders.USER_AGENT;
 import static java.net.Proxy.Type.HTTP;
 import static java.net.Proxy.Type.SOCKS;
+import static java.nio.file.Files.newInputStream;
 import static java.util.Collections.list;
 import static java.util.Objects.requireNonNull;
 
@@ -138,6 +141,41 @@ public final class OkHttpUtil
         return InetSocketAddress.createUnresolved(address.getHost(), address.getPort());
     }
 
+    public static void setupInsecureSsl(OkHttpClient.Builder clientBuilder)
+    {
+        try {
+            X509TrustManager trustAllCerts = new X509TrustManager()
+            {
+                @Override
+                public void checkClientTrusted(X509Certificate[] chain, String authType)
+                {
+                    throw new UnsupportedOperationException("checkClientTrusted should not be called");
+                }
+
+                @Override
+                public void checkServerTrusted(X509Certificate[] chain, String authType)
+                {
+                    // skip validation of server certificate
+                }
+
+                @Override
+                public X509Certificate[] getAcceptedIssuers()
+                {
+                    return new X509Certificate[0];
+                }
+            };
+
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, new TrustManager[] {trustAllCerts}, new SecureRandom());
+
+            clientBuilder.sslSocketFactory(sslContext.getSocketFactory(), trustAllCerts);
+            clientBuilder.hostnameVerifier((hostname, session) -> true);
+        }
+        catch (GeneralSecurityException e) {
+            throw new ClientException("Error setting up SSL: " + e.getMessage(), e);
+        }
+    }
+
     public static void setupSsl(
             OkHttpClient.Builder clientBuilder,
             Optional<String> keyStorePath,
@@ -160,7 +198,7 @@ public final class OkHttpUtil
                 char[] keyManagerPassword;
                 try {
                     // attempt to read the key store as a PEM file
-                    keyStore = PemReader.loadKeyStore(new File(keyStorePath.get()), new File(keyStorePath.get()), keyStorePassword);
+                    keyStore = PemReader.loadKeyStore(Paths.get(keyStorePath.get()).toFile(), Paths.get(keyStorePath.get()).toFile(), keyStorePassword);
                     // for PEM encoded keys, the password is used to decrypt the specific key (and does not protect the keystore itself)
                     keyManagerPassword = new char[0];
                 }
@@ -168,7 +206,7 @@ public final class OkHttpUtil
                     keyManagerPassword = keyStorePassword.map(String::toCharArray).orElse(null);
 
                     keyStore = KeyStore.getInstance(keystoreType.get());
-                    try (InputStream in = new FileInputStream(keyStorePath.get())) {
+                    try (InputStream in = newInputStream(Paths.get(keyStorePath.get()))) {
                         keyStore.load(in, keyManagerPassword);
                     }
                 }
@@ -182,7 +220,7 @@ public final class OkHttpUtil
             KeyStore trustStore = keyStore;
             if (trustStorePath.isPresent()) {
                 checkArgument(trustStoreType.isPresent(), "truststore type is not present");
-                trustStore = loadTrustStore(new File(trustStorePath.get()), trustStorePassword, trustStoreType.get());
+                trustStore = loadTrustStore(Paths.get(trustStorePath.get()).toFile(), trustStorePassword, trustStoreType.get());
             }
 
             // create TrustManagerFactory
@@ -201,6 +239,7 @@ public final class OkHttpUtil
             sslContext.init(keyManagers, new TrustManager[] {trustManager}, null);
 
             clientBuilder.sslSocketFactory(sslContext.getSocketFactory(), trustManager);
+            clientBuilder.hostnameVerifier(LegacyHostnameVerifier.INSTANCE);
         }
         catch (GeneralSecurityException | IOException e) {
             throw new ClientException("Error setting up SSL: " + e.getMessage(), e);
@@ -250,7 +289,7 @@ public final class OkHttpUtil
         catch (IOException | GeneralSecurityException ignored) {
         }
 
-        try (InputStream in = new FileInputStream(trustStorePath)) {
+        try (InputStream in = newInputStream(trustStorePath.toPath())) {
             trustStore.load(in, trustStorePassword.map(String::toCharArray).orElse(null));
         }
         return trustStore;

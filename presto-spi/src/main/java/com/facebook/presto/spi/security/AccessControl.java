@@ -17,11 +17,16 @@ import com.facebook.presto.common.CatalogSchemaName;
 import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.transaction.TransactionId;
+import com.facebook.presto.spi.ColumnMetadata;
+import com.facebook.presto.spi.MaterializedViewDefinition;
 import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.analyzer.ViewDefinition;
 
 import java.security.Principal;
 import java.security.cert.X509Certificate;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -43,7 +48,7 @@ public interface AccessControl
      * Check if the query is unexpectedly modified using the credentials passed in the identity.
      * @throws com.facebook.presto.spi.security.AccessDeniedException if query is modified.
      */
-    void checkQueryIntegrity(Identity identity, AccessControlContext context, String query);
+    void checkQueryIntegrity(Identity identity, AccessControlContext context, String query, Map<QualifiedObjectName, ViewDefinition> viewDefinitions, Map<QualifiedObjectName, MaterializedViewDefinition> materializedViewDefinitions);
 
     /**
      * Filter the list of catalogs to those visible to the identity.
@@ -93,6 +98,13 @@ public interface AccessControl
     Set<String> filterSchemas(TransactionId transactionId, Identity identity, AccessControlContext context, String catalogName, Set<String> schemaNames);
 
     /**
+     * Check if identity is allowed to execute SHOW CREATE TABLE or SHOW CREATE VIEW.
+     *
+     * @throws com.facebook.presto.spi.security.AccessDeniedException if not allowed
+     */
+    void checkCanShowCreateTable(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName);
+
+    /**
      * Check if identity is allowed to create the specified table.
      *
      * @throws com.facebook.presto.spi.security.AccessDeniedException if not allowed
@@ -114,6 +126,13 @@ public interface AccessControl
     void checkCanRenameTable(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName, QualifiedObjectName newTableName);
 
     /**
+     * Check if identity is allowed to set properties to the specified table.
+     *
+     * @throws AccessDeniedException if not allowed
+     */
+    void checkCanSetTableProperties(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName, Map<String, Object> properties);
+
+    /**
      * Check if identity is allowed to show metadata of tables by executing SHOW TABLES, SHOW GRANTS etc. in a catalog.
      * <p>
      * NOTE: This method is only present to give users an error message when listing is not allowed.
@@ -128,6 +147,22 @@ public interface AccessControl
      * Filter the list of tables and views to those visible to the identity.
      */
     Set<SchemaTableName> filterTables(TransactionId transactionId, Identity identity, AccessControlContext context, String catalogName, Set<SchemaTableName> tableNames);
+
+    /**
+     * Check if identity is allowed to show columns of tables by executing SHOW COLUMNS, DESCRIBE etc.
+     * <p>
+     * NOTE: This method is only present to give users an error message when listing is not allowed.
+     * The {@link #filterColumns} method must filter all results for unauthorized users,
+     * since there are multiple ways to list columns.
+     *
+     * @throws com.facebook.presto.spi.security.AccessDeniedException if not allowed
+     */
+    void checkCanShowColumnsMetadata(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName);
+
+    /**
+     * Filter the list of columns to those visible to the identity.
+     */
+    List<ColumnMetadata> filterColumns(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName, List<ColumnMetadata> columns);
 
     /**
      * Check if identity is allowed to add columns to the specified table.
@@ -184,6 +219,13 @@ public interface AccessControl
      * @throws com.facebook.presto.spi.security.AccessDeniedException if not allowed
      */
     void checkCanCreateView(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName viewName);
+
+    /**
+     * Check if identity is allowed to rename the specified view.
+     *
+     * @throws com.facebook.presto.spi.security.AccessDeniedException if not allowed
+     */
+    void checkCanRenameView(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName viewName, QualifiedObjectName newViewName);
 
     /**
      * Check if identity is allowed to drop the specified view.
@@ -307,4 +349,29 @@ public interface AccessControl
      * @throws com.facebook.presto.spi.security.AccessDeniedException if not allowed
      */
     void checkCanAddConstraints(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName constraintName);
+
+    /**
+     * Get row filters associated with the given table and identity.
+     * <p>
+     * Each filter must be a scalar SQL expression of boolean type over the columns in the table.
+     *
+     * @return the list of filters, or empty list if not applicable
+     */
+    default List<ViewExpression> getRowFilters(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName)
+    {
+        return Collections.emptyList();
+    }
+
+    /**
+     * Bulk method for getting column masks for a subset of columns in a table.
+     * <p>
+     * Each mask must be a scalar SQL expression of a type coercible to the type of the column being masked. The expression
+     * must be written in terms of columns in the table.
+     *
+     * @return a mapping from columns to masks, or an empty map if not applicable. The keys of the return Map are a subset of {@code columns}.
+     */
+    default Map<ColumnMetadata, ViewExpression> getColumnMasks(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName, List<ColumnMetadata> columns)
+    {
+        return Collections.emptyMap();
+    }
 }

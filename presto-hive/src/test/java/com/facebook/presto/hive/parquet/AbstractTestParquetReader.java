@@ -13,6 +13,8 @@
  */
 package com.facebook.presto.hive.parquet;
 
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.common.type.ArrayType;
 import com.facebook.presto.common.type.RowType;
 import com.facebook.presto.common.type.SqlDate;
@@ -35,17 +37,16 @@ import com.google.common.collect.DiscreteDomain;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Range;
 import com.google.common.primitives.Shorts;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 import org.apache.hadoop.hive.common.type.HiveDecimal;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.JavaHiveDecimalObjectInspector;
 import org.apache.hadoop.hive.serde2.typeinfo.DecimalTypeInfo;
 import org.apache.parquet.format.Statistics;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
-import org.apache.parquet.schema.MessageTypeParser;
 import org.apache.parquet.schema.PrimitiveType;
+import org.apache.parquet.schema.Types;
 import org.joda.time.DateTimeZone;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
@@ -71,6 +72,7 @@ import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.common.type.DateType.DATE;
@@ -96,11 +98,11 @@ import static com.facebook.presto.testing.TestingConnectorSession.SESSION;
 import static com.facebook.presto.tests.StructuralTestUtil.mapType;
 import static com.google.common.base.Functions.compose;
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterables.concat;
 import static com.google.common.collect.Iterables.cycle;
 import static com.google.common.collect.Iterables.limit;
 import static com.google.common.collect.Iterables.transform;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.lang.String.format;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Arrays.asList;
@@ -179,6 +181,105 @@ public abstract class AbstractTestParquetReader
         }
         values = createTestArrays(values);
         tester.testRoundTrip(objectInspector, values, values, type);
+    }
+
+    @Test
+    public void testNestedArraysDecimalBackedByINT32()
+            throws Exception
+    {
+        int precision = 1;
+        int scale = 0;
+        ObjectInspector objectInspector = getStandardListObjectInspector(javaIntObjectInspector);
+        Type type = new ArrayType(createDecimalType(precision, scale));
+        Iterable<List<Integer>> values = createTestArrays(intsBetween(1, 1_000));
+
+        ImmutableList.Builder<List<SqlDecimal>> expectedValues = new ImmutableList.Builder<>();
+        for (List<Integer> value : values) {
+            expectedValues.add(value.stream()
+                    .map(valueInt -> SqlDecimal.of(valueInt, precision, scale))
+                    .collect(toImmutableList()));
+        }
+
+        MessageType hiveSchema = parseMessageType(format("message hive_list_decimal {" +
+                "  optional group my_list (LIST){" +
+                "    repeated group list {" +
+                "        optional INT32 element (DECIMAL(%d, %d));" +
+                "    }" +
+                "  }" +
+                "} ", precision, scale));
+
+        tester.testRoundTrip(objectInspector, values, expectedValues.build(), "my_list", type, Optional.of(hiveSchema));
+    }
+
+    @Test
+    public void testNestedArraysDecimalBackedByINT64()
+            throws Exception
+    {
+        int precision = 10;
+        int scale = 2;
+        ObjectInspector objectInspector = getStandardListObjectInspector(javaLongObjectInspector);
+        Type type = new ArrayType(createDecimalType(precision, scale));
+        Iterable<List<Long>> values = createTestArrays(longsBetween(1, 1_000));
+
+        ImmutableList.Builder<List<SqlDecimal>> expectedValues = new ImmutableList.Builder<>();
+        for (List<Long> value : values) {
+            expectedValues.add(value.stream()
+                    .map(valueLong -> SqlDecimal.of(valueLong, precision, scale))
+                    .collect(toImmutableList()));
+        }
+
+        MessageType hiveSchema = parseMessageType(format("message hive_list_decimal {" +
+                "  optional group my_list (LIST){" +
+                "    repeated group list {" +
+                "        optional INT64 element (DECIMAL(%d, %d));" +
+                "    }" +
+                "  }" +
+                "} ", precision, scale));
+        tester.testRoundTrip(objectInspector, values, expectedValues.build(), "my_list", type, Optional.of(hiveSchema));
+    }
+
+    @Test
+    public void testNestedArraysShortDecimalBackedByBinary()
+            throws Exception
+    {
+        int precision = 1;
+        int scale = 0;
+        ObjectInspector objectInspector = getStandardListObjectInspector(new JavaHiveDecimalObjectInspector(new DecimalTypeInfo(precision, scale)));
+        Type type = new ArrayType(createDecimalType(precision, scale));
+        Iterable<List<HiveDecimal>> values = getNestedDecimalArrayInputValues(precision, scale);
+        List<List<SqlDecimal>> expectedValues = getNestedDecimalArrayExpectedValues(values, precision, scale);
+
+        MessageType hiveSchema = parseMessageType(format("message hive_list_decimal {" +
+                "  optional group my_list (LIST){" +
+                "    repeated group list {" +
+                "        optional BINARY element (DECIMAL(%d, %d));" +
+                "    }" +
+                "  }" +
+                "} ", precision, scale));
+
+        tester.testRoundTrip(objectInspector, values, expectedValues, "my_list", type, Optional.of(hiveSchema));
+    }
+
+    private Iterable<List<HiveDecimal>> getNestedDecimalArrayInputValues(int precision, int scale)
+    {
+        ContiguousSet<BigInteger> bigIntegerValues = bigIntegersBetween(BigDecimal.valueOf(Math.pow(10, precision - 1)).toBigInteger(),
+                BigDecimal.valueOf(Math.pow(10, precision)).toBigInteger());
+        List<HiveDecimal> writeValues = bigIntegerValues.stream()
+                .map(value -> HiveDecimal.create((BigInteger) value, scale))
+                .collect(toImmutableList());
+
+        return createTestArrays(writeValues);
+    }
+
+    private static List<List<SqlDecimal>> getNestedDecimalArrayExpectedValues(Iterable<List<HiveDecimal>> values, int precision, int scale)
+    {
+        ImmutableList.Builder<List<SqlDecimal>> expectedValues = new ImmutableList.Builder<>();
+        for (List<HiveDecimal> value : values) {
+            expectedValues.add(value.stream()
+                    .map(valueHiveDecimal -> new SqlDecimal(valueHiveDecimal.unscaledValue(), precision, scale))
+                    .collect(toImmutableList()));
+        }
+        return expectedValues.build();
     }
 
     @Test
@@ -899,8 +1000,12 @@ public abstract class AbstractTestParquetReader
     public void testTimestampMicrosBackedByINT64()
             throws Exception
     {
-        org.apache.parquet.schema.MessageType parquetSchema =
-                MessageTypeParser.parseMessageType("message ts_micros { optional INT64 test (TIMESTAMP_MICROS); }");
+        LogicalTypeAnnotation annotation = LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MICROS);
+        MessageType parquetSchema = Types.buildMessage()
+                .primitive(PrimitiveType.PrimitiveTypeName.INT64, OPTIONAL)
+                .as(annotation)
+                .named("test")
+                .named("ts_micros");
         ContiguousSet<Long> longValues = longsBetween(1_000_000, 1_001_000);
         ImmutableList.Builder<SqlTimestamp> expectedValues = new ImmutableList.Builder<>();
         for (Long value : longValues) {

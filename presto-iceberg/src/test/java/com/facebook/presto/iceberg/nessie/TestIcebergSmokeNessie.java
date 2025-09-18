@@ -28,7 +28,6 @@ import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.testing.containers.NessieContainer;
 import com.facebook.presto.tests.DistributedQueryRunner;
-import com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.Table;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
@@ -83,7 +82,7 @@ public class TestIcebergSmokeNessie
         Path dataDirectory = ((DistributedQueryRunner) queryRunner).getCoordinator().getDataDirectory();
         Path icebergDataDirectory = getIcebergDataDirectoryPath(dataDirectory, NESSIE.name(), new IcebergConfig().getFileFormat(), false);
         Optional<File> tempTableLocation = Arrays.stream(requireNonNull(icebergDataDirectory.resolve(schema).toFile().listFiles()))
-                .filter(file -> file.toURI().toString().contains(table)).findFirst();
+                .filter(file -> endsWithTableUUID(table, file.toURI().toString())).findFirst();
 
         String dataLocation = icebergDataDirectory.toFile().toURI().toString();
         String relativeTableLocation = tempTableLocation.get().toURI().toString().replace(dataLocation, "");
@@ -95,7 +94,10 @@ public class TestIcebergSmokeNessie
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        return IcebergQueryRunner.createIcebergQueryRunner(ImmutableMap.of(), nessieConnectorProperties(nessieContainer.getRestApiUri()));
+        return IcebergQueryRunner.builder()
+                .setCatalogType(NESSIE)
+                .setExtraConnectorProperties(nessieConnectorProperties(nessieContainer.getRestApiUri()))
+                .build().getQueryRunner();
     }
 
     @Override
@@ -103,7 +105,7 @@ public class TestIcebergSmokeNessie
     {
         IcebergConfig icebergConfig = new IcebergConfig();
         icebergConfig.setCatalogType(NESSIE);
-        icebergConfig.setCatalogWarehouse(getCatalogDirectory().toFile().getPath());
+        icebergConfig.setCatalogWarehouse(getCatalogDirectory().toString());
 
         IcebergNessieConfig nessieConfig = new IcebergNessieConfig().setServerUri(nessieContainer.getRestApiUri());
 
@@ -116,5 +118,10 @@ public class TestIcebergSmokeNessie
         return IcebergUtil.getNativeIcebergTable(catalogFactory,
                 session,
                 SchemaTableName.valueOf(schema + "." + tableName));
+    }
+
+    private static boolean endsWithTableUUID(String tableName, String tablePath)
+    {
+        return tablePath.matches(format(".*%s_[-a-fA-F0-9]{36}/$", tableName));
     }
 }

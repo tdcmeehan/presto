@@ -16,6 +16,7 @@ package com.facebook.presto.tests;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.metadata.SessionPropertyManager;
+import com.facebook.presto.scalar.sql.SqlInvokedFunctionsPlugin;
 import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.testing.LocalQueryRunner;
 import com.facebook.presto.testing.MaterializedResult;
@@ -71,7 +72,7 @@ public class TestVerboseOptimizerInfo
         SessionPropertyManager sessionPropertyManager = localQueryRunner.getMetadata().getSessionPropertyManager();
         sessionPropertyManager.addSystemSessionProperties(TEST_SYSTEM_PROPERTIES);
         sessionPropertyManager.addConnectorSessionProperties(new ConnectorId(TESTING_CATALOG), TEST_CATALOG_PROPERTIES);
-
+        localQueryRunner.installPlugin(new SqlInvokedFunctionsPlugin());
         return localQueryRunner;
     }
 
@@ -102,6 +103,7 @@ public class TestVerboseOptimizerInfo
 
         checkOptimizerInfo(explainPayloadJoinQuery, "Triggered", ImmutableList.of("PayloadJoinOptimizer"));
     }
+
     @Test
     public void testCostBasedOptimizers()
     {
@@ -149,6 +151,17 @@ public class TestVerboseOptimizerInfo
         explain = (String) getOnlyElement(materializedResult.getOnlyColumnAsSet());
 
         checkOptimizerResults(explain, ImmutableList.of("PayloadJoinOptimizer", "RemoveRedundantIdentityProjections"), ImmutableList.of("PruneUnreferencedOutputs"));
+    }
+
+    @Override
+    public void testSetSessionNativeWorkerSessionProperty()
+    {
+    }
+
+    @Test
+    public void testUse()
+    {
+        // USE statement is not supported
     }
 
     private void checkOptimizerInfo(String explain, String optimizerType, List<String> optimizers)

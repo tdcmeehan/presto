@@ -14,12 +14,14 @@
 package com.facebook.presto.dispatcher;
 
 import com.facebook.airlift.node.NodeInfo;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.Session;
 import com.facebook.presto.client.NodeVersion;
 import com.facebook.presto.cost.HistoryBasedOptimizationConfig;
 import com.facebook.presto.cost.HistoryBasedPlanStatisticsManager;
 import com.facebook.presto.event.QueryMonitor;
 import com.facebook.presto.event.QueryMonitorConfig;
+import com.facebook.presto.eventlistener.EventListenerConfig;
 import com.facebook.presto.eventlistener.EventListenerManager;
 import com.facebook.presto.execution.ClusterSizeMonitor;
 import com.facebook.presto.execution.ExecutionFailureInfo;
@@ -30,7 +32,6 @@ import com.facebook.presto.execution.StageInfo;
 import com.facebook.presto.execution.resourceGroups.QueryQueueFullException;
 import com.facebook.presto.metadata.InMemoryNodeManager;
 import com.facebook.presto.metadata.MetadataManager;
-import com.facebook.presto.metadata.SessionPropertyManager;
 import com.facebook.presto.operator.OperatorInfo;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.QueryId;
@@ -51,7 +52,6 @@ import com.facebook.presto.transaction.TransactionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.SettableFuture;
-import io.airlift.units.Duration;
 import org.testng.annotations.Test;
 
 import java.util.Map;
@@ -67,6 +67,7 @@ import static com.facebook.presto.execution.QueryState.FAILED;
 import static com.facebook.presto.execution.QueryState.QUEUED;
 import static com.facebook.presto.execution.QueryState.WAITING_FOR_PREREQUISITES;
 import static com.facebook.presto.execution.TaskTestUtils.createQueryStateMachine;
+import static com.facebook.presto.metadata.SessionPropertyManager.createTestingSessionPropertyManager;
 import static com.facebook.presto.spi.StandardErrorCode.ABANDONED_QUERY;
 import static com.facebook.presto.spi.StandardErrorCode.ABANDONED_TASK;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INSUFFICIENT_RESOURCES;
@@ -455,16 +456,16 @@ public class TestLocalDispatchQuery
                 eventListenerManager,
                 new NodeInfo("test"),
                 UNKNOWN,
-                new SessionPropertyManager(),
+                createTestingSessionPropertyManager(),
                 metadata,
                 new QueryMonitorConfig(),
-                new HistoryBasedPlanStatisticsManager(new ObjectMapper(), new SessionPropertyManager(), metadata, new HistoryBasedOptimizationConfig(), new FeaturesConfig(), new NodeVersion("1")),
+                new HistoryBasedPlanStatisticsManager(new ObjectMapper(), createTestingSessionPropertyManager(), metadata, new HistoryBasedOptimizationConfig(), new FeaturesConfig(), new NodeVersion("1")),
                 new FeaturesConfig());
     }
 
     private EventListenerManager createEventListenerManager(CountingEventListener countingEventListener)
     {
-        EventListenerManager eventListenerManager = new EventListenerManager();
+        EventListenerManager eventListenerManager = new EventListenerManager(new EventListenerConfig());
         eventListenerManager.addEventListenerFactory(new TestEventListenerFactory(countingEventListener));
         eventListenerManager.loadConfiguredEventListener(ImmutableMap.of("event-listener.name", TestEventListenerFactory.NAME));
         return eventListenerManager;

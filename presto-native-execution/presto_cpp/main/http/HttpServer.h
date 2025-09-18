@@ -42,6 +42,11 @@ void sendErrorResponse(
     const std::string& error = "",
     uint16_t status = http::kHttpInternalServerError);
 
+void sendResponse(
+    proxygen::ResponseHandler* downstream,
+    const json& body,
+    uint16_t status);
+
 class AbstractRequestHandler : public proxygen::RequestHandler {
  public:
   void onRequest(
@@ -254,7 +259,8 @@ class HttpsConfig {
       const std::string& certPath,
       const std::string& keyPath,
       const std::string& supportedCiphers,
-      bool reusePort = false);
+      bool reusePort = false,
+      bool http2Enabled = true);
 
   proxygen::HTTPServer::IPConfig ipConfig() const;
 
@@ -264,6 +270,7 @@ class HttpsConfig {
   const std::string keyPath_;
   std::string supportedCiphers_;
   const bool reusePort_;
+  const bool http2Enabled_;
 };
 
 class HttpServer {

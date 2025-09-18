@@ -15,6 +15,8 @@ package com.facebook.presto.execution;
 
 import com.facebook.airlift.concurrent.ThreadPoolExecutorMBean;
 import com.facebook.airlift.log.Logger;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.ExceededCpuLimitException;
 import com.facebook.presto.ExceededIntermediateWrittenBytesException;
 import com.facebook.presto.ExceededOutputSizeLimitException;
@@ -37,16 +39,13 @@ import com.facebook.presto.version.EmbedVersion;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Ordering;
 import com.google.common.util.concurrent.ListenableFuture;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
+import com.google.errorprone.annotations.ThreadSafe;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import jakarta.inject.Inject;
 import org.weakref.jmx.Flatten;
 import org.weakref.jmx.Managed;
 import org.weakref.jmx.Nested;
-
-import javax.annotation.PostConstruct;
-import javax.annotation.PreDestroy;
-import javax.annotation.concurrent.ThreadSafe;
-import javax.inject.Inject;
 
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -59,6 +58,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import static com.facebook.airlift.concurrent.Threads.threadsNamed;
+import static com.facebook.airlift.units.DataSize.Unit.BYTE;
 import static com.facebook.presto.SystemSessionProperties.getQueryMaxCpuTime;
 import static com.facebook.presto.SystemSessionProperties.getQueryMaxOutputPositions;
 import static com.facebook.presto.SystemSessionProperties.getQueryMaxOutputSize;
@@ -252,6 +252,13 @@ public class SqlQueryManager
     }
 
     @Override
+    public long getDurationUntilExpirationInMillis(QueryId queryId)
+            throws NoSuchElementException
+    {
+        return queryTracker.getQuery(queryId).getDurationUntilExpirationInMillis();
+    }
+
+    @Override
     public Session getQuerySession(QueryId queryId)
             throws NoSuchElementException
     {
@@ -423,10 +430,10 @@ public class SqlQueryManager
     private void enforceScanLimits()
     {
         for (QueryExecution query : queryTracker.getAllQueries()) {
-            DataSize rawInputSize = query.getRawInputDataSize();
+            long rawInputSize = query.getRawInputDataSizeInBytes();
             DataSize sessionlimit = getQueryMaxScanRawInputBytes(query.getSession());
             DataSize limit = Ordering.natural().min(maxQueryScanPhysicalBytes, sessionlimit);
-            if (rawInputSize.compareTo(limit) >= 0) {
+            if (Double.compare(rawInputSize, limit.getValue(BYTE)) >= 0) {
                 query.fail(new ExceededScanLimitException(limit));
             }
         }
@@ -442,10 +449,10 @@ public class SqlQueryManager
                 // No Ctes Materialized
                 continue;
             }
-            DataSize writtenIntermediateDataSize = query.getWrittenIntermediateDataSize();
+            long writtenIntermediateDataSize = query.getWrittenIntermediateDataSizeInBytes();
             DataSize sessionlimit = getQueryMaxWrittenIntermediateBytesLimit(query.getSession());
             DataSize limit = Ordering.natural().min(maxWrittenIntermediatePhysicalBytes, sessionlimit);
-            if (writtenIntermediateDataSize.compareTo(limit) >= 0) {
+            if (Double.compare(writtenIntermediateDataSize, limit.getValue(BYTE)) >= 0) {
                 query.fail(new ExceededIntermediateWrittenBytesException(limit));
             }
         }
@@ -472,10 +479,10 @@ public class SqlQueryManager
     private void enforceOutputSizeLimits()
     {
         for (QueryExecution query : queryTracker.getAllQueries()) {
-            DataSize outputSize = query.getOutputDataSize();
+            long outputSize = query.getOutputDataSizeInBytes();
             DataSize sessionlimit = getQueryMaxOutputSize(query.getSession());
             DataSize limit = Ordering.natural().min(maxQueryOutputSize, sessionlimit);
-            if (outputSize.compareTo(limit) >= 0) {
+            if (Double.compare(outputSize, limit.getValue(BYTE)) >= 0) {
                 query.fail(new ExceededOutputSizeLimitException(limit));
             }
         }

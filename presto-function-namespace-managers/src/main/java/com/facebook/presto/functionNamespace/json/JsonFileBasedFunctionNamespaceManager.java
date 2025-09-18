@@ -20,8 +20,10 @@ import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.common.type.TypeSignature;
 import com.facebook.presto.common.type.UserDefinedType;
 import com.facebook.presto.functionNamespace.AbstractSqlInvokedFunctionNamespaceManager;
+import com.facebook.presto.functionNamespace.JsonBasedUdfFunctionMetadata;
 import com.facebook.presto.functionNamespace.ServingCatalog;
 import com.facebook.presto.functionNamespace.SqlInvokedFunctionNamespaceManagerConfig;
+import com.facebook.presto.functionNamespace.UdfFunctionSignatureMap;
 import com.facebook.presto.functionNamespace.execution.SqlFunctionExecutors;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.function.AggregationFunctionImplementation;
@@ -34,8 +36,7 @@ import com.facebook.presto.spi.function.SqlFunctionHandle;
 import com.facebook.presto.spi.function.SqlFunctionId;
 import com.facebook.presto.spi.function.SqlInvokedFunction;
 import com.google.common.collect.ImmutableList;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.Collection;
 import java.util.List;

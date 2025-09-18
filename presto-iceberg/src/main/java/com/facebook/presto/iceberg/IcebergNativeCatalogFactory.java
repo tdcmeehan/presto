@@ -21,13 +21,12 @@ import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.UncheckedExecutionException;
+import jakarta.inject.Inject;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.SupportsNamespaces;
-
-import javax.inject.Inject;
 
 import java.util.HashMap;
 import java.util.List;
@@ -48,10 +47,11 @@ import static org.apache.iceberg.CatalogProperties.WAREHOUSE_LOCATION;
  */
 public class IcebergNativeCatalogFactory
 {
-    private final Cache<String, Catalog> catalogCache;
+    protected final Cache<String, Catalog> catalogCache;
     private final String catalogName;
     protected final CatalogType catalogType;
     private final String catalogWarehouse;
+    private final String catalogWarehouseDataDir;
     protected final IcebergConfig icebergConfig;
 
     private final List<String> hadoopConfigResources;
@@ -69,6 +69,7 @@ public class IcebergNativeCatalogFactory
         this.icebergConfig = requireNonNull(config, "config is null");
         this.catalogType = config.getCatalogType();
         this.catalogWarehouse = config.getCatalogWarehouse();
+        this.catalogWarehouseDataDir = config.getCatalogWarehouseDataDir();
         this.hadoopConfigResources = icebergConfig.getHadoopConfigResources();
         this.s3ConfigurationUpdater = requireNonNull(s3ConfigurationUpdater, "s3ConfigurationUpdater is null");
         this.gcsConfigurationInitialize = requireNonNull(gcsConfigurationInitialize, "gcsConfigurationInitialize is null");
@@ -90,6 +91,11 @@ public class IcebergNativeCatalogFactory
         }
     }
 
+    public String getCatalogWarehouseDataDir()
+    {
+        return this.catalogWarehouseDataDir;
+    }
+
     public SupportsNamespaces getNamespaces(ConnectorSession session)
     {
         Catalog catalog = getCatalog(session);
@@ -99,7 +105,12 @@ public class IcebergNativeCatalogFactory
         throw new PrestoException(NOT_SUPPORTED, "Iceberg catalog of type " + catalogType + " does not support namespace operations");
     }
 
-    private String getCacheKey(ConnectorSession session)
+    public boolean isNestedNamespaceEnabled()
+    {
+        return false;
+    }
+
+    protected String getCacheKey(ConnectorSession session)
     {
         StringBuilder sb = new StringBuilder();
         sb.append(catalogName);
@@ -112,11 +123,11 @@ public class IcebergNativeCatalogFactory
         return Optional.empty();
     }
 
-    private Map<String, String> getProperties(ConnectorSession session)
+    protected Map<String, String> getProperties(ConnectorSession session)
     {
         Map<String, String> properties = new HashMap<>();
         if (icebergConfig.getManifestCachingEnabled()) {
-            loadCachingProperties(properties, icebergConfig);
+            properties.putAll(loadCachingProperties(icebergConfig));
         }
         if (icebergConfig.getFileIOImpl() != null) {
             properties.put(FILE_IO_IMPL, icebergConfig.getFileIOImpl());
@@ -134,7 +145,7 @@ public class IcebergNativeCatalogFactory
         return ImmutableMap.of();
     }
 
-    private Configuration getHadoopConfiguration()
+    protected Configuration getHadoopConfiguration()
     {
         Configuration configuration = new Configuration(false);
 

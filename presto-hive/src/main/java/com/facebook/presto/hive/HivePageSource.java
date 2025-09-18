@@ -27,10 +27,9 @@ import com.facebook.presto.spi.PrestoException;
 import com.google.common.annotations.VisibleForTesting;
 import io.airlift.slice.Slices;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import jakarta.annotation.Nullable;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.joda.time.DateTimeZone;
-
-import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -98,7 +97,7 @@ public class HivePageSource
             }
             else if (isRowIdColumnHandle(columnMapping.getHiveColumnHandle())) {
                 // If there's no row ID partition component, then path + row numbers will be supplied for $row_id
-                byte[] component = rowIdPartitionComponent.orElse(new byte[0]);
+                byte[] component = rowIdPartitionComponent.orElseGet(() -> new byte[0]);
                 String rowGroupId = Paths.get(path).getFileName().toString();
                 coercers[columnIndex] = new RowIDCoercer(component, rowGroupId);
             }

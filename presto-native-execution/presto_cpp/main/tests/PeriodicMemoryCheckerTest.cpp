@@ -54,7 +54,7 @@ class PeriodicMemoryCheckerTest : public testing::Test {
       return mallocBytes_;
     }
 
-    void periodicCb() const override {
+    void periodicCb() override {
       if (periodicCb_) {
         periodicCb_();
       }
@@ -176,7 +176,7 @@ TEST_F(PeriodicMemoryCheckerTest, heapdump) {
 }
 
 TEST_F(PeriodicMemoryCheckerTest, pushbackMemory) {
-  memory::MemoryManagerOptions options;
+  memory::MemoryManager::Options options;
   options.allocatorCapacity = 32L << 20;
   memory::MemoryManager::testingSetInstance(options);
   auto asyncDataCache =
@@ -222,6 +222,6 @@ TEST_F(PeriodicMemoryCheckerTest, pushbackMemory) {
   // Shutdown global memory setups
   asyncDataCache->shutdown();
   cache::AsyncDataCache::setInstance(nullptr);
-  memory::MemoryManager::testingSetInstance({});
+  memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
 }
 } // namespace facebook::presto

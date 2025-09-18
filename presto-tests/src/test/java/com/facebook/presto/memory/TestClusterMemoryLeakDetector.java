@@ -13,6 +13,8 @@
  */
 package com.facebook.presto.memory;
 
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.execution.QueryState;
 import com.facebook.presto.server.BasicQueryInfo;
 import com.facebook.presto.server.BasicQueryStats;
@@ -21,8 +23,6 @@ import com.facebook.presto.spi.resourceGroups.ResourceGroupId;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 import org.joda.time.DateTime;
 import org.testng.annotations.Test;
 
@@ -82,14 +82,23 @@ public class TestClusterMemoryLeakDetector
                 URI.create("1"),
                 "",
                 new BasicQueryStats(
-                        DateTime.parse("1991-09-06T05:00-05:30"),
-                        DateTime.parse("1991-09-06T05:01-05:30"),
+                        DateTime.parse("1991-09-06T05:00-05:30").getMillis(),
+                        DateTime.parse("1991-09-06T05:01-05:30").getMillis(),
                         Duration.valueOf("4m"),
                         Duration.valueOf("8m"),
                         Duration.valueOf("7m"),
                         Duration.valueOf("34m"),
+                        Duration.valueOf("10m"),
                         11,
                         12,
+                        13,
+                        14,
+                        15,
+                        100,
+                        13,
+                        14,
+                        15,
+                        100,
                         13,
                         14,
                         15,

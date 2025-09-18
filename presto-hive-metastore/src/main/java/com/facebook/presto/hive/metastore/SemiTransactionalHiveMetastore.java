@@ -14,6 +14,7 @@
 package com.facebook.presto.hive.metastore;
 
 import com.facebook.airlift.log.Logger;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.common.RuntimeStats;
 import com.facebook.presto.common.predicate.Domain;
 import com.facebook.presto.common.type.Type;
@@ -47,12 +48,10 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
-import io.airlift.units.Duration;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-
-import javax.annotation.concurrent.GuardedBy;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -202,7 +201,7 @@ public class SemiTransactionalHiveMetastore
         checkReadable();
         Action<TableAndMore> tableAction = tableActions.get(hiveTableHandle.getSchemaTableName());
         if (tableAction == null) {
-            return metastoreContext.getRuntimeStats().profileNanos(GET_TABLE_TIME_NANOS, () -> delegate.getTable(metastoreContext, hiveTableHandle));
+            return metastoreContext.getRuntimeStats().recordWallTime(GET_TABLE_TIME_NANOS, () -> delegate.getTable(metastoreContext, hiveTableHandle));
         }
         switch (tableAction.getType()) {
             case ADD:
@@ -761,7 +760,7 @@ public class SemiTransactionalHiveMetastore
                 resultBuilder.put(partitionNameWithVersion.getPartitionName(), getPartitionFromPartitionAction(partitionAction));
             }
         }
-        Map<String, Optional<Partition>> delegateResult = metastoreContext.getRuntimeStats().profileNanos(GET_PARTITIONS_BY_NAMES_TIME_NANOS, () -> delegate.getPartitionsByNames(metastoreContext, databaseName, tableName, partitionNamesToQuery.build()));
+        Map<String, Optional<Partition>> delegateResult = metastoreContext.getRuntimeStats().recordWallTime(GET_PARTITIONS_BY_NAMES_TIME_NANOS, () -> delegate.getPartitionsByNames(metastoreContext, databaseName, tableName, partitionNamesToQuery.build()));
         resultBuilder.putAll(delegateResult);
 
         cacheLastDataCommitTimes(delegateResult, databaseName, tableName);
@@ -1179,7 +1178,7 @@ public class SemiTransactionalHiveMetastore
                         hdfsContext.getSession().map(MetastoreUtil::isUserDefinedTypeEncodingEnabled).orElse(false),
                         columnConverterProvider,
                         hdfsContext.getSession().map(ConnectorSession::getWarningCollector).orElse(NOOP),
-                        hdfsContext.getSession().map(ConnectorSession::getRuntimeStats).orElse(new RuntimeStats()));
+                        hdfsContext.getSession().map(ConnectorSession::getRuntimeStats).orElseGet(RuntimeStats::new));
                 switch (action.getType()) {
                     case DROP:
                         committer.prepareDropTable(metastoreContext, schemaTableName);
@@ -1213,7 +1212,7 @@ public class SemiTransactionalHiveMetastore
                             hdfsContext.getSession().map(MetastoreUtil::isUserDefinedTypeEncodingEnabled).orElse(false),
                             columnConverterProvider,
                             hdfsContext.getSession().map(ConnectorSession::getWarningCollector).orElse(NOOP),
-                            hdfsContext.getSession().map(ConnectorSession::getRuntimeStats).orElse(new RuntimeStats()));
+                            hdfsContext.getSession().map(ConnectorSession::getRuntimeStats).orElseGet(RuntimeStats::new));
                     switch (action.getType()) {
                         case DROP:
                             committer.prepareDropPartition(metastoreContext, schemaTableName, partitionValues);

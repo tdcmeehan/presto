@@ -17,8 +17,7 @@ import com.facebook.presto.spi.SourceLocation;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-
-import javax.annotation.concurrent.Immutable;
+import com.google.errorprone.annotations.Immutable;
 
 import java.util.Collections;
 import java.util.List;
@@ -75,9 +74,8 @@ public final class CteConsumerNode
     @Override
     public PlanNode replaceChildren(List<PlanNode> newChildren)
     {
-        // this function expects a new instance
         checkArgument(newChildren.size() == 0, "expected newChildren to contain 0 node");
-        return new CteConsumerNode(getSourceLocation(), getId(), getStatsEquivalentPlanNode(), originalOutputVariables, cteId, originalSource);
+        return this;
     }
 
     @Override

@@ -13,31 +13,32 @@
  */
 package com.facebook.presto.spi.session;
 
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.common.type.Type;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
 import java.util.function.Function;
 
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.common.type.DoubleType.DOUBLE;
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
+import static com.facebook.presto.common.type.TinyintType.TINYINT;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
-import static java.lang.String.format;
-import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 
 public final class PropertyMetadata<T>
 {
-    private final String name;
-    private final String description;
-    private final Type sqlType;
+    private final SessionPropertyMetadata sessionPropertyMetadata;
     private final Class<T> javaType;
+    private final Type sqlType;
     private final T defaultValue;
-    private final boolean hidden;
     private final Function<Object, T> decoder;
     private final Function<T, Object> encoder;
+    private final List<AdditionalSqlTypeHandler> additionalSqlTypeHandlers = new ArrayList<>();
 
     public PropertyMetadata(
             String name,
@@ -49,28 +50,17 @@ public final class PropertyMetadata<T>
             Function<Object, T> decoder,
             Function<T, Object> encoder)
     {
-        requireNonNull(name, "name is null");
-        requireNonNull(description, "description is null");
-        requireNonNull(sqlType, "type is null");
-        requireNonNull(javaType, "javaType is null");
-        requireNonNull(decoder, "decoder is null");
-        requireNonNull(encoder, "encoder is null");
-
-        if (name.isEmpty() || !name.trim().toLowerCase(ENGLISH).equals(name)) {
-            throw new IllegalArgumentException(format("Invalid property name '%s'", name));
-        }
-        if (description.isEmpty() || !description.trim().equals(description)) {
-            throw new IllegalArgumentException(format("Invalid property description '%s'", description));
-        }
-
-        this.name = name;
-        this.description = description;
-        this.javaType = javaType;
-        this.sqlType = sqlType;
+        this.sqlType = requireNonNull(sqlType, "sqlType is null");
+        this.sessionPropertyMetadata = new SessionPropertyMetadata(
+                name,
+                description,
+                sqlType.getTypeSignature(),
+                defaultValue == null ? "" : defaultValue.toString(),
+                hidden);
+        this.javaType = requireNonNull(javaType, "javaType is null");
         this.defaultValue = defaultValue;
-        this.hidden = hidden;
-        this.decoder = decoder;
-        this.encoder = encoder;
+        this.decoder = requireNonNull(decoder, "decoder is null");
+        this.encoder = requireNonNull(encoder, "encoder is null");
     }
 
     /**
@@ -78,7 +68,7 @@ public final class PropertyMetadata<T>
      */
     public String getName()
     {
-        return name;
+        return sessionPropertyMetadata.getName();
     }
 
     /**
@@ -86,7 +76,7 @@ public final class PropertyMetadata<T>
      */
     public String getDescription()
     {
-        return description;
+        return sessionPropertyMetadata.getDescription();
     }
 
     /**
@@ -95,6 +85,11 @@ public final class PropertyMetadata<T>
     public Type getSqlType()
     {
         return sqlType;
+    }
+
+    public List<AdditionalSqlTypeHandler> getAdditionalSqlTypeHandlers()
+    {
+        return additionalSqlTypeHandlers;
     }
 
     /**
@@ -118,7 +113,7 @@ public final class PropertyMetadata<T>
      */
     public boolean isHidden()
     {
-        return hidden;
+        return sessionPropertyMetadata.isHidden();
     }
 
     /**
@@ -130,11 +125,35 @@ public final class PropertyMetadata<T>
     }
 
     /**
+     * Decodes the SQL type object value to the Java type of the property using a specified decoder.
+     */
+    public T decode(Object value, Function<Object, T> decoder)
+    {
+        return decoder.apply(value);
+    }
+
+    public Function<Object, T> getDecoder()
+    {
+        return decoder;
+    }
+
+    /**
      * Encodes the Java type value to SQL type object value
      */
     public Object encode(T value)
     {
         return encoder.apply(value);
+    }
+
+    public Function<T, Object> getEncoder()
+    {
+        return encoder;
+    }
+
+    public PropertyMetadata<?> withAdditionalTypeHandler(Type additionalSupportedType, Function<Object, T> decoder)
+    {
+        this.additionalSqlTypeHandlers.add(new AdditionalSqlTypeHandler(additionalSupportedType, decoder));
+        return this;
     }
 
     public static PropertyMetadata<Boolean> booleanProperty(String name, String description, Boolean defaultValue, boolean hidden)
@@ -173,6 +192,19 @@ public final class PropertyMetadata<T>
                 defaultValue,
                 hidden,
                 value -> ((Number) value).longValue(),
+                object -> object);
+    }
+
+    public static PropertyMetadata<Byte> tinyIntProperty(String name, String description, Byte defaultValue, boolean hidden)
+    {
+        return new PropertyMetadata<>(
+                name,
+                description,
+                TINYINT,
+                Byte.class,
+                defaultValue,
+                hidden,
+                value -> ((Number) value).byteValue(),
                 object -> object);
     }
 
@@ -226,5 +258,59 @@ public final class PropertyMetadata<T>
                 hidden,
                 value -> Duration.valueOf((String) value),
                 Duration::toString);
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o) {
+            return true;
+        }
+        if (!(o instanceof PropertyMetadata)) {
+            return false;
+        }
+
+        PropertyMetadata<?> that = (PropertyMetadata<?>) o;
+
+        boolean isSessionPropertyMetadataEqual = this.sessionPropertyMetadata.equals(that.sessionPropertyMetadata);
+
+        boolean isJavaTypeEqual = this.javaType.equals(that.javaType);
+        boolean isDefaultValueEqual = (this.defaultValue == null && that.defaultValue == null)
+                || (this.defaultValue != null && this.defaultValue.equals(that.defaultValue));
+
+        return isSessionPropertyMetadataEqual && isJavaTypeEqual && isDefaultValueEqual;
+    }
+
+    @Override
+    public int hashCode()
+    {
+        int result = sessionPropertyMetadata.hashCode();
+
+        result = 31 * result + Objects.hashCode(javaType);
+        result = 31 * result + Objects.hashCode(defaultValue);
+
+        return result;
+    }
+
+    public class AdditionalSqlTypeHandler
+    {
+        Type sqlType;
+        Function<Object, T> decoder;
+
+        public AdditionalSqlTypeHandler(Type sqlType, Function<Object, T> decoder)
+        {
+            this.sqlType = sqlType;
+            this.decoder = decoder;
+        }
+
+        public Function<Object, T> getDecoder()
+        {
+            return decoder;
+        }
+
+        public Type getSqlType()
+        {
+            return sqlType;
+        }
     }
 }

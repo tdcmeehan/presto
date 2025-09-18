@@ -29,10 +29,9 @@ import com.facebook.presto.sql.analyzer.FeaturesConfig.TaskSpillingStrategy;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Ordering;
-
-import javax.annotation.PostConstruct;
-import javax.annotation.PreDestroy;
-import javax.inject.Inject;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import jakarta.inject.Inject;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -149,6 +148,12 @@ public class MemoryRevokingScheduler
             throws InterruptedException
     {
         memoryRevocationExecutor.invokeAll(singletonList((Callable<?>) () -> null));
+    }
+
+    @VisibleForTesting
+    void submitAsynchronousCallable(Callable<?> callable)
+    {
+        memoryRevocationExecutor.submit(callable);
     }
 
     private void onMemoryReserved(MemoryPool memoryPool, QueryId queryId, long queryMemoryReservation)

@@ -22,16 +22,20 @@ import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.json.JsonModule;
 import com.facebook.airlift.json.smile.SmileCodec;
 import com.facebook.airlift.json.smile.SmileModule;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.drift.codec.ThriftCodec;
 import com.facebook.drift.codec.guice.ThriftCodecModule;
 import com.facebook.drift.codec.utils.DataSizeToBytesThriftCodec;
 import com.facebook.drift.codec.utils.DurationToMillisThriftCodec;
 import com.facebook.drift.codec.utils.JodaDateTimeToEpochMillisThriftCodec;
+import com.facebook.drift.codec.utils.LocaleToLanguageTagCodec;
+import com.facebook.presto.SessionTestUtils;
 import com.facebook.presto.client.NodeVersion;
 import com.facebook.presto.common.ErrorCode;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeManager;
-import com.facebook.presto.connector.ConnectorTypeSerdeManager;
+import com.facebook.presto.connector.ConnectorCodecManager;
 import com.facebook.presto.execution.Lifespan;
 import com.facebook.presto.execution.NodeTaskMap;
 import com.facebook.presto.execution.QueryManagerConfig;
@@ -43,6 +47,7 @@ import com.facebook.presto.execution.TaskManagerConfig;
 import com.facebook.presto.execution.TaskSource;
 import com.facebook.presto.execution.TaskState;
 import com.facebook.presto.execution.TaskStatus;
+import com.facebook.presto.execution.TaskTestUtils;
 import com.facebook.presto.execution.TestQueryManager;
 import com.facebook.presto.execution.TestSqlTaskManager;
 import com.facebook.presto.execution.buffer.OutputBuffers;
@@ -51,12 +56,24 @@ import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.metadata.HandleJsonModule;
 import com.facebook.presto.metadata.HandleResolver;
 import com.facebook.presto.metadata.InternalNode;
-import com.facebook.presto.metadata.MetadataUpdates;
 import com.facebook.presto.metadata.Split;
-import com.facebook.presto.server.ConnectorMetadataUpdateHandleJsonSerde;
 import com.facebook.presto.server.InternalCommunicationConfig;
 import com.facebook.presto.server.TaskUpdateRequest;
+import com.facebook.presto.server.thrift.ConnectorSplitThriftCodec;
+import com.facebook.presto.server.thrift.DeleteTableHandleThriftCodec;
+import com.facebook.presto.server.thrift.InsertTableHandleThriftCodec;
+import com.facebook.presto.server.thrift.OutputTableHandleThriftCodec;
+import com.facebook.presto.server.thrift.TableHandleThriftCodec;
+import com.facebook.presto.server.thrift.TableLayoutHandleThriftCodec;
+import com.facebook.presto.server.thrift.TransactionHandleThriftCodec;
+import com.facebook.presto.spi.ConnectorDeleteTableHandle;
 import com.facebook.presto.spi.ConnectorId;
+import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorOutputTableHandle;
+import com.facebook.presto.spi.ConnectorSplit;
+import com.facebook.presto.spi.ConnectorTableHandle;
+import com.facebook.presto.spi.ConnectorTableLayoutHandle;
+import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
 import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.Serialization;
@@ -72,24 +89,22 @@ import com.google.inject.Binder;
 import com.google.inject.Injector;
 import com.google.inject.Module;
 import com.google.inject.Provides;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
+import com.google.inject.Scopes;
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DELETE;
+import jakarta.ws.rs.DefaultValue;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.HeaderParam;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.UriInfo;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
-
-import javax.ws.rs.Consumes;
-import javax.ws.rs.DELETE;
-import javax.ws.rs.DefaultValue;
-import javax.ws.rs.GET;
-import javax.ws.rs.HeaderParam;
-import javax.ws.rs.POST;
-import javax.ws.rs.Path;
-import javax.ws.rs.PathParam;
-import javax.ws.rs.Produces;
-import javax.ws.rs.QueryParam;
-import javax.ws.rs.core.Context;
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.UriInfo;
 
 import java.lang.reflect.Method;
 import java.net.URI;
@@ -110,11 +125,8 @@ import static com.facebook.airlift.json.JsonBinder.jsonBinder;
 import static com.facebook.airlift.json.JsonCodecBinder.jsonCodecBinder;
 import static com.facebook.airlift.json.smile.SmileCodecBinder.smileCodecBinder;
 import static com.facebook.drift.codec.guice.ThriftCodecBinder.thriftCodecBinder;
-import static com.facebook.presto.SessionTestUtils.TEST_SESSION;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_CURRENT_STATE;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_MAX_WAIT;
-import static com.facebook.presto.execution.TaskTestUtils.TABLE_SCAN_NODE_ID;
-import static com.facebook.presto.execution.TaskTestUtils.createPlanFragment;
 import static com.facebook.presto.execution.buffer.OutputBuffers.createInitialEmptyOutputBuffers;
 import static com.facebook.presto.metadata.FunctionAndTypeManager.createTestFunctionAndTypeManager;
 import static com.facebook.presto.metadata.MetadataManager.createTestMetadataManager;
@@ -130,6 +142,7 @@ import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.testng.Assert.assertTrue;
 
 public class TestHttpRemoteTask
@@ -187,15 +200,15 @@ public class TestHttpRemoteTask
         remoteTask.start();
 
         Lifespan lifespan = Lifespan.driverGroup(3);
-        remoteTask.addSplits(ImmutableMultimap.of(TABLE_SCAN_NODE_ID, new Split(new ConnectorId("test"), TestingTransactionHandle.create(), TestingSplit.createLocalSplit(), lifespan, NON_CACHEABLE)));
-        poll(() -> testingTaskResource.getTaskSource(TABLE_SCAN_NODE_ID) != null);
-        poll(() -> testingTaskResource.getTaskSource(TABLE_SCAN_NODE_ID).getSplits().size() == 1);
+        remoteTask.addSplits(ImmutableMultimap.of(TaskTestUtils.TABLE_SCAN_NODE_ID, new Split(new ConnectorId("test"), TestingTransactionHandle.create(), TestingSplit.createLocalSplit(), lifespan, NON_CACHEABLE)));
+        poll(() -> testingTaskResource.getTaskSource(TaskTestUtils.TABLE_SCAN_NODE_ID) != null);
+        poll(() -> testingTaskResource.getTaskSource(TaskTestUtils.TABLE_SCAN_NODE_ID).getSplits().size() == 1);
 
-        remoteTask.noMoreSplits(TABLE_SCAN_NODE_ID, lifespan);
-        poll(() -> testingTaskResource.getTaskSource(TABLE_SCAN_NODE_ID).getNoMoreSplitsForLifespan().size() == 1);
+        remoteTask.noMoreSplits(TaskTestUtils.TABLE_SCAN_NODE_ID, lifespan);
+        poll(() -> testingTaskResource.getTaskSource(TaskTestUtils.TABLE_SCAN_NODE_ID).getNoMoreSplitsForLifespan().size() == 1);
 
-        remoteTask.noMoreSplits(TABLE_SCAN_NODE_ID);
-        poll(() -> testingTaskResource.getTaskSource(TABLE_SCAN_NODE_ID).isNoMoreSplits());
+        remoteTask.noMoreSplits(TaskTestUtils.TABLE_SCAN_NODE_ID);
+        poll(() -> testingTaskResource.getTaskSource(TaskTestUtils.TABLE_SCAN_NODE_ID).isNoMoreSplits());
 
         remoteTask.cancel();
         poll(() -> remoteTask.getTaskStatus().getState().isDone());
@@ -245,12 +258,14 @@ public class TestHttpRemoteTask
         httpRemoteTaskFactory.stop();
 
         assertTrue(remoteTask.getTaskStatus().getState().isDone(), format("TaskStatus is not in a done state: %s", remoteTask.getTaskStatus()));
-        assertEquals(getOnlyElement(remoteTask.getTaskStatus().getFailures()).getMessage(), "TaskUpdate size of 1.97kB has exceeded the limit of 1kB");
+        assertThat(getOnlyElement(remoteTask.getTaskStatus().getFailures()).getMessage())
+                .matches("TaskUpdate size of .+? has exceeded the limit of 1024 bytes");
     }
 
     @Test(dataProvider = "getUpdateSize")
     public void testGetExceededTaskUpdateSizeListMessage(int updateSizeInBytes, int maxDataSizeInBytes,
-                                                         String expectedMessage) throws Exception
+            String expectedMessage)
+            throws Exception
     {
         AtomicLong lastActivityNanos = new AtomicLong(System.nanoTime());
         TestingTaskResource testingTaskResource = new TestingTaskResource(lastActivityNanos, FailureScenario.NO_FAILURE);
@@ -262,10 +277,10 @@ public class TestHttpRemoteTask
         HttpRemoteTaskFactory httpRemoteTaskFactory = createHttpRemoteTaskFactory(testingTaskResource, useThriftEncoding, internalCommunicationConfig);
         RemoteTask remoteTask = createRemoteTask(httpRemoteTaskFactory);
 
-        Method targetMethod = HttpRemoteTask.class.getDeclaredMethod("getExceededTaskUpdateSizeMessage", new Class[]{byte[].class});
+        Method targetMethod = HttpRemoteTask.class.getDeclaredMethod("getExceededTaskUpdateSizeMessage", new Class[] {byte[].class});
         targetMethod.setAccessible(true);
         byte[] taskUpdateRequestJson = new byte[updateSizeInBytes];
-        String message = (String) targetMethod.invoke(remoteTask, new Object[]{taskUpdateRequestJson});
+        String message = (String) targetMethod.invoke(remoteTask, new Object[] {taskUpdateRequestJson});
         assertEquals(message, expectedMessage);
     }
 
@@ -273,15 +288,15 @@ public class TestHttpRemoteTask
     protected Object[][] getUpdateSize()
     {
         return new Object[][] {
-                {2000, 1000, "TaskUpdate size of 1.95kB has exceeded the limit of 1000B"},
-                {2000, 1024, "TaskUpdate size of 1.95kB has exceeded the limit of 1kB"},
-                {5000, 4 * 1024, "TaskUpdate size of 4.88kB has exceeded the limit of 4kB"},
-                {2 * 1024, 1024, "TaskUpdate size of 2kB has exceeded the limit of 1kB"},
-                {1024 * 1024, 512 * 1024, "TaskUpdate size of 1MB has exceeded the limit of 512kB"},
-                {16 * 1024 * 1024, 8 * 1024 * 1024, "TaskUpdate size of 16MB has exceeded the limit of 8MB"},
-                {485 * 1000 * 1000, 1024 * 1024 * 512, "TaskUpdate size of 462.53MB has exceeded the limit of 512MB"},
-                {1024 * 1024 * 1024, 1024 * 1024 * 512, "TaskUpdate size of 1GB has exceeded the limit of 512MB"},
-                {860492511, 524288000, "TaskUpdate size of 820.63MB has exceeded the limit of 500MB"}};
+                {2000, 1000, "TaskUpdate size of 2000 bytes has exceeded the limit of 1000 bytes"},
+                {2000, 1024, "TaskUpdate size of 2000 bytes has exceeded the limit of 1024 bytes"},
+                {5000, 4 * 1024, "TaskUpdate size of 5000 bytes has exceeded the limit of 4096 bytes"},
+                {2 * 1024, 1024, "TaskUpdate size of 2048 bytes has exceeded the limit of 1024 bytes"},
+                {1024 * 1024, 512 * 1024, "TaskUpdate size of 1048576 bytes has exceeded the limit of 524288 bytes"},
+                {16 * 1024 * 1024, 8 * 1024 * 1024, "TaskUpdate size of 16777216 bytes has exceeded the limit of 8388608 bytes"},
+                {485 * 1000 * 1000, 1024 * 1024 * 512, "TaskUpdate size of 485000000 bytes has exceeded the limit of 536870912 bytes"},
+                {1024 * 1024 * 1024, 1024 * 1024 * 512, "TaskUpdate size of 1073741824 bytes has exceeded the limit of 536870912 bytes"},
+                {860492511, 524288000, "TaskUpdate size of 860492511 bytes has exceeded the limit of 524288000 bytes"}};
     }
 
     private void runTest(FailureScenario failureScenario, boolean useThriftEncoding)
@@ -320,15 +335,15 @@ public class TestHttpRemoteTask
     private RemoteTask createRemoteTask(HttpRemoteTaskFactory httpRemoteTaskFactory)
     {
         return httpRemoteTaskFactory.createRemoteTask(
-                TEST_SESSION,
+                SessionTestUtils.TEST_SESSION,
                 new TaskId("test", 1, 0, 2, 0),
                 new InternalNode("node-id", URI.create("http://fake.invalid/"), new NodeVersion("version"), false),
-                createPlanFragment(),
+                TaskTestUtils.createPlanFragment(),
                 ImmutableMultimap.of(),
                 createInitialEmptyOutputBuffers(OutputBuffers.BufferType.BROADCAST),
                 new NodeTaskMap.NodeStatsTracker(i -> {}, i -> {}, (age, i) -> {}),
                 true,
-                new TableWriteInfo(Optional.empty(), Optional.empty(), Optional.empty()),
+                new TableWriteInfo(Optional.empty(), Optional.empty()),
                 SchedulerStatsTracker.NOOP);
     }
 
@@ -363,16 +378,34 @@ public class TestHttpRemoteTask
                         smileCodecBinder(binder).bindSmileCodec(TaskInfo.class);
                         smileCodecBinder(binder).bindSmileCodec(TaskUpdateRequest.class);
                         smileCodecBinder(binder).bindSmileCodec(PlanFragment.class);
-                        smileCodecBinder(binder).bindSmileCodec(MetadataUpdates.class);
                         jsonCodecBinder(binder).bindJsonCodec(TaskStatus.class);
                         jsonCodecBinder(binder).bindJsonCodec(TaskInfo.class);
                         jsonCodecBinder(binder).bindJsonCodec(TaskUpdateRequest.class);
                         jsonCodecBinder(binder).bindJsonCodec(PlanFragment.class);
-                        jsonCodecBinder(binder).bindJsonCodec(MetadataUpdates.class);
+                        jsonCodecBinder(binder).bindJsonCodec(TableWriteInfo.class);
                         jsonBinder(binder).addKeySerializerBinding(VariableReferenceExpression.class).to(Serialization.VariableReferenceExpressionSerializer.class);
                         jsonBinder(binder).addKeyDeserializerBinding(VariableReferenceExpression.class).to(Serialization.VariableReferenceExpressionDeserializer.class);
+                        jsonCodecBinder(binder).bindJsonCodec(ConnectorSplit.class);
+                        jsonCodecBinder(binder).bindJsonCodec(ConnectorTransactionHandle.class);
+                        jsonCodecBinder(binder).bindJsonCodec(ConnectorOutputTableHandle.class);
+                        jsonCodecBinder(binder).bindJsonCodec(ConnectorDeleteTableHandle.class);
+                        jsonCodecBinder(binder).bindJsonCodec(ConnectorInsertTableHandle.class);
+                        jsonCodecBinder(binder).bindJsonCodec(ConnectorTableHandle.class);
+                        jsonCodecBinder(binder).bindJsonCodec(ConnectorTableLayoutHandle.class);
+
+                        binder.bind(ConnectorCodecManager.class).in(Scopes.SINGLETON);
+
+                        thriftCodecBinder(binder).bindCustomThriftCodec(ConnectorSplitThriftCodec.class);
+                        thriftCodecBinder(binder).bindCustomThriftCodec(TransactionHandleThriftCodec.class);
+                        thriftCodecBinder(binder).bindCustomThriftCodec(OutputTableHandleThriftCodec.class);
+                        thriftCodecBinder(binder).bindCustomThriftCodec(InsertTableHandleThriftCodec.class);
+                        thriftCodecBinder(binder).bindCustomThriftCodec(DeleteTableHandleThriftCodec.class);
+                        thriftCodecBinder(binder).bindCustomThriftCodec(TableHandleThriftCodec.class);
+                        thriftCodecBinder(binder).bindCustomThriftCodec(TableLayoutHandleThriftCodec.class);
                         thriftCodecBinder(binder).bindThriftCodec(TaskStatus.class);
                         thriftCodecBinder(binder).bindThriftCodec(TaskInfo.class);
+                        thriftCodecBinder(binder).bindThriftCodec(TaskUpdateRequest.class);
+                        thriftCodecBinder(binder).bindCustomThriftCodec(LocaleToLanguageTagCodec.class);
                         thriftCodecBinder(binder).bindCustomThriftCodec(JodaDateTimeToEpochMillisThriftCodec.class);
                         thriftCodecBinder(binder).bindCustomThriftCodec(DurationToMillisThriftCodec.class);
                         thriftCodecBinder(binder).bindCustomThriftCodec(DataSizeToBytesThriftCodec.class);
@@ -390,10 +423,9 @@ public class TestHttpRemoteTask
                             SmileCodec<TaskInfo> taskInfoSmileCodec,
                             JsonCodec<TaskUpdateRequest> taskUpdateRequestJsonCodec,
                             SmileCodec<TaskUpdateRequest> taskUpdateRequestSmileCodec,
+                            ThriftCodec<TaskUpdateRequest> taskUpdateRequestThriftCodec,
                             JsonCodec<PlanFragment> planFragmentJsonCodec,
-                            SmileCodec<PlanFragment> planFragmentSmileCodec,
-                            JsonCodec<MetadataUpdates> metadataUpdatesJsonCodec,
-                            SmileCodec<MetadataUpdates> metadataUpdatesSmileCodec)
+                            SmileCodec<PlanFragment> planFragmentSmileCodec)
                     {
                         JaxrsTestingHttpProcessor jaxrsTestingHttpProcessor = new JaxrsTestingHttpProcessor(URI.create("http://fake.invalid/"), testingTaskResource, jsonMapper, thriftMapper);
                         TestingHttpClient testingHttpClient = new TestingHttpClient(jaxrsTestingHttpProcessor.setTrace(TRACE_HTTP));
@@ -411,16 +443,14 @@ public class TestHttpRemoteTask
                                 taskInfoThriftCodec,
                                 taskUpdateRequestJsonCodec,
                                 taskUpdateRequestSmileCodec,
+                                taskUpdateRequestThriftCodec,
                                 planFragmentJsonCodec,
                                 planFragmentSmileCodec,
-                                metadataUpdatesJsonCodec,
-                                metadataUpdatesSmileCodec,
                                 new RemoteTaskStats(),
                                 internalCommunicationConfig,
                                 createTestMetadataManager(),
                                 new TestQueryManager(),
-                                new HandleResolver(),
-                                new ConnectorTypeSerdeManager(new ConnectorMetadataUpdateHandleJsonSerde()));
+                                new HandleResolver());
                     }
                 });
         Injector injector = app
@@ -601,12 +631,11 @@ public class TestHttpRemoteTask
             return new TaskInfo(
                     initialTaskInfo.getTaskId(),
                     buildTaskStatus(),
-                    initialTaskInfo.getLastHeartbeat(),
+                    initialTaskInfo.getLastHeartbeatInMillis(),
                     initialTaskInfo.getOutputBuffers(),
                     initialTaskInfo.getNoMoreSplits(),
                     initialTaskInfo.getStats(),
                     initialTaskInfo.isNeedsPlan(),
-                    initialTaskInfo.getMetadataUpdates(),
                     initialTaskInfo.getNodeId());
         }
 

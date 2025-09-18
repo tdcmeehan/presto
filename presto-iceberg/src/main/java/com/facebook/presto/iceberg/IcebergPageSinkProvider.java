@@ -25,12 +25,11 @@ import com.facebook.presto.spi.PageSinkContext;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.connector.ConnectorPageSinkProvider;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
+import jakarta.inject.Inject;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.io.LocationProvider;
-
-import javax.inject.Inject;
 
 import java.util.Optional;
 
@@ -48,6 +47,7 @@ public class IcebergPageSinkProvider
     private final IcebergFileWriterFactory fileWriterFactory;
     private final PageIndexerFactory pageIndexerFactory;
     private final int maxOpenPartitions;
+    private final SortParameters sortParameters;
 
     @Inject
     public IcebergPageSinkProvider(
@@ -55,7 +55,8 @@ public class IcebergPageSinkProvider
             JsonCodec<CommitTaskData> jsonCodec,
             IcebergFileWriterFactory fileWriterFactory,
             PageIndexerFactory pageIndexerFactory,
-            IcebergConfig icebergConfig)
+            IcebergConfig icebergConfig,
+            SortParameters sortParameters)
     {
         this.hdfsEnvironment = requireNonNull(hdfsEnvironment, "hdfsEnvironment is null");
         this.jsonCodec = requireNonNull(jsonCodec, "jsonCodec is null");
@@ -63,6 +64,7 @@ public class IcebergPageSinkProvider
         this.pageIndexerFactory = requireNonNull(pageIndexerFactory, "pageIndexerFactory is null");
         requireNonNull(icebergConfig, "icebergConfig is null");
         this.maxOpenPartitions = icebergConfig.getMaxPartitionsPerWriter();
+        this.sortParameters = sortParameters;
     }
 
     @Override
@@ -96,6 +98,8 @@ public class IcebergPageSinkProvider
                 jsonCodec,
                 session,
                 tableHandle.getFileFormat(),
-                maxOpenPartitions);
+                maxOpenPartitions,
+                tableHandle.getSortOrder(),
+                sortParameters);
     }
 }

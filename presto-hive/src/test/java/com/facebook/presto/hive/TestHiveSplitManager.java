@@ -147,6 +147,7 @@ public class TestHiveSplitManager
     private static final Table TEST_TABLE = createTestTable(VIEW_STORAGE_FORMAT, ImmutableMap.of());
 
     private ListeningExecutorService executor;
+    private static final String TEST_CATALOG_NAME = "catalogName";
 
     @BeforeClass
     public void setUp()
@@ -162,7 +163,8 @@ public class TestHiveSplitManager
 
     private static Table createTestTable(StorageFormat storageFormat, Map<String, String> parameters)
     {
-        return new Table("test_db",
+        return new Table(Optional.of(TEST_CATALOG_NAME),
+                "test_db",
                 "test_table",
                 "test_owner",
                 MANAGED_TABLE,
@@ -472,8 +474,7 @@ public class TestHiveSplitManager
 
         // Prepare partition with stats
         PartitionWithStatistics partitionWithStatistics = new PartitionWithStatistics(
-                new Partition(
-                        "test_db",
+                new Partition("test_db",
                         "test_table",
                         ImmutableList.of(PARTITION_VALUE),
                         new Storage(
@@ -499,8 +500,9 @@ public class TestHiveSplitManager
                 new HiveHdfsConfiguration(new HdfsConfigurationInitializer(hiveClientConfig, new MetastoreClientConfig()), ImmutableSet.of(), hiveClientConfig),
                 new MetastoreClientConfig(),
                 new NoHdfsAuthentication());
+        TestingExtendedHiveMetastore metastore = new TestingExtendedHiveMetastore(TEST_TABLE, partitionWithStatistics);
         HiveMetadataFactory metadataFactory = new HiveMetadataFactory(
-                new TestingExtendedHiveMetastore(TEST_TABLE, partitionWithStatistics),
+                metastore,
                 hdfsEnvironment,
                 new HivePartitionManager(FUNCTION_AND_TYPE_MANAGER, hiveClientConfig),
                 DateTimeZone.forOffsetHours(1),
@@ -529,9 +531,8 @@ public class TestHiveSplitManager
                 new HivePartitionObjectBuilder(),
                 new HiveEncryptionInformationProvider(ImmutableList.of()),
                 new HivePartitionStats(),
-                new HiveFileRenamer(),
                 HiveColumnConverterProvider.DEFAULT_COLUMN_CONVERTER_PROVIDER,
-                new QuickStatsProvider(HDFS_ENVIRONMENT, DO_NOTHING_DIRECTORY_LISTER, new HiveClientConfig(), new NamenodeStats(), ImmutableList.of()),
+                new QuickStatsProvider(metastore, HDFS_ENVIRONMENT, DO_NOTHING_DIRECTORY_LISTER, new HiveClientConfig(), new NamenodeStats(), ImmutableList.of()),
                 new HiveTableWritabilityChecker(false));
 
         HiveSplitManager splitManager = new HiveSplitManager(
@@ -646,8 +647,9 @@ public class TestHiveSplitManager
                 new NoHdfsAuthentication());
         HiveEncryptionInformationProvider encryptionInformationProvider = new HiveEncryptionInformationProvider(ImmutableList.of(new TestDwrfEncryptionInformationSource()));
 
+        TestingExtendedHiveMetastore metastore = new TestingExtendedHiveMetastore(testTable, partitionWithStatistics);
         HiveMetadataFactory metadataFactory = new HiveMetadataFactory(
-                new TestingExtendedHiveMetastore(testTable, partitionWithStatistics),
+                metastore,
                 hdfsEnvironment,
                 new HivePartitionManager(FUNCTION_AND_TYPE_MANAGER, hiveClientConfig),
                 DateTimeZone.forOffsetHours(1),
@@ -676,9 +678,8 @@ public class TestHiveSplitManager
                 new HivePartitionObjectBuilder(),
                 encryptionInformationProvider,
                 new HivePartitionStats(),
-                new HiveFileRenamer(),
                 HiveColumnConverterProvider.DEFAULT_COLUMN_CONVERTER_PROVIDER,
-                new QuickStatsProvider(HDFS_ENVIRONMENT, DO_NOTHING_DIRECTORY_LISTER, new HiveClientConfig(), new NamenodeStats(), ImmutableList.of()),
+                new QuickStatsProvider(metastore, HDFS_ENVIRONMENT, DO_NOTHING_DIRECTORY_LISTER, new HiveClientConfig(), new NamenodeStats(), ImmutableList.of()),
                 new HiveTableWritabilityChecker(false));
 
         HiveSplitManager splitManager = new HiveSplitManager(
@@ -811,11 +812,11 @@ public class TestHiveSplitManager
         {
             try {
                 return ImmutableList.of(
-                        createHiveFileInfo(
-                                new LocatedFileStatus(
-                                        new FileStatus(0, false, 1, 0, 0, path),
-                                        new BlockLocation[] {}),
-                                Optional.empty()))
+                                createHiveFileInfo(
+                                        new LocatedFileStatus(
+                                                new FileStatus(0, false, 1, 0, 0, new Path(path.toString() + "/" + "test_file_name")),
+                                                new BlockLocation[] {}),
+                                        Optional.empty()))
                         .iterator();
             }
             catch (IOException e) {

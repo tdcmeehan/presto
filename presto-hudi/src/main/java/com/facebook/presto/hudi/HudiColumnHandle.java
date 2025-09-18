@@ -119,7 +119,16 @@ public class HudiColumnHandle
         return ColumnMetadata.builder()
                 .setName(name)
                 .setType(hiveType.getType(typeManager))
-                .setExtraInfo(getExtraInfo())
+                .setExtraInfo(getExtraInfo().orElse(null))
+                .build();
+    }
+
+    public ColumnMetadata toColumnMetadata(TypeManager typeManager, String name)
+    {
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(hiveType.getType(typeManager))
+                .setExtraInfo(getExtraInfo().orElse(null))
                 .build();
     }
 

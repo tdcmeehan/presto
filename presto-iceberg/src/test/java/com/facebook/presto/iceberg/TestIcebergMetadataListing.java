@@ -40,6 +40,7 @@ public class TestIcebergMetadataListing
         extends AbstractTestQueryFramework
 {
     private static final int TEST_TIMEOUT = 10_000;
+
     @Override
     protected QueryRunner createQueryRunner()
             throws Exception
@@ -118,7 +119,7 @@ public class TestIcebergMetadataListing
     @Test
     public void testTableDescribing()
     {
-        assertQuery("DESCRIBE iceberg.test_schema.iceberg_table1", "VALUES ('_string', 'varchar', '', ''), ('_integer', 'integer', '', '')");
+        assertQuery("DESCRIBE iceberg.test_schema.iceberg_table1", "VALUES ('_string', 'varchar', '', '', null, null, 2147483647L), ('_integer', 'integer', '', '', 10l, null, null)");
     }
 
     /*
@@ -126,7 +127,7 @@ public class TestIcebergMetadataListing
      * when refreshing Iceberg table metadata. If this test fails, check the refreshFromMetadataLocation method
      * in HiveTableOperations.
      */
-    @Test (timeOut = TEST_TIMEOUT)
+    @Test(timeOut = TEST_TIMEOUT)
     public void testTableDropWithMissingMetadata()
     {
         assertQuerySucceeds("CREATE SCHEMA hive.test_metadata_schema");

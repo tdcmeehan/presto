@@ -101,7 +101,6 @@ public class TypeSignature
         this(TypeSignatureBase.of(base), parameters);
     }
 
-    @ThriftConstructor
     public TypeSignature(TypeSignatureBase typeSignatureBase, List<TypeSignatureParameter> parameters)
     {
         this.base = typeSignatureBase;
@@ -111,12 +110,18 @@ public class TypeSignature
         this.calculated = parameters.stream().anyMatch(TypeSignatureParameter::isCalculated);
     }
 
+    // Add a ignore field to avoid construct conflict
+    @ThriftConstructor
+    public TypeSignature(String signature, boolean ignore)
+    {
+        this(parseTypeSignature(signature).getTypeSignatureBase(), parseTypeSignature(signature).getParameters());
+    }
+
     public TypeSignature getStandardTypeSignature()
     {
         return new TypeSignature(base.getStandardTypeBase(), parameters);
     }
 
-    @ThriftField(1)
     public TypeSignatureBase getTypeSignatureBase()
     {
         return base;
@@ -127,23 +132,29 @@ public class TypeSignature
         return base.toString();
     }
 
-    @ThriftField(2)
     public List<TypeSignatureParameter> getParameters()
     {
         return parameters;
     }
 
-    public List<TypeSignature> getTypeParametersAsTypeSignatures()
+    public List<TypeSignature> getTypeOrNamedTypeParametersAsTypeSignatures()
     {
         List<TypeSignature> result = new ArrayList<>();
         for (TypeSignatureParameter parameter : parameters) {
-            if (parameter.getKind() != ParameterKind.TYPE) {
-                throw new IllegalStateException(
-                        format("Expected all parameters to be TypeSignatures but [%s] was found", parameter.toString()));
+            switch (parameter.getKind()) {
+                case TYPE:
+                    result.add(parameter.getTypeSignature());
+                    break;
+                case NAMED_TYPE:
+                    result.add(parameter.getNamedTypeSignature().getTypeSignature());
+                    break;
+                default:
+                    throw new IllegalStateException(
+                            format("Expected all parameters to be of kind TYPE or NAMED_TYPE but [%s] kind was found for parameter: [%s]",
+                                    parameter.getKind(), parameter));
             }
-            result.add(parameter.getTypeSignature());
         }
-        return result;
+        return unmodifiableList(result);
     }
 
     public boolean isCalculated()
@@ -693,6 +704,7 @@ public class TypeSignature
 
     @Override
     @JsonValue
+    @ThriftField(value = 1, name = "signature")
     public String toString()
     {
         String baseString = base.toString();
@@ -714,6 +726,12 @@ public class TypeSignature
         }
         typeName.append(")");
         return typeName.toString();
+    }
+
+    @ThriftField(2)
+    public boolean getIgnore()
+    {
+        return true;
     }
 
     private static void checkArgument(boolean argument, String format, Object... args)

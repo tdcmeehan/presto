@@ -44,10 +44,9 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
 import com.google.common.primitives.Ints;
 import io.airlift.slice.Slice;
+import jakarta.annotation.Nullable;
 import org.joda.time.DateTimeZone;
 import org.openjdk.jol.info.ClassLayout;
-
-import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -188,7 +187,8 @@ public class OrcSelectiveRecordReader
             StripeMetadataSource stripeMetadataSource,
             boolean cacheable,
             RuntimeStats runtimeStats,
-            Optional<OrcFileIntrospector> fileIntrospector)
+            Optional<OrcFileIntrospector> fileIntrospector,
+            long fileModificationTime)
     {
         super(includedColumns,
                 requiredSubfields,
@@ -231,7 +231,8 @@ public class OrcSelectiveRecordReader
                 stripeMetadataSource,
                 cacheable,
                 runtimeStats,
-                fileIntrospector);
+                fileIntrospector,
+                fileModificationTime);
 
         // Hive column indices can't be used to index into arrays because they are negative
         // for partition and hidden columns. Hence, we create synthetic zero-based indices.

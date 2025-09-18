@@ -14,8 +14,8 @@
 package com.facebook.presto.router.cluster;
 
 import com.facebook.airlift.http.client.HttpClient;
-
-import javax.inject.Inject;
+import com.facebook.presto.router.RouterConfig;
+import jakarta.inject.Inject;
 
 import java.net.URI;
 
@@ -29,23 +29,29 @@ public class RemoteInfoFactory
 
     private final HttpClient clusterInfoHttpClient;
     private final HttpClient queryInfoHttpClient;
+    private final RouterConfig routerConfig;
+    private final RemoteStateConfig remoteStateConfig;
 
     @Inject
     public RemoteInfoFactory(
             @ForClusterInfoTracker HttpClient clusterInfoHttpClient,
-            @ForQueryInfoTracker HttpClient queryInfoHttpClient)
+            @ForQueryInfoTracker HttpClient queryInfoHttpClient,
+            RouterConfig routerConfig,
+            RemoteStateConfig remoteStateConfig)
     {
         this.clusterInfoHttpClient = requireNonNull(clusterInfoHttpClient, "Http client for cluster info is null");
         this.queryInfoHttpClient = requireNonNull(queryInfoHttpClient, "Http client for cluster info is null");
+        this.routerConfig = requireNonNull(routerConfig, "routerConfig is null");
+        this.remoteStateConfig = requireNonNull(remoteStateConfig, "remoteStateConfig is null");
     }
 
     public RemoteQueryInfo createRemoteQueryInfo(URI uri)
     {
-        return new RemoteQueryInfo(clusterInfoHttpClient, uriBuilderFrom(uri).appendPath(QUERY_INFO).build());
+        return new RemoteQueryInfo(clusterInfoHttpClient, uriBuilderFrom(uri).appendPath(QUERY_INFO).build(), remoteStateConfig, routerConfig);
     }
 
     public RemoteClusterInfo createRemoteClusterInfo(URI uri)
     {
-        return new RemoteClusterInfo(queryInfoHttpClient, uriBuilderFrom(uri).appendPath(CLUSTER_INFO).build());
+        return new RemoteClusterInfo(queryInfoHttpClient, uriBuilderFrom(uri).appendPath(CLUSTER_INFO).build(), remoteStateConfig, routerConfig);
     }
 }

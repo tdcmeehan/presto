@@ -19,7 +19,6 @@
 #include "presto_cpp/main/thrift/ThriftIO.h"
 #include "presto_cpp/main/thrift/gen-cpp2/PrestoThrift.h"
 #include "presto_cpp/main/types/PrestoToVeloxQueryPlan.h"
-#include "velox/common/time/Timer.h"
 
 namespace facebook::presto {
 
@@ -205,52 +204,72 @@ proxygen::RequestHandler* TaskResource::acknowledgeResults(
 }
 
 proxygen::RequestHandler* TaskResource::createOrUpdateTaskImpl(
-    proxygen::HTTPMessage* /*message*/,
+    proxygen::HTTPMessage* message,
     const std::vector<std::string>& pathMatch,
     const std::function<std::unique_ptr<protocol::TaskInfo>(
         const protocol::TaskId& taskId,
-        const std::string& updateJson,
-        long startProcessCpuTime)>& createOrUpdateFunc) {
+        const std::string& requestBody,
+        const bool summarize,
+        long startProcessCpuTime,
+        bool receiveThrift)>& createOrUpdateFunc) {
   protocol::TaskId taskId = pathMatch[1];
+  bool summarize = message->hasQueryParam("summarize");
+
+  const auto& headers = message->getHeaders();
+  const auto& acceptHeader = headers.getSingleOrEmpty(proxygen::HTTP_HEADER_ACCEPT);
+  const auto sendThrift =
+      acceptHeader.find(http::kMimeTypeApplicationThrift) != std::string::npos;
+  const auto& contentHeader = headers.getSingleOrEmpty(proxygen::HTTP_HEADER_CONTENT_TYPE);
+  const auto receiveThrift =
+      contentHeader.find(http::kMimeTypeApplicationThrift) != std::string::npos;
+
   return new http::CallbackRequestHandler(
-      [this, taskId, createOrUpdateFunc](
+      [this, taskId, summarize, createOrUpdateFunc, sendThrift, receiveThrift](
           proxygen::HTTPMessage* /*message*/,
           const std::vector<std::unique_ptr<folly::IOBuf>>& body,
           proxygen::ResponseHandler* downstream,
           std::shared_ptr<http::CallbackRequestHandlerState> handlerState) {
         folly::via(
             httpSrvCpuExecutor_,
-            [this, &body, taskId, createOrUpdateFunc]() {
+            [this,
+             requestBody = util::extractMessageBody(body),
+             taskId,
+             summarize,
+             createOrUpdateFunc,
+             receiveThrift]() {
               const auto startProcessCpuTimeNs = util::getProcessCpuTimeNs();
-
-              // TODO Avoid copy
-              std::ostringstream oss;
-              for (auto& buf : body) {
-                oss << std::string((const char*)buf->data(), buf->length());
-              }
-              std::string updateJson = oss.str();
 
               std::unique_ptr<protocol::TaskInfo> taskInfo;
               try {
                 taskInfo = createOrUpdateFunc(
-                    taskId, updateJson, startProcessCpuTimeNs);
+                    taskId, requestBody, summarize, startProcessCpuTimeNs, receiveThrift);
               } catch (const velox::VeloxException& e) {
                 // Creating an empty task, putting errors inside so that next
                 // status fetch from coordinator will catch the error and well
                 // categorize it.
                 try {
                   taskInfo = taskManager_.createOrUpdateErrorTask(
-                      taskId, std::current_exception(), startProcessCpuTimeNs);
+                      taskId,
+                      std::current_exception(),
+                      summarize,
+                      startProcessCpuTimeNs);
                 } catch (const velox::VeloxUserError& e) {
                   throw;
                 }
               }
-              return json(*taskInfo);
+              return taskInfo;
             })
             .via(folly::EventBaseManager::get()->getEventBase())
-            .thenValue([downstream, handlerState](auto&& taskInfoJson) {
+            .thenValue([downstream, handlerState, sendThrift](auto taskInfo) {
               if (!handlerState->requestExpired()) {
-                http::sendOkResponse(downstream, taskInfoJson);
+                if (sendThrift) {
+                  thrift::TaskInfo thriftTaskInfo;
+                  toThrift(*taskInfo, thriftTaskInfo);
+                  http::sendOkThriftResponse(
+                      downstream, thriftWrite(thriftTaskInfo));
+                } else {
+                  http::sendOkResponse(downstream, json(*taskInfo));
+                }
               }
             })
             .thenError(
@@ -277,10 +296,12 @@ proxygen::RequestHandler* TaskResource::createOrUpdateBatchTask(
       message,
       pathMatch,
       [&](const protocol::TaskId& taskId,
-          const std::string& updateJson,
-          long startProcessCpuTime) {
+          const std::string& requestBody,
+          const bool summarize,
+          long startProcessCpuTime,
+          bool /*receiveThrift*/) {
         protocol::BatchTaskUpdateRequest batchUpdateRequest =
-            json::parse(updateJson);
+            json::parse(requestBody);
         auto updateRequest = batchUpdateRequest.taskUpdateRequest;
         VELOX_USER_CHECK_NOT_NULL(updateRequest.fragment);
 
@@ -300,7 +321,7 @@ proxygen::RequestHandler* TaskResource::createOrUpdateBatchTask(
 
         auto queryCtx =
             taskManager_.getQueryContextManager()->findOrCreateQueryCtx(
-                taskId, updateRequest.session);
+                taskId, updateRequest);
 
         VeloxBatchQueryPlanConverter converter(
             shuffleName,
@@ -315,6 +336,7 @@ proxygen::RequestHandler* TaskResource::createOrUpdateBatchTask(
             taskId,
             batchUpdateRequest,
             planFragment,
+            summarize,
             std::move(queryCtx),
             startProcessCpuTime);
       });
@@ -327,19 +349,26 @@ proxygen::RequestHandler* TaskResource::createOrUpdateTask(
       message,
       pathMatch,
       [&](const protocol::TaskId& taskId,
-          const std::string& updateJson,
-          long startProcessCpuTime) {
-        protocol::TaskUpdateRequest updateRequest = json::parse(updateJson);
+          const std::string& requestBody,
+          const bool summarize,
+          long startProcessCpuTime,
+          bool receiveThrift) {
+        protocol::TaskUpdateRequest updateRequest;
+        if (receiveThrift) {
+          auto thriftTaskUpdateRequest = std::make_shared<thrift::TaskUpdateRequest>();
+          thriftRead(requestBody, thriftTaskUpdateRequest);
+          fromThrift(*thriftTaskUpdateRequest, updateRequest);
+        } else {
+          updateRequest = json::parse(requestBody);
+        }
         velox::core::PlanFragment planFragment;
         std::shared_ptr<velox::core::QueryCtx> queryCtx;
         if (updateRequest.fragment) {
-          auto fragment =
-              velox::encoding::Base64::decode(*updateRequest.fragment);
-          protocol::PlanFragment prestoPlan = json::parse(fragment);
+          protocol::PlanFragment prestoPlan = json::parse(receiveThrift ? *updateRequest.fragment : velox::encoding::Base64::decode(*updateRequest.fragment));
 
           queryCtx =
               taskManager_.getQueryContextManager()->findOrCreateQueryCtx(
-                  taskId, updateRequest.session);
+                  taskId, updateRequest);
 
           VeloxInteractiveQueryPlanConverter converter(queryCtx.get(), pool_);
           planFragment = converter.toVeloxQueryPlan(
@@ -351,6 +380,7 @@ proxygen::RequestHandler* TaskResource::createOrUpdateTask(
             taskId,
             updateRequest,
             planFragment,
+            summarize,
             std::move(queryCtx),
             startProcessCpuTime);
       });
@@ -365,27 +395,40 @@ proxygen::RequestHandler* TaskResource::deleteTask(
     abort =
         message->getQueryParam(protocol::PRESTO_ABORT_TASK_URL_PARAM) == "true";
   }
+  bool summarize = message->hasQueryParam("summarize");
+  const auto& headers = message->getHeaders();
+  const auto& acceptHeader = headers.getSingleOrEmpty(proxygen::HTTP_HEADER_ACCEPT);
+  const auto sendThrift =
+      acceptHeader.find(http::kMimeTypeApplicationThrift) != std::string::npos;
 
   return new http::CallbackRequestHandler(
-      [this, taskId, abort](
+      [this, taskId, abort, summarize, sendThrift](
           proxygen::HTTPMessage* /*message*/,
           const std::vector<std::unique_ptr<folly::IOBuf>>& /*body*/,
           proxygen::ResponseHandler* downstream,
           std::shared_ptr<http::CallbackRequestHandlerState> handlerState) {
         folly::via(
             httpSrvCpuExecutor_,
-            [this, taskId, abort, downstream]() {
+            [this, taskId, abort, downstream, summarize]() {
               std::unique_ptr<protocol::TaskInfo> taskInfo;
-              taskInfo = taskManager_.deleteTask(taskId, abort);
+              taskInfo = taskManager_.deleteTask(taskId, abort, summarize);
               return std::move(taskInfo);
             })
             .via(folly::EventBaseManager::get()->getEventBase())
-            .thenValue([taskId, downstream, handlerState](auto&& taskInfo) {
+            .thenValue([taskId, downstream, handlerState, sendThrift](auto&& taskInfo) {
               if (!handlerState->requestExpired()) {
                 if (taskInfo == nullptr) {
                   sendTaskNotFound(downstream, taskId);
+                  return;
                 }
-                http::sendOkResponse(downstream, json(*taskInfo));
+                if (sendThrift) {
+                  thrift::TaskInfo thriftTaskInfo;
+                  toThrift(*taskInfo, thriftTaskInfo);
+                  http::sendOkThriftResponse(
+                      downstream, thriftWrite(thriftTaskInfo));
+                } else {
+                  http::sendOkResponse(downstream, json(*taskInfo));
+                }
               }
             })
             .thenError(
@@ -417,7 +460,7 @@ proxygen::RequestHandler* TaskResource::getResults(
   auto maxWait = getMaxWait(message).value_or(
       protocol::Duration(protocol::PRESTO_MAX_WAIT_DEFAULT));
   protocol::DataSize maxSize;
-  if (getDataSize || headers.exists(protocol::PRESTO_GET_DATA_SIZE_HEADER)) {
+  if (getDataSize) {
     maxSize = protocol::DataSize(0, protocol::DataUnit::BYTE);
   } else {
     maxSize = protocol::DataSize(
@@ -506,13 +549,13 @@ proxygen::RequestHandler* TaskResource::getTaskStatus(
   auto currentState = getCurrentState(message);
   auto maxWait = getMaxWait(message);
 
-  auto& headers = message->getHeaders();
-  auto acceptHeader = headers.getSingleOrEmpty(proxygen::HTTP_HEADER_ACCEPT);
-  auto useThrift =
+  const auto& headers = message->getHeaders();
+  const auto& acceptHeader = headers.getSingleOrEmpty(proxygen::HTTP_HEADER_ACCEPT);
+  const auto sendThrift =
       acceptHeader.find(http::kMimeTypeApplicationThrift) != std::string::npos;
 
   return new http::CallbackRequestHandler(
-      [this, useThrift, taskId, currentState, maxWait](
+      [this, sendThrift, taskId, currentState, maxWait](
           proxygen::HTTPMessage* /*message*/,
           const std::vector<std::unique_ptr<folly::IOBuf>>& /*body*/,
           proxygen::ResponseHandler* downstream,
@@ -522,7 +565,7 @@ proxygen::RequestHandler* TaskResource::getTaskStatus(
             httpSrvCpuExecutor_,
             [this,
              evb,
-             useThrift,
+             sendThrift,
              taskId,
              currentState,
              maxWait,
@@ -532,10 +575,10 @@ proxygen::RequestHandler* TaskResource::getTaskStatus(
                   .getTaskStatus(taskId, currentState, maxWait, handlerState)
                   .via(evb)
                   .thenValue(
-                      [useThrift, downstream, taskId, handlerState](
+                      [sendThrift, downstream, taskId, handlerState](
                           std::unique_ptr<protocol::TaskStatus> taskStatus) {
                         if (!handlerState->requestExpired()) {
-                          if (useThrift) {
+                          if (sendThrift) {
                             thrift::TaskStatus thriftTaskStatus;
                             toThrift(*taskStatus, thriftTaskStatus);
                             http::sendOkThriftResponse(
@@ -577,8 +620,13 @@ proxygen::RequestHandler* TaskResource::getTaskInfo(
   auto maxWait = getMaxWait(message);
   bool summarize = message->hasQueryParam("summarize");
 
+  const auto& headers = message->getHeaders();
+  const auto& acceptHeader = headers.getSingleOrEmpty(proxygen::HTTP_HEADER_ACCEPT);
+  const auto sendThrift =
+      acceptHeader.find(http::kMimeTypeApplicationThrift) != std::string::npos;
+
   return new http::CallbackRequestHandler(
-      [this, taskId, currentState, maxWait, summarize](
+      [this, taskId, currentState, maxWait, summarize, sendThrift](
           proxygen::HTTPMessage* /*message*/,
           const std::vector<std::unique_ptr<folly::IOBuf>>& /*body*/,
           proxygen::ResponseHandler* downstream,
@@ -592,16 +640,23 @@ proxygen::RequestHandler* TaskResource::getTaskInfo(
              maxWait,
              summarize,
              handlerState,
-             downstream]() {
+             downstream,
+             sendThrift]() {
               taskManager_
                   .getTaskInfo(
                       taskId, summarize, currentState, maxWait, handlerState)
                   .via(evb)
-                  .thenValue([downstream, taskId, handlerState](
+                  .thenValue([downstream, taskId, handlerState, sendThrift](
                                  std::unique_ptr<protocol::TaskInfo> taskInfo) {
                     if (!handlerState->requestExpired()) {
-                      json taskInfoJson = *taskInfo;
-                      http::sendOkResponse(downstream, taskInfoJson);
+                      if (sendThrift) {
+                        thrift::TaskInfo thriftTaskInfo;
+                        toThrift(*taskInfo, thriftTaskInfo);
+                        http::sendOkThriftResponse(
+                            downstream, thriftWrite(thriftTaskInfo));
+                      } else {
+                        http::sendOkResponse(downstream, json(*taskInfo));
+                      }
                     }
                   })
                   .thenError(

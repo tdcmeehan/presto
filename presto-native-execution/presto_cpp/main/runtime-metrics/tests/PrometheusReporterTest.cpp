@@ -20,8 +20,10 @@ namespace facebook::presto::prometheus {
 class PrometheusReporterTest : public testing::Test {
  public:
   void SetUp() override {
-    reporter = std::make_shared<PrometheusStatsReporter>(testLabels);
+    reporter = std::make_shared<PrometheusStatsReporter>(testLabels, 1);
+    multiThreadedReporter =  std::make_shared<PrometheusStatsReporter>(testLabels, 2);
   }
+
   void verifySerializedResult(
       const std::string& fullSerializedResult,
       std::vector<std::string>& expected) {
@@ -32,12 +34,50 @@ class PrometheusReporterTest : public testing::Test {
       EXPECT_EQ(line, expected[i++]);
     }
   }
+
   const std::map<std::string, std::string> testLabels = {
       {"cluster", "test_cluster"},
       {"worker", "test_worker_pod"}};
   const std::string labelsSerialized =
       R"(cluster="test_cluster",worker="test_worker_pod")";
   std::shared_ptr<PrometheusStatsReporter> reporter;
+  std::shared_ptr<PrometheusStatsReporter> multiThreadedReporter;
+};
+
+TEST_F(PrometheusReporterTest, testConcurrentReporting) {
+  multiThreadedReporter->registerMetricExportType(
+      "test.key1", facebook::velox::StatType::COUNT);
+  multiThreadedReporter->registerMetricExportType(
+      "test.key3", facebook::velox::StatType::SUM);
+  EXPECT_EQ(
+      facebook::velox::StatType::COUNT,
+      multiThreadedReporter->registeredMetricsMap_.find("test.key1")->second.statType);
+  EXPECT_EQ(
+      facebook::velox::StatType::SUM,
+      multiThreadedReporter->registeredMetricsMap_.find("test.key3")->second.statType);
+
+  std::vector<size_t> testData = {10, 12, 14};
+  for (auto i : testData) {
+    multiThreadedReporter->addMetricValue("test.key1", i);
+    multiThreadedReporter->addMetricValue("test.key3", i + 2000);
+  }
+
+  // Uses default value of 1 for second parameter.
+  multiThreadedReporter->addMetricValue("test.key1");
+  multiThreadedReporter->addMetricValue("test.key3");
+
+  // Wait for all async updates to finish before validation
+  multiThreadedReporter->waitForCompletion();
+
+  auto fullSerializedResult = multiThreadedReporter->fetchMetrics();
+
+  std::vector<std::string> expected = {
+      "# TYPE test_key1 counter",
+      "test_key1{" + labelsSerialized + "} 37",
+      "# TYPE test_key3 gauge",
+      "test_key3{" + labelsSerialized + "} 6037"};
+
+  verifySerializedResult(fullSerializedResult, expected);
 };
 
 TEST_F(PrometheusReporterTest, testCountAndGauge) {
@@ -62,24 +102,30 @@ TEST_F(PrometheusReporterTest, testCountAndGauge) {
       facebook::velox::StatType::RATE,
       reporter->registeredMetricsMap_.find("test.key4")->second.statType);
 
-  std::vector<size_t> testData = {10, 11, 15};
+  std::vector<size_t> testData = {10, 12, 14};
   for (auto i : testData) {
     reporter->addMetricValue("test.key1", i);
     reporter->addMetricValue("test.key2", i + 1000);
+    reporter->addMetricValue("test.key3", i + 2000);
+    reporter->addMetricValue("test.key4", i + 3000);
   }
+
   // Uses default value of 1 for second parameter.
   reporter->addMetricValue("test.key1");
+  reporter->addMetricValue("test.key3");
+  reporter->waitForCompletion();
+
   auto fullSerializedResult = reporter->fetchMetrics();
 
   std::vector<std::string> expected = {
       "# TYPE test_key1 counter",
       "test_key1{" + labelsSerialized + "} 37",
       "# TYPE test_key2 gauge",
-      "test_key2{" + labelsSerialized + "} 1015",
+      "test_key2{" + labelsSerialized + "} 1014",
       "# TYPE test_key3 gauge",
-      "test_key3{" + labelsSerialized + "} 0",
+      "test_key3{" + labelsSerialized + "} 6037",
       "# TYPE test_key4 gauge",
-      "test_key4{" + labelsSerialized + "} 0"};
+      "test_key4{" + labelsSerialized + "} 3014"};
 
   verifySerializedResult(fullSerializedResult, expected);
 };
@@ -107,6 +153,7 @@ TEST_F(PrometheusReporterTest, testHistogramSummary) {
     }
   }
   reporter->addHistogramMetricValue(histogramKey, 10);
+  reporter->waitForCompletion();
   auto fullSerializedResult = reporter->fetchMetrics();
   std::replace(histSummaryKey.begin(), histSummaryKey.end(), '.', '_');
   std::replace(histogramKey.begin(), histogramKey.end(), '.', '_');

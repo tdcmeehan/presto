@@ -15,8 +15,11 @@ package com.facebook.presto.hive;
 
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.json.smile.SmileCodec;
+import com.facebook.airlift.log.Logger;
 import com.facebook.presto.PagesIndexPageSorter;
+import com.facebook.presto.Session;
 import com.facebook.presto.cache.CacheConfig;
+import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.block.BlockEncodingManager;
 import com.facebook.presto.common.type.ArrayType;
 import com.facebook.presto.common.type.MapType;
@@ -50,7 +53,9 @@ import com.facebook.presto.hive.s3.PrestoS3ClientFactory;
 import com.facebook.presto.hive.s3.PrestoS3ConfigurationUpdater;
 import com.facebook.presto.hive.s3select.S3SelectRecordCursorProvider;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
+import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.MetadataManager;
+import com.facebook.presto.metadata.TableLayout;
 import com.facebook.presto.operator.PagesIndex;
 import com.facebook.presto.orc.StorageStripeMetadataSource;
 import com.facebook.presto.orc.StripeMetadataSourceFactory;
@@ -58,7 +63,9 @@ import com.facebook.presto.orc.cache.StorageOrcFileTailSource;
 import com.facebook.presto.parquet.cache.MetadataReader;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorSession;
+import com.facebook.presto.spi.Constraint;
 import com.facebook.presto.spi.PageSorter;
+import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
 import com.facebook.presto.spi.plan.FilterStatsCalculatorService;
 import com.facebook.presto.spi.relation.DeterminismEvaluator;
@@ -74,26 +81,36 @@ import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.relational.RowExpressionDeterminismEvaluator;
 import com.facebook.presto.sql.relational.RowExpressionDomainTranslator;
 import com.facebook.presto.sql.relational.RowExpressionOptimizer;
+import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.testing.TestingConnectorSession;
+import com.facebook.presto.tests.DistributedQueryRunner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.slice.Slice;
 
+import java.io.File;
 import java.math.BigDecimal;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 import static com.facebook.airlift.json.JsonCodec.jsonCodec;
 import static com.facebook.airlift.json.smile.SmileCodec.smileCodec;
 import static com.facebook.presto.common.type.Decimals.encodeScaledValue;
 import static com.facebook.presto.hive.HiveDwrfEncryptionProvider.NO_ENCRYPTION;
+import static com.facebook.presto.hive.HiveQueryRunner.TPCH_SCHEMA;
+import static com.facebook.presto.transaction.TransactionBuilder.transaction;
 import static java.lang.String.format;
 import static java.util.stream.Collectors.toList;
+import static org.testng.Assert.assertTrue;
 
 public final class HiveTestUtils
 {
+    private static final Logger log = Logger.get(HiveTestUtils.class);
+
     private HiveTestUtils()
     {
     }
@@ -121,7 +138,7 @@ public final class HiveTestUtils
         }
 
         @Override
-        public ExpressionOptimizer getExpressionOptimizer()
+        public ExpressionOptimizer getExpressionOptimizer(ConnectorSession session)
         {
             return new RowExpressionOptimizer(METADATA);
         }
@@ -146,7 +163,7 @@ public final class HiveTestUtils
     };
 
     public static final FilterStatsCalculatorService FILTER_STATS_CALCULATOR_SERVICE = new ConnectorFilterStatsCalculatorService(
-            new FilterStatsCalculator(METADATA, new ScalarStatsCalculator(METADATA), new StatsNormalizer()));
+            new FilterStatsCalculator(METADATA, new ScalarStatsCalculator(METADATA, ROW_EXPRESSION_SERVICE), new StatsNormalizer()));
 
     public static final HiveClientConfig HIVE_CLIENT_CONFIG = new HiveClientConfig();
     public static final MetastoreClientConfig METASTORE_CLIENT_CONFIG = new MetastoreClientConfig();
@@ -183,8 +200,8 @@ public final class HiveTestUtils
         FileFormatDataSourceStats stats = new FileFormatDataSourceStats();
         HdfsEnvironment testHdfsEnvironment = createTestHdfsEnvironment(hiveClientConfig, metastoreClientConfig);
         return ImmutableSet.<HiveAggregatedPageSourceFactory>builder()
-                .add(new OrcAggregatedPageSourceFactory(FUNCTION_AND_TYPE_MANAGER, FUNCTION_RESOLUTION, hiveClientConfig, testHdfsEnvironment, stats, new StorageOrcFileTailSource(), StripeMetadataSourceFactory.of(new StorageStripeMetadataSource())))
-                .add(new DwrfAggregatedPageSourceFactory(FUNCTION_AND_TYPE_MANAGER, FUNCTION_RESOLUTION, hiveClientConfig, testHdfsEnvironment, stats, new StorageOrcFileTailSource(), StripeMetadataSourceFactory.of(new StorageStripeMetadataSource())))
+                .add(new OrcAggregatedPageSourceFactory(FUNCTION_AND_TYPE_MANAGER, FUNCTION_RESOLUTION, testHdfsEnvironment, stats, new StorageOrcFileTailSource(), StripeMetadataSourceFactory.of(new StorageStripeMetadataSource())))
+                .add(new DwrfAggregatedPageSourceFactory(FUNCTION_AND_TYPE_MANAGER, FUNCTION_RESOLUTION, testHdfsEnvironment, stats, new StorageOrcFileTailSource(), StripeMetadataSourceFactory.of(new StorageStripeMetadataSource())))
                 .add(new ParquetAggregatedPageSourceFactory(FUNCTION_AND_TYPE_MANAGER, FUNCTION_RESOLUTION, testHdfsEnvironment, stats, new MetadataReader()))
                 .build();
     }
@@ -312,6 +329,42 @@ public final class HiveTestUtils
         }
     }
 
+    public static Optional<Path> getDataDirectoryPath(Optional<String> suppliedDataDirectoryPath)
+    {
+        Optional<Path> dataDirectory = Optional.empty();
+        if (!suppliedDataDirectoryPath.isPresent()) {
+            //in case the path is not supplied as program argument, read it from env variable.
+            suppliedDataDirectoryPath = getProperty("DATA_DIR");
+        }
+        if (suppliedDataDirectoryPath.isPresent()) {
+            File dataDirectoryFile = new File(suppliedDataDirectoryPath.get());
+            if (dataDirectoryFile.exists()) {
+                if (!dataDirectoryFile.isDirectory()) {
+                    log.error("Error: " + dataDirectoryFile.getAbsolutePath() + " is not a directory.");
+                    System.exit(1);
+                }
+                else if (!dataDirectoryFile.canRead() || !dataDirectoryFile.canWrite()) {
+                    log.error("Error: " + dataDirectoryFile.getAbsolutePath() + " is not readable/writable.");
+                    System.exit(1);
+                }
+            }
+            else {
+                // For user supplied path like [path_exists_but_is_not_readable_or_writable]/[paths_do_not_exist], the hadoop file system won't
+                // be able to create directory for it. e.g. "/aaa/bbb" is not creatable because path "/" is not writable.
+                while (!dataDirectoryFile.exists()) {
+                    dataDirectoryFile = dataDirectoryFile.getParentFile();
+                }
+                if (!dataDirectoryFile.canRead() || !dataDirectoryFile.canWrite()) {
+                    log.error("Error: The ancestor directory " + dataDirectoryFile.getAbsolutePath() + " is not readable/writable.");
+                    System.exit(1);
+                }
+            }
+
+            dataDirectory = Optional.of(dataDirectoryFile.toPath());
+        }
+        return dataDirectory;
+    }
+
     public static List<PropertyMetadata<?>> getAllSessionProperties(HiveClientConfig hiveClientConfig, HiveCommonClientConfig hiveCommonClientConfig)
     {
         return getAllSessionProperties(hiveClientConfig, new ParquetFileWriterConfig(), hiveCommonClientConfig);
@@ -332,5 +385,21 @@ public final class HiveTestUtils
 
         allSessionProperties.addAll(hiveCommonSessionProperties.getSessionProperties());
         return allSessionProperties;
+    }
+
+    public static Object getHiveTableProperty(QueryRunner queryRunner, Session session, String tableName, Function<HiveTableLayoutHandle, Object> propertyGetter)
+    {
+        Metadata metadata = ((DistributedQueryRunner) queryRunner).getCoordinator().getMetadata();
+
+        return transaction(queryRunner.getTransactionManager(), queryRunner.getAccessControl())
+                .readOnly()
+                .execute(session, transactionSession -> {
+                    Optional<TableHandle> tableHandle = metadata.getMetadataResolver(transactionSession).getTableHandle(new QualifiedObjectName("hive", TPCH_SCHEMA, tableName));
+                    assertTrue(tableHandle.isPresent());
+
+                    TableLayout layout = metadata.getLayout(transactionSession, tableHandle.get(), Constraint.alwaysTrue(), Optional.empty())
+                            .getLayout();
+                    return propertyGetter.apply((HiveTableLayoutHandle) layout.getNewTableHandle().getLayout().get());
+                });
     }
 }

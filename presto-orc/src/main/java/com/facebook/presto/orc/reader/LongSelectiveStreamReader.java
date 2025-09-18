@@ -23,9 +23,8 @@ import com.facebook.presto.orc.Stripe;
 import com.facebook.presto.orc.metadata.ColumnEncoding;
 import com.facebook.presto.orc.stream.InputStreamSources;
 import com.google.common.io.Closer;
+import jakarta.annotation.Nullable;
 import org.openjdk.jol.info.ClassLayout;
-
-import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -51,9 +50,11 @@ public class LongSelectiveStreamReader
             Optional<TupleDomainFilter> filter,
             Optional<Type> outputType,
             OrcAggregatedMemoryContext systemMemoryContext,
-            boolean isLowMemory)
+            boolean isLowMemory,
+            long maxSliceSize,
+            boolean resetAllReaders)
     {
-        this.context = new SelectiveReaderContext(streamDescriptor, outputType, filter, systemMemoryContext, isLowMemory);
+        this.context = new SelectiveReaderContext(streamDescriptor, outputType, filter, systemMemoryContext, isLowMemory, maxSliceSize, resetAllReaders);
     }
 
     @Override
@@ -72,12 +73,20 @@ public class LongSelectiveStreamReader
                     directReader = new LongDirectSelectiveStreamReader(context);
                 }
                 currentReader = directReader;
+                if (dictionaryReader != null && context.isResetAllReaders()) {
+                    dictionaryReader = null;
+                    System.setProperty("RESET_LONG_READER", "RESET_LONG_READER");
+                }
                 break;
             case DICTIONARY:
                 if (dictionaryReader == null) {
                     dictionaryReader = new LongDictionarySelectiveStreamReader(context);
                 }
                 currentReader = dictionaryReader;
+                if (directReader != null && context.isResetAllReaders()) {
+                    directReader = null;
+                    System.setProperty("RESET_LONG_READER", "RESET_LONG_READER");
+                }
                 break;
             default:
                 throw new IllegalArgumentException("Unsupported encoding " + kind);

@@ -21,10 +21,9 @@ import com.facebook.presto.common.type.VarcharType;
 import io.airlift.slice.Murmur3Hash32;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import jakarta.annotation.Nullable;
 import org.apache.iceberg.PartitionField;
 import org.joda.time.DateTimeField;
-
-import javax.annotation.Nullable;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -42,6 +41,7 @@ import static com.facebook.presto.common.type.Decimals.isLongDecimal;
 import static com.facebook.presto.common.type.Decimals.isShortDecimal;
 import static com.facebook.presto.common.type.Decimals.readBigDecimal;
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
+import static com.facebook.presto.common.type.TimeType.TIME;
 import static com.facebook.presto.common.type.TimestampType.TIMESTAMP;
 import static com.facebook.presto.common.type.TypeUtils.readNativeValue;
 import static com.facebook.presto.common.type.VarbinaryType.VARBINARY;
@@ -51,6 +51,7 @@ import static java.lang.Integer.parseInt;
 import static java.lang.Math.floorDiv;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.DAYS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.joda.time.chrono.ISOChronology.getInstanceUTC;
 
 public final class PartitionTransforms
@@ -61,6 +62,7 @@ public final class PartitionTransforms
     private static final DateTimeField MONTH_OF_YEAR_UTC = getInstanceUTC().monthOfYear();
     public static final int MILLISECONDS_PER_HOUR = 60 * 60 * 1000;
     public static final int MILLISECONDS_PER_DAY = MILLISECONDS_PER_HOUR * 24;
+
     private PartitionTransforms() {}
 
     /**
@@ -156,6 +158,11 @@ public final class PartitionTransforms
                         block -> bucketDate(block, count),
                         (block, position) -> bucketValueDate(block, position, count));
             }
+            if (type.equals(TIME)) {
+                return new ColumnTransform(transform, INTEGER,
+                        block -> bucketTime(block, count),
+                        (block, position) -> bucketValueTime(block, position, count));
+            }
             if (type instanceof VarcharType) {
                 return new ColumnTransform(transform, INTEGER,
                         block -> bucketVarchar(block, count),
@@ -249,7 +256,7 @@ public final class PartitionTransforms
 
     private static int bucketValueInteger(Block block, int position, int count)
     {
-        return bucketValue(block, count, position, pos -> bucketHash(INTEGER.getLong(block, pos)));
+        return bucketValue(block, position, count, pos -> bucketHash(INTEGER.getLong(block, pos)));
     }
 
     private static Block bucketBigint(Block block, int count)
@@ -259,7 +266,7 @@ public final class PartitionTransforms
 
     private static int bucketValueBigint(Block block, int position, int count)
     {
-        return bucketValue(block, count, position, pos -> bucketHash(BIGINT.getLong(block, pos)));
+        return bucketValue(block, position, count, pos -> bucketHash(BIGINT.getLong(block, pos)));
     }
 
     private static Block bucketShortDecimal(DecimalType decimal, Block block, int count)
@@ -273,7 +280,7 @@ public final class PartitionTransforms
 
     private static int bucketValueShortDecimal(DecimalType decimal, Block block, int position, int count)
     {
-        return bucketValue(block, count, position, pos -> {
+        return bucketValue(block, position, count, pos -> {
             // TODO: write optimized implementation
             BigDecimal value = readBigDecimal(decimal, block, pos);
             return bucketHash(Slices.wrappedBuffer(value.unscaledValue().toByteArray()));
@@ -291,7 +298,7 @@ public final class PartitionTransforms
 
     private static int bucketValueLongDecimal(DecimalType decimal, Block block, int position, int count)
     {
-        return bucketValue(block, count, position, pos -> {
+        return bucketValue(block, position, count, pos -> {
             // TODO: write optimized implementation
             BigDecimal value = readBigDecimal(decimal, block, pos);
             return bucketHash(Slices.wrappedBuffer(value.unscaledValue().toByteArray()));
@@ -306,6 +313,16 @@ public final class PartitionTransforms
     private static int bucketValueDate(Block block, int position, int count)
     {
         return bucketValue(block, position, count, pos -> bucketHash(DATE.getLong(block, pos)));
+    }
+
+    private static Block bucketTime(Block block, int count)
+    {
+        return bucketBlock(block, count, position -> bucketHash(MILLISECONDS.toMicros(TIME.getLong(block, position))));
+    }
+
+    private static int bucketValueTime(Block block, int position, int count)
+    {
+        return bucketValue(block, position, count, pos -> bucketHash(MILLISECONDS.toMicros(TIME.getLong(block, pos))));
     }
 
     private static Block bucketVarchar(Block block, int count)
@@ -550,9 +567,9 @@ public final class PartitionTransforms
         private final ValueTransform valueTransform;
 
         public ColumnTransform(String transformName,
-                               Type type,
-                               Function<Block, Block> transform,
-                               ValueTransform valueTransform)
+                Type type,
+                Function<Block, Block> transform,
+                ValueTransform valueTransform)
         {
             this.transformName = requireNonNull(transformName, "transformName is null");
             this.type = requireNonNull(type, "resultType is null");

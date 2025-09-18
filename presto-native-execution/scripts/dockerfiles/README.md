@@ -4,7 +4,7 @@
 
 There are two kinds of Dockerfiles:
 1) A platform specific file to build dependencies. Current supported platforms are:
-   1) Centos-8-stream with gcc9.
+   1) Centos-9-stream with gcc12. Clang15 is also installed.
    2) Ubuntu-22.04 with gcc11.
 2) A platform-agnostic file to build Prestissimo runtime on top of the dependency image.
 ### Dependency Dockerfiles
@@ -53,4 +53,9 @@ CMake variable. The allowed values are specified [here](https://cmake.org/cmake/
 podman compose build centos-native-runtime
 # For a debug build, specify the BUILD_TYPE argument.
 podman compose build --build-arg BUILD_TYPE=Debug centos-native-runtime
+```
+
+If you would like to enable GPU support, you can set set GPU to ON:
+```bash
+GPU=ON podman compose build centos-native-runtime
 ```

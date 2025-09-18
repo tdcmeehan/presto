@@ -13,12 +13,12 @@
  */
 package com.facebook.presto.spark;
 
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.Session;
 import com.facebook.presto.connector.system.GlobalSystemConnector;
 import com.facebook.presto.execution.QueryManagerConfig;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.sql.analyzer.FeaturesConfig;
-import io.airlift.units.Duration;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkContext;
 
@@ -97,6 +97,7 @@ public class PrestoSparkSettingsRequirements
         config.setEnforceFixedDistributionForOutputOperator(true);
         config.setPrestoSparkAssignBucketToPartitionForPartitionedTableWriteEnabled(true);
         config.setTrackPartialAggregationHistory(false);
+        config.setPrestoSparkExecutionEnvironment(true);
     }
 
     public static void setDefaults(QueryManagerConfig config)

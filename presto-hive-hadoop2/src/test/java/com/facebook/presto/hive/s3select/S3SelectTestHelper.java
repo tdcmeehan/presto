@@ -28,8 +28,8 @@ import com.facebook.presto.hive.HiveClientConfig;
 import com.facebook.presto.hive.HiveCoercionPolicy;
 import com.facebook.presto.hive.HiveColumnConverterProvider;
 import com.facebook.presto.hive.HiveColumnHandle;
+import com.facebook.presto.hive.HiveCommonClientConfig;
 import com.facebook.presto.hive.HiveEncryptionInformationProvider;
-import com.facebook.presto.hive.HiveFileRenamer;
 import com.facebook.presto.hive.HiveHdfsConfiguration;
 import com.facebook.presto.hive.HiveLocationService;
 import com.facebook.presto.hive.HiveMetadataFactory;
@@ -57,6 +57,7 @@ import com.facebook.presto.hive.metastore.thrift.BridgingHiveMetastore;
 import com.facebook.presto.hive.metastore.thrift.HiveCluster;
 import com.facebook.presto.hive.metastore.thrift.TestingHiveCluster;
 import com.facebook.presto.hive.metastore.thrift.ThriftHiveMetastore;
+import com.facebook.presto.hive.metastore.thrift.ThriftHiveMetastoreConfig;
 import com.facebook.presto.hive.s3.HiveS3Config;
 import com.facebook.presto.hive.s3.PrestoS3ConfigurationUpdater;
 import com.facebook.presto.hive.s3.S3ConfigurationUpdater;
@@ -110,6 +111,7 @@ public class S3SelectTestHelper
     private HiveClientConfig config;
     private CacheConfig cacheConfig;
     private MetastoreClientConfig metastoreClientConfig;
+    private ThriftHiveMetastoreConfig thriftHiveMetastoreConfig;
 
     public S3SelectTestHelper(String host,
             int port,
@@ -128,13 +130,14 @@ public class S3SelectTestHelper
         config = hiveClientConfig;
         cacheConfig = new CacheConfig();
         metastoreClientConfig = new MetastoreClientConfig();
+        thriftHiveMetastoreConfig = new ThriftHiveMetastoreConfig();
 
         String proxy = System.getProperty("hive.metastore.thrift.client.socks-proxy");
         if (proxy != null) {
             metastoreClientConfig.setMetastoreSocksProxy(HostAndPort.fromString(proxy));
         }
 
-        HiveCluster hiveCluster = new TestingHiveCluster(metastoreClientConfig, host, port);
+        HiveCluster hiveCluster = new TestingHiveCluster(metastoreClientConfig, thriftHiveMetastoreConfig, host, port, new HiveCommonClientConfig());
         executor = newCachedThreadPool(daemonThreadsNamed("hive-%s"));
         HivePartitionManager hivePartitionManager = new HivePartitionManager(FUNCTION_AND_TYPE_MANAGER, config);
 
@@ -174,9 +177,8 @@ public class S3SelectTestHelper
                 new HivePartitionObjectBuilder(),
                 new HiveEncryptionInformationProvider(ImmutableSet.of()),
                 new HivePartitionStats(),
-                new HiveFileRenamer(),
                 columnConverterProvider,
-                new QuickStatsProvider(hdfsEnvironment, DO_NOTHING_DIRECTORY_LISTER, new HiveClientConfig(), new NamenodeStats(), ImmutableList.of()),
+                new QuickStatsProvider(metastoreClient, hdfsEnvironment, DO_NOTHING_DIRECTORY_LISTER, new HiveClientConfig(), new NamenodeStats(), ImmutableList.of()),
                 new HiveTableWritabilityChecker(config));
         transactionManager = new HiveTransactionManager();
         splitManager = new HiveSplitManager(

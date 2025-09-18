@@ -13,79 +13,99 @@
  */
 package com.facebook.presto.hive.statistics;
 
-import com.facebook.presto.hive.ColumnConverterProvider;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.hive.DirectoryLister;
-import com.facebook.presto.hive.HdfsConfiguration;
-import com.facebook.presto.hive.HdfsConfigurationInitializer;
+import com.facebook.presto.hive.HadoopDirectoryLister;
+import com.facebook.presto.hive.HdfsContext;
 import com.facebook.presto.hive.HdfsEnvironment;
 import com.facebook.presto.hive.HiveClientConfig;
-import com.facebook.presto.hive.HiveColumnConverterProvider;
-import com.facebook.presto.hive.HiveHdfsConfiguration;
+import com.facebook.presto.hive.HiveDirectoryContext;
+import com.facebook.presto.hive.HiveFileInfo;
 import com.facebook.presto.hive.MetastoreClientConfig;
 import com.facebook.presto.hive.NamenodeStats;
-import com.facebook.presto.hive.PartitionNameWithVersion;
-import com.facebook.presto.hive.authentication.NoHdfsAuthentication;
+import com.facebook.presto.hive.TestingExtendedHiveMetastore;
+import com.facebook.presto.hive.filesystem.ExtendedFileSystem;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
-import com.facebook.presto.hive.metastore.HivePartitionMutator;
 import com.facebook.presto.hive.metastore.MetastoreContext;
 import com.facebook.presto.hive.metastore.Partition;
 import com.facebook.presto.hive.metastore.PartitionStatistics;
-import com.facebook.presto.hive.metastore.SemiTransactionalHiveMetastore;
+import com.facebook.presto.hive.metastore.PartitionWithStatistics;
+import com.facebook.presto.hive.metastore.PrincipalPrivileges;
 import com.facebook.presto.hive.metastore.Storage;
+import com.facebook.presto.hive.metastore.StorageFormat;
 import com.facebook.presto.hive.metastore.Table;
-import com.facebook.presto.hive.metastore.thrift.BridgingHiveMetastore;
-import com.facebook.presto.hive.metastore.thrift.HiveCluster;
-import com.facebook.presto.hive.metastore.thrift.TestingHiveCluster;
-import com.facebook.presto.hive.metastore.thrift.ThriftHiveMetastore;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.session.PropertyMetadata;
 import com.facebook.presto.testing.TestingConnectorSession;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.util.concurrent.ListeningExecutorService;
-import io.airlift.units.Duration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat;
+import org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat;
+import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
+import org.apache.hadoop.mapred.InputFormat;
 import org.testng.annotations.BeforeTest;
 import org.testng.annotations.Test;
 
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 
-import static com.facebook.airlift.concurrent.Threads.daemonThreadsNamed;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.hive.HiveColumnConverterProvider.DEFAULT_COLUMN_CONVERTER_PROVIDER;
+import static com.facebook.presto.hive.HivePartition.UNPARTITIONED_ID;
 import static com.facebook.presto.hive.HiveSessionProperties.QUICK_STATS_BACKGROUND_BUILD_TIMEOUT;
 import static com.facebook.presto.hive.HiveSessionProperties.QUICK_STATS_ENABLED;
 import static com.facebook.presto.hive.HiveSessionProperties.QUICK_STATS_INLINE_BUILD_TIMEOUT;
 import static com.facebook.presto.hive.HiveSessionProperties.SKIP_EMPTY_FILES;
 import static com.facebook.presto.hive.HiveSessionProperties.USE_LIST_DIRECTORY_CACHE;
+import static com.facebook.presto.hive.HiveSessionProperties.isSkipEmptyFilesEnabled;
+import static com.facebook.presto.hive.HiveSessionProperties.isUseListDirectoryCache;
 import static com.facebook.presto.hive.HiveStorageFormat.PARQUET;
 import static com.facebook.presto.hive.HiveTestUtils.createTestHdfsEnvironment;
+import static com.facebook.presto.hive.HiveUtil.buildDirectoryContextProperties;
+import static com.facebook.presto.hive.HiveUtil.getInputFormat;
+import static com.facebook.presto.hive.NestedDirectoryPolicy.RECURSE;
 import static com.facebook.presto.hive.RetryDriver.retry;
 import static com.facebook.presto.hive.metastore.PartitionStatistics.empty;
+import static com.facebook.presto.hive.metastore.PrestoTableType.EXTERNAL_TABLE;
 import static com.facebook.presto.hive.metastore.PrestoTableType.MANAGED_TABLE;
 import static com.facebook.presto.hive.metastore.StorageFormat.fromHiveStorageFormat;
 import static com.facebook.presto.hive.statistics.PartitionQuickStats.convertToPartitionStatistics;
 import static com.facebook.presto.spi.session.PropertyMetadata.booleanProperty;
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator;
+import static com.google.common.io.MoreFiles.deleteRecursively;
+import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
+import static com.google.common.io.Resources.getResource;
+import static java.nio.file.Files.copy;
+import static java.nio.file.Files.createDirectory;
+import static java.nio.file.Files.createFile;
+import static java.nio.file.Files.createTempDirectory;
+import static java.nio.file.Files.newBufferedWriter;
+import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
+import static java.nio.file.StandardOpenOption.CREATE;
+import static java.nio.file.StandardOpenOption.TRUNCATE_EXISTING;
 import static java.util.Collections.emptyIterator;
 import static java.util.concurrent.CompletableFuture.allOf;
 import static java.util.concurrent.CompletableFuture.supplyAsync;
-import static java.util.concurrent.Executors.newCachedThreadPool;
 import static java.util.concurrent.ForkJoinPool.commonPool;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.testcontainers.shaded.com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
@@ -130,10 +150,11 @@ public class TestQuickStatsProvider
     private final HiveClientConfig hiveClientConfig = new HiveClientConfig().setRecursiveDirWalkerEnabled(true);
     private HdfsEnvironment hdfsEnvironment;
     private DirectoryLister directoryListerMock;
-    private SemiTransactionalHiveMetastore metastoreMock;
+    private ExtendedHiveMetastore metastoreMock;
     private MetastoreContext metastoreContext;
     private PartitionQuickStats mockPartitionQuickStats;
     private PartitionStatistics expectedPartitionStats;
+    private ColumnQuickStats<Integer> mockIntegerColumnStats;
 
     private static ConnectorSession getSession(String inlineBuildTimeout, String backgroundBuildTimeout)
     {
@@ -163,6 +184,7 @@ public class TestQuickStatsProvider
                 ImmutableMap.of(),
                 ImmutableMap.of());
         Partition mockPartition = new Partition(
+                Optional.of("catalogName"),
                 TEST_SCHEMA,
                 TEST_TABLE,
                 ImmutableList.of(),
@@ -176,6 +198,7 @@ public class TestQuickStatsProvider
                 0,
                 Optional.empty());
         Table mockTable = new Table(
+                Optional.of("catalogName"),
                 TEST_SCHEMA,
                 TEST_TABLE,
                 "owner",
@@ -190,14 +213,16 @@ public class TestQuickStatsProvider
                 Optional.empty(),
                 Optional.empty());
 
-        metastoreMock = MockSemiTransactionalHiveMetastore.create(mockTable, mockPartition);
+        metastoreMock = new TestingExtendedHiveMetastore();
+        metastoreMock.createTable(metastoreContext, mockTable, new PrincipalPrivileges(ImmutableMultimap.of(), ImmutableMultimap.of()), ImmutableList.of());
+        metastoreMock.addPartitions(metastoreContext, TEST_SCHEMA, TEST_TABLE, ImmutableList.of(new PartitionWithStatistics(mockPartition, "TEST_PARTITION", empty())));
 
         directoryListerMock = (fileSystem, table2, path, partition, namenodeStats, hiveDirectoryContext) -> emptyIterator();
 
         MetastoreClientConfig metastoreClientConfig = new MetastoreClientConfig();
         hdfsEnvironment = createTestHdfsEnvironment(hiveClientConfig, metastoreClientConfig);
 
-        ColumnQuickStats<Integer> mockIntegerColumnStats = new ColumnQuickStats<>("column", Integer.class);
+        mockIntegerColumnStats = new ColumnQuickStats<>("column", Integer.class);
         mockIntegerColumnStats.setMinValue(Integer.MIN_VALUE);
         mockIntegerColumnStats.setMaxValue(Integer.MAX_VALUE);
         mockIntegerColumnStats.addToRowCount(4242L);
@@ -210,12 +235,12 @@ public class TestQuickStatsProvider
     {
         QuickStatsBuilder quickStatsBuilderMock = (session, metastore, table, metastoreContext, partitionId, files) -> mockPartitionQuickStats;
 
-        QuickStatsProvider quickStatsProvider = new QuickStatsProvider(hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
+        QuickStatsProvider quickStatsProvider = new QuickStatsProvider(metastoreMock, hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
                 ImmutableList.of(quickStatsBuilderMock));
 
         // Execute
         ImmutableList<String> testPartitions1 = ImmutableList.of("partition1", "partition2", "partition3");
-        Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(SESSION, metastoreMock,
+        Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(SESSION,
                 new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions1);
 
         // Verify only one call was made for each test partition
@@ -224,14 +249,14 @@ public class TestQuickStatsProvider
         quickStats.values().forEach(ps -> assertEquals(ps, expectedPartitionStats));
 
         // For subsequent calls for the same partitions that are already cached, no new calls are mode to the quick stats builder
-        quickStatsProvider.getQuickStats(SESSION, metastoreMock,
+        quickStatsProvider.getQuickStats(SESSION,
                 new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions1);
 
         // For subsequent calls with a mix of old and new partitions, we only see calls to the quick stats builder for the new partitions
         ImmutableList<String> testPartitions2 = ImmutableList.of("partition4", "partition5", "partition6");
         ImmutableList<String> testPartitionsMix = ImmutableList.<String>builder().addAll(testPartitions1).addAll(testPartitions2).build();
 
-        quickStats = quickStatsProvider.getQuickStats(SESSION, metastoreMock,
+        quickStats = quickStatsProvider.getQuickStats(SESSION,
                 new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitionsMix);
         assertEquals(quickStats.entrySet().size(), testPartitionsMix.size());
         assertTrue(quickStats.keySet().containsAll(testPartitionsMix));
@@ -254,7 +279,7 @@ public class TestQuickStatsProvider
             return mockPartitionQuickStats;
         };
 
-        QuickStatsProvider quickStatsProvider = new QuickStatsProvider(hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
+        QuickStatsProvider quickStatsProvider = new QuickStatsProvider(metastoreMock, hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
                 ImmutableList.of(longRunningQuickStatsBuilderMock));
 
         List<String> testPartitions = ImmutableList.of("partition1", "partition2", "partition3");
@@ -265,10 +290,10 @@ public class TestQuickStatsProvider
 
             ConnectorSession session = getSession("600ms", "0ms");
             // Execute two concurrent calls for the same partitions; wait for them to complete
-            CompletableFuture<Map<String, PartitionStatistics>> future1 = supplyAsync(() -> quickStatsProvider.getQuickStats(session, metastoreMock,
+            CompletableFuture<Map<String, PartitionStatistics>> future1 = supplyAsync(() -> quickStatsProvider.getQuickStats(session,
                     new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions), commonPool());
 
-            CompletableFuture<Map<String, PartitionStatistics>> future2 = supplyAsync(() -> quickStatsProvider.getQuickStats(session, metastoreMock,
+            CompletableFuture<Map<String, PartitionStatistics>> future2 = supplyAsync(() -> quickStatsProvider.getQuickStats(session,
                     new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions), commonPool());
 
             allOf(future1, future2).join();
@@ -300,7 +325,7 @@ public class TestQuickStatsProvider
             }
 
             // Future calls for the same partitions will return from cached partition stats with valid values
-            Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(session, metastoreMock,
+            Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(session,
                     new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions);
 
             // Verify only one call was made for each test partition
@@ -315,10 +340,10 @@ public class TestQuickStatsProvider
 
             ConnectorSession session = getSession("300ms", "300ms");
             // Execute two concurrent calls for the same partitions; wait for them to complete
-            CompletableFuture<Map<String, PartitionStatistics>> future1 = supplyAsync(() -> quickStatsProvider.getQuickStats(session, metastoreMock,
+            CompletableFuture<Map<String, PartitionStatistics>> future1 = supplyAsync(() -> quickStatsProvider.getQuickStats(session,
                     new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions), commonPool());
 
-            CompletableFuture<Map<String, PartitionStatistics>> future2 = supplyAsync(() -> quickStatsProvider.getQuickStats(session, metastoreMock,
+            CompletableFuture<Map<String, PartitionStatistics>> future2 = supplyAsync(() -> quickStatsProvider.getQuickStats(session,
                     new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions), commonPool());
 
             allOf(future1, future2).join();
@@ -350,12 +375,12 @@ public class TestQuickStatsProvider
         };
 
         {
-            QuickStatsProvider quickStatsProvider = new QuickStatsProvider(hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
+            QuickStatsProvider quickStatsProvider = new QuickStatsProvider(metastoreMock, hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
                     ImmutableList.of(longRunningQuickStatsBuilderMock));
             // Create a session where an inline build will occur for any newly requested partition
             ConnectorSession session = getSession("300ms", "0ms");
             List<String> testPartitions = ImmutableList.copyOf(mockPerPartitionStatsFetchTimes.keySet());
-            Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(session, metastoreMock,
+            Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(session,
                     new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, testPartitions);
             Map<String, Instant> inProgressBuildsSnapshot = quickStatsProvider.getInProgressBuildsSnapshot();
 
@@ -376,10 +401,10 @@ public class TestQuickStatsProvider
             // Create a session where no inline builds will occur for any requested partition; empty() quick stats will be returned
             ConnectorSession session = getSession("0ms", "0ms");
 
-            QuickStatsProvider quickStatsProvider = new QuickStatsProvider(hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
+            QuickStatsProvider quickStatsProvider = new QuickStatsProvider(metastoreMock, hdfsEnvironment, directoryListerMock, hiveClientConfig, new NamenodeStats(),
                     ImmutableList.of((session1, metastore, table, metastoreContext, partitionId, files) -> mockPartitionQuickStats));
 
-            Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(session, metastoreMock,
+            Map<String, PartitionStatistics> quickStats = quickStatsProvider.getQuickStats(session,
                     new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, ImmutableList.of("p5", "p6"));
 
             assertEquals(quickStats.size(), 2);
@@ -392,7 +417,7 @@ public class TestQuickStatsProvider
                     .maxAttempts(10)
                     .exponentialBackoff(new Duration(20D, MILLISECONDS), new Duration(500D, MILLISECONDS), new Duration(2, SECONDS), 2.0)
                     .run("waitForQuickStatsBuild", () -> {
-                        Map<String, PartitionStatistics> quickStatsAfter = quickStatsProvider.getQuickStats(session, metastoreMock,
+                        Map<String, PartitionStatistics> quickStatsAfter = quickStatsProvider.getQuickStats(session,
                                 new SchemaTableName(TEST_SCHEMA, TEST_TABLE), metastoreContext, ImmutableList.of("p5", "p6"));
 
                         try {
@@ -408,60 +433,109 @@ public class TestQuickStatsProvider
         }
     }
 
-    public static class MockSemiTransactionalHiveMetastore
-            extends SemiTransactionalHiveMetastore
+    @Test
+    public void testFollowSymlinkFile()
+            throws IOException
     {
-        private final Table mockTable;
-        private final Partition mockPartition;
+        java.nio.file.Path testTempDir = createTempDirectory("test");
+        java.nio.file.Path symlinkFileDir = testTempDir.resolve("symlink");
+        java.nio.file.Path tableDir1 = testTempDir.resolve("table_1");
+        java.nio.file.Path tableDir2 = testTempDir.resolve("table_2");
+        createDirectory(symlinkFileDir);
+        createDirectory(tableDir1);
+        createDirectory(tableDir2);
 
-        private MockSemiTransactionalHiveMetastore(HdfsEnvironment hdfsEnvironment,
-                ExtendedHiveMetastore delegate,
-                ListeningExecutorService renameExecutor,
-                boolean skipDeletionForAlter,
-                boolean skipTargetCleanupOnRollback,
-                boolean undoMetastoreOperationsEnabled,
-                ColumnConverterProvider columnConverterProvider,
-                Table mockTable, Partition mockPartition)
-        {
-            super(hdfsEnvironment, delegate, renameExecutor, skipDeletionForAlter, skipTargetCleanupOnRollback, undoMetastoreOperationsEnabled, columnConverterProvider);
-            this.mockPartition = mockPartition;
-            this.mockTable = mockTable;
+        // Copy a parquet file from resources to the test/table temp dir
+        String fileName1 = "data_1.parquet";
+        String fileName2 = "data_2.parquet";
+        URL resourceUrl1 = getResource("quick_stats/tpcds_store_sales_sf_point_01/20230706_110621_00007_4uxkh_10e94cd0-1f67-4440-afd0-75cd328ea570");
+        URL resourceUrl2 = getResource("quick_stats/tpcds_store_sales_sf_point_01/20230706_110621_00007_4uxkh_12b3ec73-4952-4df7-9987-2beb20cd5953");
+        assertNotNull(resourceUrl1);
+        assertNotNull(resourceUrl2);
+
+        java.nio.file.Path targetFilePath1 = tableDir1.resolve(fileName1);
+        java.nio.file.Path targetFilePath2 = tableDir2.resolve(fileName2);
+
+        try (InputStream in = resourceUrl1.openStream()) {
+            copy(in, targetFilePath1, REPLACE_EXISTING);
+        }
+        try (InputStream in = resourceUrl2.openStream()) {
+            copy(in, targetFilePath2, REPLACE_EXISTING);
         }
 
-        public static MockSemiTransactionalHiveMetastore create(Table mockTable, Partition mockPartition)
-        {
-            // none of these values matter, as we never use them
-            HiveClientConfig config = new HiveClientConfig();
-            MetastoreClientConfig metastoreClientConfig = new MetastoreClientConfig();
-            HdfsConfiguration hdfsConfiguration = new HiveHdfsConfiguration(new HdfsConfigurationInitializer(config, metastoreClientConfig), ImmutableSet.of(), config);
-            HdfsEnvironment hdfsEnvironment = new HdfsEnvironment(hdfsConfiguration, metastoreClientConfig, new NoHdfsAuthentication());
-            HiveCluster hiveCluster = new TestingHiveCluster(metastoreClientConfig, "dummy", 1000);
-            ColumnConverterProvider columnConverterProvider = HiveColumnConverterProvider.DEFAULT_COLUMN_CONVERTER_PROVIDER;
-            ExtendedHiveMetastore delegate = new BridgingHiveMetastore(new ThriftHiveMetastore(hiveCluster, metastoreClientConfig, hdfsEnvironment), new HivePartitionMutator());
-            ExecutorService executor = newCachedThreadPool(daemonThreadsNamed("hive-%s"));
-            ListeningExecutorService renameExecutor = listeningDecorator(executor);
-
-            return new MockSemiTransactionalHiveMetastore(hdfsEnvironment, delegate, renameExecutor, false, false, true,
-                    columnConverterProvider, mockTable, mockPartition);
+        // Create the symlink manifest pointing to data.parquet
+        java.nio.file.Path manifestFilePath = createFile(symlinkFileDir.resolve("manifest"));
+        try (BufferedWriter writer = newBufferedWriter(manifestFilePath, CREATE, TRUNCATE_EXISTING)) {
+            writer.write("file:" + tableDir1 + "/" + fileName1);
+            writer.newLine();
+            writer.write("file:" + tableDir2 + "/" + fileName2);
         }
 
-        @Override
-        public synchronized Optional<Partition> getPartition(MetastoreContext metastoreContext, String databaseName, String tableName, List<String> partitionValues)
-        {
-            return Optional.of(mockPartition);
-        }
+        String symlinkTableName = "symlink_table";
+        Table symlinkTable = new Table(
+                Optional.of("catalogName"),
+                TEST_SCHEMA,
+                symlinkTableName,
+                "owner",
+                EXTERNAL_TABLE,
+                Storage.builder()
+                        .setStorageFormat(StorageFormat.create(ParquetHiveSerDe.class.getName(), SymlinkTextInputFormat.class.getName(), HiveIgnoreKeyTextOutputFormat.class.getName()))
+                        .setLocation(symlinkFileDir.toString())
+                        .build(),
+                ImmutableList.of(),
+                ImmutableList.of(),
+                ImmutableMap.of(),
+                Optional.empty(),
+                Optional.empty());
 
-        @Override
-        public synchronized Map<String, Optional<Partition>> getPartitionsByNames(MetastoreContext metastoreContext, String databaseName, String tableName, List<PartitionNameWithVersion> partitionNames)
-        {
-            checkArgument(partitionNames.size() == 1, "Expected caller to only pass in a single partition to fetch");
-            return ImmutableMap.of(partitionNames.get(0).getPartitionName(), Optional.of(mockPartition));
-        }
+        metastoreMock.createTable(metastoreContext, symlinkTable, new PrincipalPrivileges(ImmutableMultimap.of(), ImmutableMultimap.of()), ImmutableList.of());
 
-        @Override
-        public Optional<Table> getTable(MetastoreContext metastoreContext, String databaseName, String tableName)
-        {
-            return Optional.of(mockTable);
-        }
+        DirectoryLister directoryLister = new HadoopDirectoryLister();
+
+        QuickStatsBuilder quickStatsBuilder = (session1, metastore, table, metastoreContext, partitionId, files) -> {
+            List<HiveFileInfo> fileInfoList = ImmutableList.copyOf(files);
+            assertEquals(fileInfoList.size(), 2);
+            for (HiveFileInfo hiveFileInfo : fileInfoList) {
+                assertTrue(hiveFileInfo.getPath().equals("file:" + targetFilePath1) || hiveFileInfo.getPath().equals("file:" + targetFilePath2));
+            }
+            return new PartitionQuickStats(UNPARTITIONED_ID.getPartitionName(), ImmutableList.of(mockIntegerColumnStats), fileInfoList.size());
+        };
+
+        QuickStatsProvider quickStatsProvider = new QuickStatsProvider(metastoreMock, hdfsEnvironment, directoryLister, hiveClientConfig, new NamenodeStats(),
+                ImmutableList.of(quickStatsBuilder));
+
+        SchemaTableName table = new SchemaTableName(TEST_SCHEMA, symlinkTableName);
+
+        Table resolvedTable = metastoreMock.getTable(metastoreContext, table.getSchemaName(), table.getTableName()).get();
+        Path symlinkTablePath = new Path(resolvedTable.getStorage().getLocation());
+        HdfsContext hdfsContext = new HdfsContext(SESSION, table.getSchemaName(), table.getTableName(), UNPARTITIONED_ID.getPartitionName(), false);
+        ExtendedFileSystem fs = hdfsEnvironment.getFileSystem(hdfsContext, symlinkTablePath);
+        HiveDirectoryContext hiveDirectoryContext = new HiveDirectoryContext(RECURSE, isUseListDirectoryCache(SESSION),
+                isSkipEmptyFilesEnabled(SESSION), hdfsContext.getIdentity(), buildDirectoryContextProperties(SESSION), SESSION.getRuntimeStats());
+
+        // Test directoryLister finds the manifest file in the table dir
+        Iterator<HiveFileInfo> fileInfoIterator = directoryLister.list(fs, resolvedTable, symlinkTablePath, Optional.empty(), new NamenodeStats(), hiveDirectoryContext);
+        ImmutableList<HiveFileInfo> fileInfoList = ImmutableList.copyOf(fileInfoIterator);
+
+        assertEquals(fileInfoList.size(), 1);
+        assertEquals(fileInfoList.get(0).getPath(), "file:" + manifestFilePath);
+        assertEquals(fileInfoList.get(0).getParent(), "file:" + symlinkFileDir);
+
+        // Test that the input format is correct
+        InputFormat<?, ?> inputFormat = getInputFormat(
+                hdfsEnvironment.getConfiguration(hdfsContext, symlinkTablePath),
+                resolvedTable.getStorage().getStorageFormat().getInputFormat(),
+                resolvedTable.getStorage().getStorageFormat().getSerDe(),
+                false);
+
+        assertTrue(inputFormat instanceof SymlinkTextInputFormat);
+
+        // Test entire getQuickStats and ensure file count matches fileList size in buildQuickStats
+        PartitionStatistics quickStats = quickStatsProvider.getQuickStats(SESSION, table, metastoreContext, UNPARTITIONED_ID.getPartitionName());
+
+        assertTrue(quickStats.getBasicStatistics().getFileCount().isPresent());
+        assertEquals(quickStats.getBasicStatistics().getFileCount().getAsLong(), 2L);
+
+        deleteRecursively(testTempDir, ALLOW_INSECURE);
     }
 }

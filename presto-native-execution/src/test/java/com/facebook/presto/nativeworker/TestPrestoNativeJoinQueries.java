@@ -22,12 +22,18 @@ public class TestPrestoNativeJoinQueries
     @Override
     protected QueryRunner createQueryRunner() throws Exception
     {
-        return PrestoNativeQueryRunnerUtils.createNativeQueryRunner(true);
+        return PrestoNativeQueryRunnerUtils.nativeHiveQueryRunnerBuilder()
+                .setAddStorageFormatToPath(true)
+                .setUseThrift(true)
+                .setUseReactorNettyHttpClient(true)
+                .build();
     }
 
     @Override
     protected ExpectedQueryRunner createExpectedQueryRunner() throws Exception
     {
-        return PrestoNativeQueryRunnerUtils.createJavaQueryRunner();
+        return PrestoNativeQueryRunnerUtils.javaHiveQueryRunnerBuilder()
+                .setAddStorageFormatToPath(true)
+                .build();
     }
 }

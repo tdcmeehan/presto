@@ -131,8 +131,13 @@ public enum KafkaInternalFieldDescription
                 true);
     }
 
-    ColumnMetadata getColumnMetadata(boolean hidden)
+    ColumnMetadata getColumnMetadata(boolean hidden, String name)
     {
-        return new ColumnMetadata(columnName, type, comment, hidden);
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(type)
+                .setComment(comment)
+                .setHidden(hidden)
+                .build();
     }
 }

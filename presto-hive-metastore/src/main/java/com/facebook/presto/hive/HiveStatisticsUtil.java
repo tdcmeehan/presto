@@ -21,18 +21,18 @@ import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.statistics.ColumnStatisticMetadata;
 import com.facebook.presto.spi.statistics.ComputedStatistics;
 import com.google.common.base.VerifyException;
-import com.google.common.collect.ImmutableMap;
 import org.joda.time.DateTimeZone;
 
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.hive.metastore.Statistics.fromComputedStatistics;
 import static com.facebook.presto.spi.statistics.TableStatisticType.ROW_COUNT;
 import static com.google.common.base.Verify.verify;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
 
 public final class HiveStatisticsUtil
 {
@@ -61,9 +61,14 @@ public final class HiveStatisticsUtil
             ConnectorSession session,
             Map<String, Type> columnTypes,
             ComputedStatistics computedStatistics,
+            Set<ColumnStatisticMetadata> supportedColumnStatistics,
             DateTimeZone timeZone)
     {
-        Map<ColumnStatisticMetadata, Block> computedColumnStatistics = computedStatistics.getColumnStatistics();
+        Map<ColumnStatisticMetadata, Block> computedColumnStatistics = computedStatistics.getColumnStatistics()
+                .entrySet()
+                .stream()
+                .filter((entry) -> supportedColumnStatistics.contains(entry.getKey()))
+                .collect(toImmutableMap(Map.Entry::getKey, Map.Entry::getValue));
 
         Block rowCountBlock = Optional.ofNullable(computedStatistics.getTableStatistics().get(ROW_COUNT))
                 .orElseThrow(() -> new VerifyException("rowCount not present"));
@@ -73,18 +78,21 @@ public final class HiveStatisticsUtil
         return createPartitionStatistics(session, rowCountOnlyBasicStatistics, columnTypes, computedColumnStatistics, timeZone);
     }
 
-    public static Map<ColumnStatisticMetadata, Block> getColumnStatistics(Map<List<String>, ComputedStatistics> statistics, List<String> partitionValues)
+    public static PartitionStatistics createPartitionStatistics(
+            ConnectorSession session,
+            Map<String, Type> columnTypes,
+            ComputedStatistics computedStatistics,
+            DateTimeZone timeZone)
     {
-        return Optional.ofNullable(statistics.get(partitionValues))
-                .map(ComputedStatistics::getColumnStatistics)
-                .orElse(ImmutableMap.of());
+        return createPartitionStatistics(session, columnTypes, computedStatistics, computedStatistics.getColumnStatistics().keySet(), timeZone);
     }
 
     // TODO: Collect file count, on-disk size and in-memory size during ANALYZE
+
     /**
-     *  This method updates old {@link PartitionStatistics} with new statistics, only if the new
-     *  partition stats are not empty. This method always overwrites each of the
-     *  {@link HiveColumnStatistics} contained in the new partition statistics.
+     * This method updates old {@link PartitionStatistics} with new statistics, only if the new
+     * partition stats are not empty. This method always overwrites each of the
+     * {@link HiveColumnStatistics} contained in the new partition statistics.
      *
      * @param oldPartitionStats old version of partition statistics
      * @param newPartitionStats new version of partition statistics

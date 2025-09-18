@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.orc;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.common.RuntimeStats;
 import com.facebook.presto.orc.cache.StorageOrcFileTailSource;
 import com.facebook.presto.orc.metadata.DwrfMetadataReader;
@@ -23,7 +24,6 @@ import com.facebook.presto.orc.proto.DwrfProto;
 import com.facebook.presto.orc.protobuf.AbstractMessageLite;
 import com.facebook.presto.orc.protobuf.InvalidProtocolBufferException;
 import com.google.common.collect.ImmutableList;
-import io.airlift.units.DataSize;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -34,10 +34,11 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Optional;
 
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
+import static com.facebook.presto.orc.OrcReader.MODIFICATION_TIME_NOT_SET;
 import static com.facebook.presto.orc.metadata.DwrfStripeCacheMode.INDEX_AND_FOOTER;
 import static com.facebook.presto.orc.proto.DwrfProto.CompressionKind.NONE;
 import static com.facebook.presto.orc.proto.DwrfProto.StripeCacheMode.BOTH;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
@@ -91,7 +92,7 @@ public class TestStorageOrcFileTailSource
         int expectedFooterSizeInBytes = 567;
         StorageOrcFileTailSource src = new StorageOrcFileTailSource(expectedFooterSizeInBytes, false);
         TestingOrcDataSource orcDataSource = new TestingOrcDataSource(createFileOrcDataSource());
-        src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false);
+        src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false, MODIFICATION_TIME_NOT_SET);
 
         // make sure only the configured expectedFooterSizeInBytes bytes have been read
         assertEquals(orcDataSource.getReadCount(), 1);
@@ -121,7 +122,7 @@ public class TestStorageOrcFileTailSource
         // read the file tail with the disabled "read dwrf stripe cache" feature
         StorageOrcFileTailSource src = new StorageOrcFileTailSource(tailReadSizeInBytes, false);
         TestingOrcDataSource orcDataSource = new TestingOrcDataSource(createFileOrcDataSource());
-        OrcFileTail orcFileTail = src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false);
+        OrcFileTail orcFileTail = src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false, MODIFICATION_TIME_NOT_SET);
 
         assertEquals(orcFileTail.getMetadataSize(), 0);
         DwrfProto.Footer actualFooter = readFooter(orcFileTail);
@@ -160,7 +161,7 @@ public class TestStorageOrcFileTailSource
         // read the file tail with the enabled "read dwrf stripe cache" feature
         StorageOrcFileTailSource src = new StorageOrcFileTailSource(FOOTER_READ_SIZE_IN_BYTES, true);
         OrcDataSource orcDataSource = createFileOrcDataSource();
-        OrcFileTail orcFileTail = src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false);
+        OrcFileTail orcFileTail = src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false, MODIFICATION_TIME_NOT_SET);
 
         assertEquals(orcFileTail.getMetadataSize(), 0);
         DwrfProto.Footer actualFooter = readFooter(orcFileTail);
@@ -190,7 +191,7 @@ public class TestStorageOrcFileTailSource
         // read the file tail with the enabled "read dwrf stripe cache" feature
         StorageOrcFileTailSource src = new StorageOrcFileTailSource(FOOTER_READ_SIZE_IN_BYTES, true);
         OrcDataSource orcDataSource = createFileOrcDataSource();
-        OrcFileTail orcFileTail = src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false);
+        OrcFileTail orcFileTail = src.getOrcFileTail(orcDataSource, metadataReader, Optional.empty(), false, MODIFICATION_TIME_NOT_SET);
 
         assertEquals(orcFileTail.getMetadataSize(), 0);
         DwrfProto.Footer actualFooter = readFooter(orcFileTail);

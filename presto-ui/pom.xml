@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.290-SNAPSHOT</version>
+        <version>0.295-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-ui</artifactId>
@@ -13,6 +13,7 @@
 
     <properties>
         <air.main.basedir>${project.parent.basedir}</air.main.basedir>
+        <air.check.skip-modernizer>true</air.check.skip-modernizer>
     </properties>
 
     <build>
@@ -20,6 +21,10 @@
             <resource>
                 <directory>${project.build.directory}/webapp</directory>
                 <targetPath>webapp</targetPath>
+            </resource>
+            <resource>
+                <directory>${project.build.directory}/webapp-router</directory>
+                <targetPath>webapp-router</targetPath>
             </resource>
         </resources>
 
@@ -59,7 +64,7 @@
                         </goals>
                         <phase>initialize</phase>
                         <configuration>
-                            <nodeVersion>v18.20.2</nodeVersion>
+                            <nodeVersion>v22.15.1</nodeVersion>
                             <yarnVersion>v1.22.22</yarnVersion>
                         </configuration>
                     </execution>

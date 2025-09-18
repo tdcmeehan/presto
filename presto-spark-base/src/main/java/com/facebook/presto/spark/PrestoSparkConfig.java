@@ -16,22 +16,21 @@ package com.facebook.presto.spark;
 import com.facebook.airlift.configuration.Config;
 import com.facebook.airlift.configuration.ConfigDescription;
 import com.facebook.airlift.configuration.LegacyConfig;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableMap;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
-
-import javax.validation.constraints.DecimalMax;
-import javax.validation.constraints.DecimalMin;
-import javax.validation.constraints.Min;
-import javax.validation.constraints.NotNull;
+import jakarta.validation.constraints.DecimalMax;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
 
 import java.util.Map;
 
+import static com.facebook.airlift.units.DataSize.Unit.GIGABYTE;
+import static com.facebook.airlift.units.DataSize.Unit.KILOBYTE;
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.google.common.base.Strings.nullToEmpty;
-import static io.airlift.units.DataSize.Unit.GIGABYTE;
-import static io.airlift.units.DataSize.Unit.KILOBYTE;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.concurrent.TimeUnit.MINUTES;
 
 public class PrestoSparkConfig
@@ -72,6 +71,9 @@ public class PrestoSparkConfig
     private String nativeExecutionBroadcastBasePath;
     private boolean nativeTerminateWithCoreWhenUnresponsiveEnabled;
     private Duration nativeTerminateWithCoreTimeout = new Duration(5, MINUTES);
+    private boolean isDynamicPrestoMemoryPoolTuningEnabled;
+    private double dynamicPrestoMemoryPoolTuningFraction = 0.7;
+    private int attemptNumberToApplyDynamicMemoryPoolTuning = 1;
 
     public boolean isSparkPartitionCountAutoTuneEnabled()
     {
@@ -522,6 +524,45 @@ public class PrestoSparkConfig
     public PrestoSparkConfig setNativeTerminateWithCoreTimeout(Duration nativeTerminateWithCoreTimeout)
     {
         this.nativeTerminateWithCoreTimeout = nativeTerminateWithCoreTimeout;
+        return this;
+    }
+
+    public boolean isDynamicPrestoMemoryPoolTuningEnabled()
+    {
+        return isDynamicPrestoMemoryPoolTuningEnabled;
+    }
+
+    @Config("spark.dynamic-presto-memory-pool-tuning-enabled")
+    @ConfigDescription("Dynamic tuning for Presto memory pool enabled")
+    public PrestoSparkConfig setDynamicPrestoMemoryPoolTuningEnabled(boolean isDynamicPrestoMemoryPoolTuningEnabled)
+    {
+        this.isDynamicPrestoMemoryPoolTuningEnabled = isDynamicPrestoMemoryPoolTuningEnabled;
+        return this;
+    }
+
+    public double getDynamicPrestoMemoryPoolTuningFraction()
+    {
+        return dynamicPrestoMemoryPoolTuningFraction;
+    }
+
+    @Config("spark.dynamic-presto-memory-pool-tuning-fraction")
+    @ConfigDescription("Percentage of JVM memory available to Presto")
+    public PrestoSparkConfig setDynamicPrestoMemoryPoolTuningFraction(double dynamicPrestoMemoryPoolTuningFraction)
+    {
+        this.dynamicPrestoMemoryPoolTuningFraction = dynamicPrestoMemoryPoolTuningFraction;
+        return this;
+    }
+
+    public int getAttemptNumberToApplyDynamicMemoryPoolTuning()
+    {
+        return attemptNumberToApplyDynamicMemoryPoolTuning;
+    }
+
+    @Config("spark.attempt-number-to-apply-dynamic-memory-pool-tuning")
+    @ConfigDescription("Attempt number after which dynamic memory pool tuning will be enabled")
+    public PrestoSparkConfig setAttemptNumberToApplyDynamicMemoryPoolTuning(int attemptNumberToApplyDynamicMemoryPoolTuning)
+    {
+        this.attemptNumberToApplyDynamicMemoryPoolTuning = attemptNumberToApplyDynamicMemoryPoolTuning;
         return this;
     }
 }

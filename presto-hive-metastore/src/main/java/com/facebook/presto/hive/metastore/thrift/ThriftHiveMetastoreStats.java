@@ -19,6 +19,7 @@ import org.weakref.jmx.Nested;
 public class ThriftHiveMetastoreStats
 {
     private final HiveMetastoreApiStats getAllDatabases = new HiveMetastoreApiStats();
+    private final HiveMetastoreApiStats getDatabases = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats getDatabase = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats getAllTables = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats getAllViews = new HiveMetastoreApiStats();
@@ -39,6 +40,7 @@ public class ThriftHiveMetastoreStats
     private final HiveMetastoreApiStats createTableWithConstraints = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats dropTable = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats alterTable = new HiveMetastoreApiStats();
+    private final HiveMetastoreApiStats alterTableWithEnvironmentContext = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats addPartitions = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats dropPartition = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats alterPartition = new HiveMetastoreApiStats();
@@ -60,6 +62,13 @@ public class ThriftHiveMetastoreStats
     private final HiveMetastoreApiStats addUniqueConstraint = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats addPrimaryKeyConstraint = new HiveMetastoreApiStats();
     private final HiveMetastoreApiStats addNotNullConstraint = new HiveMetastoreApiStats();
+
+    @Managed
+    @Nested
+    public HiveMetastoreApiStats getGetDatabases()
+    {
+        return getDatabases;
+    }
 
     @Managed
     @Nested
@@ -206,6 +215,13 @@ public class ThriftHiveMetastoreStats
     public HiveMetastoreApiStats getAlterTable()
     {
         return alterTable;
+    }
+
+    @Managed
+    @Nested
+    public HiveMetastoreApiStats getAlterTableWithEnvironmentContext()
+    {
+        return alterTableWithEnvironmentContext;
     }
 
     @Managed

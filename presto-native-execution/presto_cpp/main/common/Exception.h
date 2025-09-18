@@ -14,7 +14,7 @@
 #pragma once
 
 #include <unordered_map>
-#include "presto_cpp/presto_protocol/presto_protocol.h"
+#include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
 #include "velox/common/base/VeloxException.h"
 
 namespace std {
@@ -33,56 +33,14 @@ class VeloxToPrestoExceptionTranslator {
   static protocol::ExecutionFailureInfo translate(
       const velox::VeloxException& e);
 
-  // Translates to Presto error from std::exceptions
-  static protocol::ExecutionFailureInfo translate(const std::exception& e);
-
- private:
-  static const std::unordered_map<
+  // Returns a reference to the error map containing mapping between
+  // velox error code and Presto errors defined in Presto protocol
+  static std::unordered_map<
       std::string,
       std::unordered_map<std::string, protocol::ErrorCode>>&
-  translateMap() {
-    static const std::unordered_map<
-        std::string,
-        std::unordered_map<std::string, protocol::ErrorCode>>
-        kTranslateMap = {
-            {velox::error_source::kErrorSourceRuntime,
-             {{velox::error_code::kMemCapExceeded,
-               {0x00020000,
-                "GENERIC_INSUFFICIENT_RESOURCES",
-                protocol::ErrorType::INSUFFICIENT_RESOURCES}},
-              {velox::error_code::kMemAborted,
-               {0x00020000,
-                "GENERIC_INSUFFICIENT_RESOURCES",
-                protocol::ErrorType::INSUFFICIENT_RESOURCES}},
-              {velox::error_code::kInvalidState,
-               {0x00010000,
-                "GENERIC_INTERNAL_ERROR",
-                protocol::ErrorType::INTERNAL_ERROR}},
-              {velox::error_code::kUnreachableCode,
-               {0x00010000,
-                "GENERIC_INTERNAL_ERROR",
-                protocol::ErrorType::INTERNAL_ERROR}},
-              {velox::error_code::kNotImplemented,
-               {0x00010000,
-                "GENERIC_INTERNAL_ERROR",
-                protocol::ErrorType::INTERNAL_ERROR}},
-              {velox::error_code::kUnknown,
-               {0x00010000,
-                "GENERIC_INTERNAL_ERROR",
-                protocol::ErrorType::INTERNAL_ERROR}}}},
-            {velox::error_source::kErrorSourceUser,
-             {{velox::error_code::kInvalidArgument,
-               {0x00000000,
-                "GENERIC_USER_ERROR",
-                protocol::ErrorType::USER_ERROR}},
-              {velox::error_code::kUnsupported,
-               {0x0000000D, "NOT_SUPPORTED", protocol::ErrorType::USER_ERROR}},
-              {velox::error_code::kArithmeticError,
-               {0x00000000,
-                "GENERIC_USER_ERROR",
-                protocol::ErrorType::USER_ERROR}}}},
-            {velox::error_source::kErrorSourceSystem, {}}};
-    return kTranslateMap;
-  }
+  translateMap();
+
+  // Translates to Presto error from std::exceptions
+  static protocol::ExecutionFailureInfo translate(const std::exception& e);
 };
 } // namespace facebook::presto

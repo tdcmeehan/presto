@@ -17,9 +17,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
-
-import javax.annotation.concurrent.GuardedBy;
-import javax.annotation.concurrent.ThreadSafe;
+import com.google.errorprone.annotations.ThreadSafe;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -115,6 +114,20 @@ public class AsyncQueue<T>
         return immediateFuture(null);
     }
 
+    private synchronized void offerAll(List<T> elementsToInsert)
+    {
+        requireNonNull(elementsToInsert);
+        if (finishing && borrowerCount == 0) {
+            return;
+        }
+        boolean wasEmpty = elements.isEmpty();
+        elements.addAll(elementsToInsert);
+        if (wasEmpty && !elements.isEmpty()) {
+            completeAsync(executor, notEmptySignal);
+            notEmptySignal = SettableFuture.create();
+        }
+    }
+
     private synchronized List<T> getBatch(int maxSize)
     {
         int oldSize = elements.size();
@@ -194,8 +207,9 @@ public class AsyncQueue<T>
                             checkArgument(borrowResult.getElementsToInsert().isEmpty(), "Function must not insert anything when no element is borrowed");
                             return borrowResult.getResult();
                         }
-                        for (T element : borrowResult.getElementsToInsert()) {
-                            offer(element);
+                        List<T> elementsToInsert = borrowResult.getElementsToInsert();
+                        if (!elementsToInsert.isEmpty()) {
+                            offerAll(elementsToInsert);
                         }
                         return borrowResult.getResult();
                     }

@@ -22,7 +22,7 @@ namespace facebook::presto {
 class QueryContextManagerTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    velox::memory::MemoryManager::testingSetInstance({});
+    velox::memory::MemoryManager::testingSetInstance(velox::memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -56,9 +56,16 @@ TEST_F(QueryContextManagerTest, nativeSessionProperties) {
           {"native_debug_disable_common_sub_expressions", "true"},
           {"native_debug_disable_expression_with_memoization", "true"},
           {"native_debug_disable_expression_with_lazy_inputs", "true"},
-          {"aggregation_spill_all", "true"}}};
+          {"native_selective_nimble_reader_enabled", "true"},
+          {"aggregation_spill_all", "true"},
+          {"native_expression_max_array_size_in_reduce", "99999"},
+          {"native_expression_max_compiled_regexes", "54321"},
+          {"request_data_sizes_max_wait_sec", "20"},
+      }};
+  protocol::TaskUpdateRequest updateRequest;
+  updateRequest.session = session;
   auto queryCtx = taskManager_->getQueryContextManager()->findOrCreateQueryCtx(
-      taskId, session);
+      taskId, updateRequest);
   EXPECT_EQ(queryCtx->queryConfig().maxSpillLevel(), 2);
   EXPECT_EQ(queryCtx->queryConfig().spillCompressionKind(), "NONE");
   EXPECT_FALSE(queryCtx->queryConfig().joinSpillEnabled());
@@ -67,7 +74,32 @@ TEST_F(QueryContextManagerTest, nativeSessionProperties) {
   EXPECT_TRUE(queryCtx->queryConfig().debugDisableCommonSubExpressions());
   EXPECT_TRUE(queryCtx->queryConfig().debugDisableExpressionsWithMemoization());
   EXPECT_TRUE(queryCtx->queryConfig().debugDisableExpressionsWithLazyInputs());
+  EXPECT_TRUE(queryCtx->queryConfig().selectiveNimbleReaderEnabled());
   EXPECT_EQ(queryCtx->queryConfig().spillWriteBufferSize(), 1024);
+  EXPECT_EQ(queryCtx->queryConfig().exprMaxArraySizeInReduce(), 99999);
+  EXPECT_EQ(queryCtx->queryConfig().exprMaxCompiledRegexes(), 54321);
+  EXPECT_EQ(queryCtx->queryConfig().requestDataSizesMaxWaitSec(), 20);
+}
+
+TEST_F(QueryContextManagerTest, nativeConnectorSessionProperties) {
+  protocol::TaskId taskId = "scan.0.0.1.0";
+  protocol::SessionRepresentation session;
+  std::map<std::string, std::string> hiveSessions{
+      {"native_stats_based_filter_reorder_disabled", "true"},
+      {"orc_max_merge_distance", "512kB"}};
+  session.catalogProperties.emplace("hive", hiveSessions);
+  protocol::TaskUpdateRequest updateRequest;
+  updateRequest.session = session;
+  auto queryCtx = taskManager_->getQueryContextManager()->findOrCreateQueryCtx(
+      taskId, updateRequest);
+  EXPECT_EQ(
+      queryCtx->connectorSessionProperties().at("hive")->get<std::string>(
+          "orc_max_merge_distance"),
+      "512kB");
+  EXPECT_EQ(
+      queryCtx->connectorSessionProperties().at("hive")->get<std::string>(
+          "stats_based_filter_reorder_disabled"),
+      "true");
 }
 
 TEST_F(QueryContextManagerTest, defaultSessionProperties) {
@@ -76,54 +108,115 @@ TEST_F(QueryContextManagerTest, defaultSessionProperties) {
 
   protocol::TaskId taskId = "scan.0.0.1.0";
   protocol::SessionRepresentation session{.systemProperties = {}};
+  protocol::TaskUpdateRequest updateRequest;
+  updateRequest.session = session;
   auto queryCtx = taskManager_->getQueryContextManager()->findOrCreateQueryCtx(
-      taskId, session);
+      taskId, updateRequest);
   const auto& queryConfig = queryCtx->queryConfig();
   EXPECT_EQ(queryConfig.maxSpillLevel(), defaultQC->maxSpillLevel());
   EXPECT_EQ(
       queryConfig.spillCompressionKind(), defaultQC->spillCompressionKind());
+  EXPECT_EQ(queryConfig.spillEnabled(), defaultQC->spillEnabled());
+  EXPECT_EQ(queryConfig.aggregationSpillEnabled(), defaultQC->aggregationSpillEnabled());
   EXPECT_EQ(queryConfig.joinSpillEnabled(), defaultQC->joinSpillEnabled());
+  EXPECT_EQ(queryConfig.orderBySpillEnabled(), defaultQC->orderBySpillEnabled());
   EXPECT_EQ(
       queryConfig.validateOutputFromOperators(),
       defaultQC->validateOutputFromOperators());
   EXPECT_EQ(
       queryConfig.spillWriteBufferSize(), defaultQC->spillWriteBufferSize());
+  EXPECT_EQ(
+      queryConfig.requestDataSizesMaxWaitSec(), defaultQC->requestDataSizesMaxWaitSec());
+  EXPECT_EQ(
+      queryConfig.maxSplitPreloadPerDriver(), defaultQC->maxSplitPreloadPerDriver());
+  EXPECT_EQ(
+      queryConfig.maxLocalExchangePartitionBufferSize(), defaultQC->maxLocalExchangePartitionBufferSize());
 }
 
-TEST_F(QueryContextManagerTest, overrdingSessionProperties) {
+TEST_F(QueryContextManagerTest, overridingSessionProperties) {
   protocol::TaskId taskId = "scan.0.0.1.0";
   const auto& systemConfig = SystemConfig::instance();
   {
     protocol::SessionRepresentation session{.systemProperties = {}};
+    protocol::TaskUpdateRequest updateRequest;
+    updateRequest.session = session;
     auto queryCtx =
         taskManager_->getQueryContextManager()->findOrCreateQueryCtx(
-            taskId, session);
+            taskId, updateRequest);
+    // When session properties are not explicitly set, they should be set to 
+    // system config values.
     EXPECT_EQ(
         queryCtx->queryConfig().queryMaxMemoryPerNode(),
         systemConfig->queryMaxMemoryPerNode());
     EXPECT_EQ(
         queryCtx->queryConfig().spillFileCreateConfig(),
         systemConfig->spillerFileCreateConfig());
+    EXPECT_EQ(
+        queryCtx->queryConfig().spillEnabled(),
+        systemConfig->spillEnabled());
+    EXPECT_EQ(
+        queryCtx->queryConfig().aggregationSpillEnabled(),
+        systemConfig->aggregationSpillEnabled());
+    EXPECT_EQ(
+        queryCtx->queryConfig().joinSpillEnabled(),
+        systemConfig->joinSpillEnabled());
+    EXPECT_EQ(
+        queryCtx->queryConfig().orderBySpillEnabled(),
+        systemConfig->orderBySpillEnabled());
+    EXPECT_EQ(
+        queryCtx->queryConfig().requestDataSizesMaxWaitSec(),
+        systemConfig->requestDataSizesMaxWaitSec());
   }
   {
     protocol::SessionRepresentation session{
         .systemProperties = {
             {"query_max_memory_per_node", "1GB"},
-            {"spill_file_create_config", "encoding:replica_2"}}};
+            {"spill_file_create_config", "encoding:replica_2"},
+            {"spill_enabled", "true"},
+            {"aggregation_spill_enabled", "false"},
+            {"join_spill_enabled", "true"},
+            {"request_data_sizes_max_wait_sec", "12"}}};
+    protocol::TaskUpdateRequest updateRequest;
+    updateRequest.session = session;
     auto queryCtx =
         taskManager_->getQueryContextManager()->findOrCreateQueryCtx(
-            taskId, session);
+            taskId, updateRequest);
     EXPECT_EQ(
         queryCtx->queryConfig().queryMaxMemoryPerNode(),
         1UL * 1024 * 1024 * 1024);
     EXPECT_EQ(
         queryCtx->queryConfig().spillFileCreateConfig(), "encoding:replica_2");
+    // Override with different value
+    EXPECT_EQ(
+        queryCtx->queryConfig().spillEnabled(), true);
+    EXPECT_NE(
+        queryCtx->queryConfig().spillEnabled(),
+        systemConfig->spillEnabled());
+    // Override with different value
+    EXPECT_EQ(
+        queryCtx->queryConfig().aggregationSpillEnabled(), false);
+    EXPECT_NE(
+        queryCtx->queryConfig().aggregationSpillEnabled(),
+        systemConfig->aggregationSpillEnabled());
+    // Override with same value
+    EXPECT_EQ(
+        queryCtx->queryConfig().joinSpillEnabled(), true);
+    EXPECT_EQ(
+        queryCtx->queryConfig().joinSpillEnabled(),
+        systemConfig->joinSpillEnabled());
+    // No override
+    EXPECT_EQ(
+        queryCtx->queryConfig().orderBySpillEnabled(),
+        systemConfig->orderBySpillEnabled());
+    EXPECT_EQ(queryCtx->queryConfig().requestDataSizesMaxWaitSec(), 12);
   }
 }
 
 TEST_F(QueryContextManagerTest, duplicateQueryRootPoolName) {
   const protocol::TaskId fakeTaskId = "scan.0.0.1.0";
   const protocol::SessionRepresentation fakeSession{.systemProperties = {}};
+  protocol::TaskUpdateRequest fakeUpdateRequest;
+  fakeUpdateRequest.session = fakeSession;
   auto* queryCtxManager = taskManager_->getQueryContextManager();
   struct {
     bool hasPendingReference;
@@ -147,7 +240,7 @@ TEST_F(QueryContextManagerTest, duplicateQueryRootPoolName) {
     queryCtxManager->testingClearCache();
 
     auto queryCtx =
-        queryCtxManager->findOrCreateQueryCtx(fakeTaskId, fakeSession);
+        queryCtxManager->findOrCreateQueryCtx(fakeTaskId, fakeUpdateRequest);
     const auto poolName = queryCtx->pool()->name();
     ASSERT_THAT(poolName, testing::HasSubstr("scan_"));
     if (!testData.hasPendingReference) {
@@ -157,7 +250,7 @@ TEST_F(QueryContextManagerTest, duplicateQueryRootPoolName) {
       queryCtxManager->testingClearCache();
     }
     auto newQueryCtx =
-        queryCtxManager->findOrCreateQueryCtx(fakeTaskId, fakeSession);
+        queryCtxManager->findOrCreateQueryCtx(fakeTaskId, fakeUpdateRequest);
     const auto newPoolName = newQueryCtx->pool()->name();
     ASSERT_THAT(newPoolName, testing::HasSubstr("scan_"));
     if (testData.expectedNewPoolName) {

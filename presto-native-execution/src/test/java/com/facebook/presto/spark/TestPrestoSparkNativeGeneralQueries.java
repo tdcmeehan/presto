@@ -13,50 +13,111 @@
  */
 package com.facebook.presto.spark;
 
+import com.facebook.airlift.log.Level;
+import com.facebook.airlift.log.Logging;
 import com.facebook.presto.nativeworker.AbstractTestNativeGeneralQueries;
+import com.facebook.presto.scalar.sql.SqlInvokedFunctionsPlugin;
 import com.facebook.presto.testing.ExpectedQueryRunner;
 import com.facebook.presto.testing.QueryRunner;
 import org.testng.annotations.Ignore;
 
+import java.util.ArrayList;
+import java.util.List;
+
 public class TestPrestoSparkNativeGeneralQueries
         extends AbstractTestNativeGeneralQueries
 {
+    private static final Logging logging = Logging.initialize();
+
     @Override
     protected QueryRunner createQueryRunner()
     {
-        return PrestoSparkNativeQueryRunnerUtils.createHiveRunner();
+        QueryRunner queryRunner = PrestoSparkNativeQueryRunnerUtils.createHiveRunner();
+
+        // Install plugins needed for extra array functions.
+        queryRunner.installPlugin(new SqlInvokedFunctionsPlugin());
+        return queryRunner;
     }
 
     @Override
     protected ExpectedQueryRunner createExpectedQueryRunner()
             throws Exception
     {
-        return PrestoSparkNativeQueryRunnerUtils.createJavaQueryRunner();
+        QueryRunner queryRunner = PrestoSparkNativeQueryRunnerUtils.createJavaQueryRunner();
+
+        // Install plugins needed for extra array functions.
+        queryRunner.installPlugin(new SqlInvokedFunctionsPlugin());
+        return queryRunner;
     }
 
-    // TODO: Enable following Ignored tests after fixing (Tests can be enabled by removing the method)
+    @Override
+    public void testUnicodeInJson()
+    {
+        // Suppress the logging for large volume of query text to avoid console hangs.
+        List<String> suppressLogList = new ArrayList<>();
+        suppressLogList.add("com.facebook.presto.spark.execution.PrestoSparkStaticQueryExecution");
+        suppressLogList.add("com.facebook.presto.spark.PrestoSparkQueryExecutionFactory");
+        try {
+            for (String logLocation : suppressLogList) {
+                logging.setLevel(logLocation, Level.WARN);
+            }
+            super.testUnicodeInJson();
+        }
+        finally {
+            for (String logLocation : suppressLogList) {
+                logging.setLevel(logLocation, Level.INFO);
+            }
+        }
+    }
+
+    // Disable: Only applicable for Presto-Native single node mode, not applicable for POS.
     @Override
     @Ignore
-    public void testCatalogWithCacheEnabled() {}
+    public void testDistributedSortSingleNode() {}
 
+    // Disable: Text file reader is not supported. This test is also disabled in pom.xml through disabling groups "textfile_reader".
+    @Override
+    public void testReadTableWithTextfileFormat() {}
+
+    // Disable: Not supporte by POS
     @Override
     @Ignore
     public void testInformationSchemaTables() {}
 
+    // Disable: Not supporte by POS
     @Override
     @Ignore
     public void testShowAndDescribe() {}
 
+    // Disable: Not supporte by POS
     @Override
+    @Ignore
     public void testSystemTables() {}
 
-    // @TODO Refer https://github.com/prestodb/presto/issues/20294
+    // Disable: Not supporte by POS
     @Override
     @Ignore
-    public void testAnalyzeStats() {}
+    public void testShowSessionWithoutJavaSessionProperties() {}
 
-    // https://github.com/prestodb/presto/issues/22275
+    // Disable: Not supporte by POS
     @Override
     @Ignore
-    public void testUnionAllInsert() {}
+    public void testSetSessionJavaWorkerSessionProperty() {}
+
+    // Disable: PrestoSparkQueryRunner does not support pattern assertion.
+    @Override
+    @Ignore
+    public void testRowWiseExchange() {}
+
+    // TODO: Enable following Ignored tests after fixing (Tests can be enabled by removing the method)
+
+    // This test is broken likely due to Parquet related issues.
+    @Override
+    @Ignore
+    public void testAnalyzeStatsOnDecimals() {}
+
+    // VeloxRuntimeError: it != connectors().end() Connector with ID 'hivecached' not registered
+    @Override
+    @Ignore
+    public void testCatalogWithCacheEnabled() {}
 }

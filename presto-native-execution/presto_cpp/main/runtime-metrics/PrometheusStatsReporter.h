@@ -12,10 +12,13 @@
  * limitations under the License.
  */
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/concurrency/ConcurrentHashMap.h>
 #include "presto_cpp/main/common/Configs.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/GTestMacros.h"
 #include "velox/common/base/StatsReporter.h"
+
 
 namespace facebook::presto::prometheus {
 
@@ -38,8 +41,9 @@ class PrometheusStatsReporter : public facebook::velox::BaseStatsReporter {
   class PrometheusImpl;
 
  public:
+
   explicit PrometheusStatsReporter(
-      const std::map<std::string, std::string>& labels);
+      const std::map<std::string, std::string>& labels, int numThreads);
 
   void registerMetricExportType(const char* key, velox::StatType)
       const override;
@@ -61,6 +65,30 @@ class PrometheusStatsReporter : public facebook::velox::BaseStatsReporter {
       int64_t max,
       const std::vector<int32_t>& pcts) const override;
 
+  void registerQuantileMetricExportType(
+      const char* /* key */,
+      const std::vector<velox::StatType>& /* statTypes */,
+      const std::vector<double>& /* pcts */,
+      const std::vector<size_t>& /* slidingWindowsSeconds */) const override {};
+
+  void registerQuantileMetricExportType(
+      folly::StringPiece /* key */,
+      const std::vector<velox::StatType>& /* statTypes */,
+      const std::vector<double>& /* pcts */,
+      const std::vector<size_t>& /* slidingWindowsSeconds */) const override {};
+  
+  void registerDynamicQuantileMetricExportType(
+      const char* /* keyPattern */,
+      const std::vector<velox::StatType>& /* statTypes */,
+      const std::vector<double>& /* pcts */,
+      const std::vector<size_t>& /* slidingWindowsSeconds */) const override {};
+  
+  void registerDynamicQuantileMetricExportType(
+      folly::StringPiece /* keyPattern */,
+      const std::vector<velox::StatType>& /* statTypes */,
+      const std::vector<double>& /* pcts */,
+      const std::vector<size_t>& /* slidingWindowsSeconds */) const override {};
+
   void addMetricValue(const std::string& key, size_t value = 1) const override;
 
   void addMetricValue(const char* key, size_t value = 1) const override;
@@ -75,7 +103,37 @@ class PrometheusStatsReporter : public facebook::velox::BaseStatsReporter {
   void addHistogramMetricValue(folly::StringPiece key, size_t value)
       const override;
 
+  void addQuantileMetricValue(const std::string& /* key */, size_t /* value */)
+      const override {};
+
+  void addQuantileMetricValue(const char* /* key */, size_t /* value */)
+      const override {};
+
+  void addQuantileMetricValue(folly::StringPiece /* key */, size_t /* value */)
+      const override{};
+  
+  void addDynamicQuantileMetricValue(
+      const std::string& /* key */,
+      folly::Range<const folly::StringPiece*> /* subkeys */,
+      size_t /* value */) const override {};
+  
+  virtual void addDynamicQuantileMetricValue(
+      const char* /* key */,
+      folly::Range<const folly::StringPiece*> /* subkeys */,
+      size_t /* value */) const override {};
+
+  virtual void addDynamicQuantileMetricValue(
+      folly::StringPiece /* key */,
+      folly::Range<const folly::StringPiece*> /* subkeys */,
+      size_t /* value */) const override {};
+
   std::string fetchMetrics() override;
+
+  /**
+   * Waits for all pending metric updates to complete.
+   * This is only used in tests to ensure correct timing.
+   */
+  void waitForCompletion() const;
 
   static std::unique_ptr<velox::BaseStatsReporter> createPrometheusReporter() {
     auto nodeConfig = NodeConfig::instance();
@@ -84,15 +142,17 @@ class PrometheusStatsReporter : public facebook::velox::BaseStatsReporter {
     const std::string worker = !hostName ? "" : hostName;
     std::map<std::string, std::string> labels{
         {"cluster", cluster}, {"worker", worker}};
-    return std::make_unique<PrometheusStatsReporter>(labels);
+    return std::make_unique<PrometheusStatsReporter>(labels, nodeConfig->prometheusExecutorThreads());
   }
 
  private:
+  std::shared_ptr<folly::CPUThreadPoolExecutor> executor_;
   std::shared_ptr<PrometheusImpl> impl_;
   // A map of labels assigned to each metric which helps in filtering at client
   // end.
-  mutable std::unordered_map<std::string, StatsInfo> registeredMetricsMap_;
+  mutable folly::ConcurrentHashMap<std::string, StatsInfo> registeredMetricsMap_;
   VELOX_FRIEND_TEST(PrometheusReporterTest, testCountAndGauge);
   VELOX_FRIEND_TEST(PrometheusReporterTest, testHistogramSummary);
+  VELOX_FRIEND_TEST(PrometheusReporterTest, testConcurrentReporting);
 };
 } // namespace facebook::presto::prometheus

@@ -7,7 +7,7 @@ Overview
 
 This connector allows reading `Delta Lake <https://delta.io/>`_
 tables in Presto. The connector uses the
-`Delta Standalone Library (DSR) <https://github.com/delta-io/connectors/wiki/Delta-Standalone-Reader>`_
+`Delta Kernel API <https://docs.delta.io/latest/delta-kernel.html>`_
 provided by Delta Lake project to read the table metadata.
 
 Configuration
@@ -22,6 +22,12 @@ replacing the properties as appropriate:
     connector.name=delta
     hive.metastore.uri=hostname:port
 
+File-Based Metastore
+^^^^^^^^^^^^^^^^^^^^
+
+For testing or development purposes, this connector can be configured to use a local 
+filesystem directory as a Hive Metastore. See :ref:`installation/deployment:File-Based Metastore`.  
+
 Configuration Properties
 ------------------------
 
@@ -35,6 +41,9 @@ Property Name                                   Description                     
                                                 metastore to find the location of Delta Lake tables.
                                                 From the Delta Log at given location, schema and data
                                                 file list of the table is found.
+
+``hive.metastore.catalog.name``                 Specifies the catalog name to be passed to the metastore.
+
 ``delta.parquet-dereference-pushdown-enabled``  Enable pushing nested column dereferences into            ``true``
                                                 table scan so that only the required fields
                                                 selected in a ``struct`` data type column are selected.
@@ -124,3 +133,47 @@ in the table ``sales.apac.sales_data``.
 
 Above query drops the external table ``sales.apac.sales_data_new``. This only drops the
 metadata for the table. The referenced data directory is not deleted.
+
+Delta Lake to PrestoDB type mapping
+-----------------------------------
+
+Map of Delta Lake types to the relevant PrestoDB types:
+
+.. list-table:: Delta Lake to PrestoDB type mapping
+  :widths: 50, 50
+  :header-rows: 1
+
+  * - Delta Lake type
+    - PrestoDB type
+  * - ``BOOLEAN``
+    - ``BOOLEAN``
+  * - ``SMALLINT``
+    - ``SMALLINT`` 
+  * - ``TINYINT``
+    - ``TINYINT``
+  * - ``INT``
+    - ``INTEGER``
+  * - ``LONG``
+    - ``BIGINT``
+  * - ``FLOAT``
+    - ``REAL``
+  * - ``DOUBLE``
+    - ``DOUBLE``
+  * - ``DECIMAL``
+    - ``DECIMAL``
+  * - ``STRING``
+    - ``VARCHAR``
+  * - ``BINARY``
+    - ``VARBINARY``
+  * - ``DATE``
+    - ``DATE``
+  * - ``TIMESTAMP_NTZ``
+    - ``TIMESTAMP``
+  * - ``TIMESTAMP``
+    - ``TIMESTAMP WITH TIME ZONE``
+  * - ``ARRAY``
+    - ``ARRAY``
+  * - ``MAP``
+    - ``MAP``
+  * - ``STRUCT``
+    - ``ROW``

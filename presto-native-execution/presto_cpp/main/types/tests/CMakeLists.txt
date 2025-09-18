@@ -10,6 +10,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_library(presto_type_test_utils OBJECT TestUtils.cpp)
+
 add_executable(presto_velox_split_test PrestoToVeloxSplitTest.cpp)
 
 add_test(presto_velox_split_test presto_velox_split_test)
@@ -18,8 +20,11 @@ target_link_libraries(
   presto_velox_split_test
   GTest::gtest
   GTest::gtest_main
+  presto_connectors
   presto_operators
   presto_protocol
+  velox_dwio_common
+  velox_dwio_orc_reader
   velox_hive_connector
   velox_tpch_connector
   velox_exec
@@ -30,7 +35,7 @@ target_link_libraries(
   velox_hive_partition_function)
 
 add_executable(presto_expressions_test RowExpressionTest.cpp ValuesPipeTest.cpp
-                                       PlanConverterTest.cpp)
+                                       PlanConverterTest.cpp TypeParserTest.cpp)
 
 add_test(
   NAME presto_expressions_test
@@ -44,10 +49,13 @@ target_link_libraries(
   presto_expressions_test
   GTest::gtest
   GTest::gtest_main
+  presto_connectors
   $<TARGET_OBJECTS:presto_protocol>
   $<TARGET_OBJECTS:presto_type_converter>
   $<TARGET_OBJECTS:presto_types>
   presto_operators
+  presto_mutable_configs
+  presto_type_test_utils
   velox_core
   velox_dwio_common_exception
   velox_encode
@@ -59,9 +67,9 @@ target_link_libraries(
   velox_tpch_connector
   velox_hive_partition_function
   velox_presto_serializer
+  velox_presto_type_parser
   velox_serialization
   velox_type
-  velox_type_parser
   Boost::filesystem
   ${RE2}
   ${FOLLY_WITH_DEPENDENCIES}
@@ -81,10 +89,51 @@ add_test(
 
 target_link_libraries(
   presto_to_velox_connector_test
+  presto_connectors
   presto_protocol
   presto_operators
   presto_type_converter
   presto_types
+  velox_dwio_common
+  velox_hive_connector
+  velox_tpch_connector
+  GTest::gtest
+  GTest::gtest_main)
+
+add_executable(presto_function_metadata_test FunctionMetadataTest.cpp)
+
+add_test(
+  NAME presto_function_metadata_test
+  COMMAND presto_function_metadata_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_link_libraries(
+  presto_function_metadata_test
+  presto_function_metadata
+  presto_protocol
+  presto_type_test_utils
+  velox_aggregates
+  velox_functions_prestosql
+  velox_window
+  GTest::gtest
+  GTest::gtest_main)
+
+add_executable(presto_to_velox_query_plan_test PrestoToVeloxQueryPlanTest.cpp)
+
+add_test(
+  NAME presto_to_velox_query_plan_test
+  COMMAND presto_to_velox_query_plan_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_link_libraries(
+  presto_to_velox_query_plan_test
+  presto_connectors
+  presto_operators
+  presto_protocol
+  presto_type_converter
+  presto_types
+  velox_dwio_common
+  velox_exec_test_lib
   velox_hive_connector
   velox_tpch_connector
   GTest::gtest

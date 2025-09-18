@@ -42,7 +42,7 @@ import com.facebook.presto.testing.TestingConnectorSession;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import org.testng.annotations.AfterMethod;
+import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
@@ -67,14 +67,12 @@ import static com.facebook.presto.common.type.Varchars.isVarcharType;
 import static com.facebook.presto.spi.connector.ConnectorSplitManager.SplitSchedulingStrategy.UNGROUPED_SCHEDULING;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
 import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.collect.Iterables.getOnlyElement;
 import static java.util.Locale.ENGLISH;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
-@Test(singleThreaded = true)
 public class TestCassandraConnector
 {
     protected static final String INVALID_DATABASE = "totally_invalid_database";
@@ -95,9 +93,11 @@ public class TestCassandraConnector
             Optional.empty(),
             ImmutableMap.of());
     protected String database;
+
     protected SchemaTableName table;
     protected SchemaTableName tableUnpartitioned;
     protected SchemaTableName invalidTable;
+    private CassandraServer server;
     private ConnectorMetadata metadata;
     private ConnectorSplitManager splitManager;
     private ConnectorRecordSetProvider recordSetProvider;
@@ -106,17 +106,17 @@ public class TestCassandraConnector
     public void setup()
             throws Exception
     {
-        EmbeddedCassandra.start();
+        this.server = new CassandraServer();
 
         String keyspace = "test_connector";
-        createTestTables(EmbeddedCassandra.getSession(), keyspace, DATE);
+        createTestTables(server.getSession(), server.getMetadata(), keyspace, DATE);
 
         String connectorId = "cassandra-test";
         CassandraConnectorFactory connectorFactory = new CassandraConnectorFactory(connectorId);
 
         Connector connector = connectorFactory.create(connectorId, ImmutableMap.of(
-                "cassandra.contact-points", EmbeddedCassandra.getHost(),
-                "cassandra.native-protocol-port", Integer.toString(EmbeddedCassandra.getPort())),
+                "cassandra.contact-points", server.getHost(),
+                "cassandra.native-protocol-port", Integer.toString(server.getPort())),
                 new TestingConnectorContext());
 
         metadata = connector.getMetadata(CassandraTransactionHandle.INSTANCE);
@@ -134,14 +134,15 @@ public class TestCassandraConnector
         invalidTable = new SchemaTableName(database, "totally_invalid_table_name");
     }
 
-    @AfterMethod
-    public void tearDown()
-    {
-    }
-
     @Test
     public void testGetClient()
     {
+    }
+
+    @AfterClass(alwaysRun = true)
+    public void tearDown()
+    {
+        server.close();
     }
 
     @Test
@@ -183,8 +184,8 @@ public class TestCassandraConnector
 
         ConnectorTransactionHandle transaction = CassandraTransactionHandle.INSTANCE;
 
-        List<ConnectorTableLayoutResult> layouts = metadata.getTableLayouts(SESSION, tableHandle, Constraint.alwaysTrue(), Optional.empty());
-        ConnectorTableLayoutHandle layout = getOnlyElement(layouts).getTableLayout().getHandle();
+        ConnectorTableLayoutResult layoutResult = metadata.getTableLayoutForConstraint(SESSION, tableHandle, Constraint.alwaysTrue(), Optional.empty());
+        ConnectorTableLayoutHandle layout = layoutResult.getTableLayout().getHandle();
         List<ConnectorSplit> splits = getAllSplits(splitManager.getSplits(transaction, SESSION, layout, new SplitSchedulingContext(UNGROUPED_SCHEDULING, false, WarningCollector.NOOP)));
 
         long rowNumber = 0;

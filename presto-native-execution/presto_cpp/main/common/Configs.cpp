@@ -37,6 +37,15 @@ std::string bool2String(bool value) {
   return value ? "true" : "false";
 }
 
+uint32_t hardwareConcurrency() {
+  const auto numLogicalCores = std::thread::hardware_concurrency();
+  // The spec says std::thread::hardware_concurrency() might return 0.
+  // But we depend on std::thread::hardware_concurrency() to create executors.
+  // Check to ensure numThreads is > 0.
+  VELOX_CHECK_GT(numLogicalCores, 0);
+  return numLogicalCores;
+}
+
 #define STR_PROP(_key_, _val_) \
   { std::string(_key_), std::string(_val_) }
 #define NUM_PROP(_key_, _val_) \
@@ -69,13 +78,6 @@ void ConfigBase::initialize(const std::string& filePath, bool optionalConfig) {
       std::move(values), mutableConfig);
 }
 
-std::string ConfigBase::capacityPropertyAsBytesString(
-    std::string_view propertyName) const {
-  return folly::to<std::string>(velox::config::toCapacity(
-      optionalProperty(propertyName).value(),
-      velox::config::CapacityUnit::BYTE));
-}
-
 bool ConfigBase::registerProperty(
     const std::string& propertyName,
     const folly::Optional<std::string>& defaultValue) {
@@ -101,8 +103,8 @@ folly::Optional<std::string> ConfigBase::setValue(
       propertyName);
   auto oldValue = config_->get<std::string>(propertyName);
   config_->set(propertyName, value);
-  if (oldValue.hasValue()) {
-    return oldValue;
+  if (oldValue.has_value()) {
+    return oldValue.value();
   }
   return registeredProps_[propertyName];
 }
@@ -138,13 +140,17 @@ SystemConfig::SystemConfig() {
           BOOL_PROP(kHttpServerReusePort, false),
           BOOL_PROP(kHttpServerBindToNodeInternalAddressOnlyEnabled, false),
           NONE_PROP(kDiscoveryUri),
-          NUM_PROP(kMaxDriversPerTask, 16),
+          NUM_PROP(kMaxDriversPerTask, hardwareConcurrency()),
+          NONE_PROP(kTaskWriterCount),
+          NONE_PROP(kTaskPartitionedWriterCount),
           NUM_PROP(kConcurrentLifespansPerTask, 1),
           STR_PROP(kTaskMaxPartialAggregationMemory, "16MB"),
+          NUM_PROP(kDriverMaxSplitPreload, 2),
           NUM_PROP(kHttpServerNumIoThreadsHwMultiplier, 1.0),
           NUM_PROP(kHttpServerNumCpuThreadsHwMultiplier, 1.0),
           NONE_PROP(kHttpServerHttpsPort),
           BOOL_PROP(kHttpServerHttpsEnabled, false),
+          BOOL_PROP(kHttpServerHttp2Enabled, true),
           STR_PROP(
               kHttpsSupportedCiphers,
               "ECDHE-ECDSA-AES256-GCM-SHA384,AES256-GCM-SHA384"),
@@ -153,22 +159,30 @@ SystemConfig::SystemConfig() {
           NONE_PROP(kHttpsClientCertAndKeyPath),
           NUM_PROP(kExchangeHttpClientNumIoThreadsHwMultiplier, 1.0),
           NUM_PROP(kExchangeHttpClientNumCpuThreadsHwMultiplier, 1.0),
+          NUM_PROP(kConnectorNumCpuThreadsHwMultiplier, 0.0),
           NUM_PROP(kConnectorNumIoThreadsHwMultiplier, 1.0),
           NUM_PROP(kDriverNumCpuThreadsHwMultiplier, 4.0),
           BOOL_PROP(kDriverThreadsBatchSchedulingEnabled, false),
           NUM_PROP(kDriverStuckOperatorThresholdMs, 30 * 60 * 1000),
           NUM_PROP(
               kDriverCancelTasksWithStuckOperatorsThresholdMs, 40 * 60 * 1000),
+          NUM_PROP(kDriverNumStuckOperatorsToDetachWorker, 0.5 * hardwareConcurrency()),
           NUM_PROP(kSpillerNumCpuThreadsHwMultiplier, 1.0),
           STR_PROP(kSpillerFileCreateConfig, ""),
+          STR_PROP(kSpillerDirectoryCreateConfig, ""),
           NONE_PROP(kSpillerSpillPath),
           NUM_PROP(kShutdownOnsetSec, 10),
-          NUM_PROP(kSystemMemoryGb, 40),
+          NUM_PROP(kSystemMemoryGb, 57),
           BOOL_PROP(kSystemMemPushbackEnabled, false),
-          NUM_PROP(kSystemMemLimitGb, 55),
+          NUM_PROP(kSystemMemLimitGb, 60),
           NUM_PROP(kSystemMemShrinkGb, 8),
           BOOL_PROP(kMallocMemHeapDumpEnabled, false),
           BOOL_PROP(kSystemMemPushbackAbortEnabled, false),
+          NUM_PROP(kWorkerOverloadedThresholdMemGb, 0),
+          NUM_PROP(kWorkerOverloadedThresholdCpuPct, 0),
+          NUM_PROP(kWorkerOverloadedThresholdNumQueuedDriversHwMultiplier, 0.0),
+          NUM_PROP(kWorkerOverloadedCooldownPeriodSec, 5),
+          BOOL_PROP(kWorkerOverloadedTaskQueuingEnabled, false),
           NUM_PROP(kMallocHeapDumpThresholdGb, 20),
           NUM_PROP(kMallocMemMinHeapDumpInterval, 10),
           NUM_PROP(kMallocMemMaxHeapDumpFiles, 5),
@@ -191,9 +205,9 @@ SystemConfig::SystemConfig() {
           STR_PROP(kSharedArbitratorReservedCapacity, "4GB"),
           STR_PROP(kSharedArbitratorMemoryPoolInitialCapacity, "128MB"),
           STR_PROP(kSharedArbitratorMemoryPoolReservedCapacity, "64MB"),
-          STR_PROP(kSharedArbitratorMemoryPoolTransferCapacity, "32MB"),
-          STR_PROP(kSharedArbitratorMemoryReclaimMaxWaitTime, "5m"),
+          STR_PROP(kSharedArbitratorMaxMemoryArbitrationTime, "5m"),
           STR_PROP(kSharedArbitratorGlobalArbitrationEnabled, "false"),
+          STR_PROP(kSharedArbitratorMemoryPoolAbortCapacityLimit, "8GB"),
           NUM_PROP(kLargestSizeClassPages, 256),
           BOOL_PROP(kEnableVeloxTaskLogging, false),
           BOOL_PROP(kEnableVeloxExprSetLogging, false),
@@ -204,7 +218,6 @@ SystemConfig::SystemConfig() {
           BOOL_PROP(kHttpEnableAccessLog, false),
           BOOL_PROP(kHttpEnableStatsFilter, false),
           BOOL_PROP(kHttpEnableEndpointLatencyFilter, false),
-          BOOL_PROP(kRegisterTestFunctions, false),
           NUM_PROP(kHttpMaxAllocateBytes, 65536),
           STR_PROP(kQueryMaxMemoryPerNode, "4GB"),
           BOOL_PROP(kEnableMemoryLeakCheck, true),
@@ -235,6 +248,21 @@ SystemConfig::SystemConfig() {
           STR_PROP(kCacheVeloxTtlCheckInterval, "1h"),
           BOOL_PROP(kEnableRuntimeMetricsCollection, false),
           BOOL_PROP(kPlanValidatorFailOnNestedLoopJoin, false),
+          STR_PROP(kPrestoDefaultNamespacePrefix, "presto.default"),
+          STR_PROP(kPoolType, "DEFAULT"),
+          BOOL_PROP(kSpillEnabled, false),
+          BOOL_PROP(kJoinSpillEnabled, true),
+          BOOL_PROP(kAggregationSpillEnabled, true),
+          BOOL_PROP(kOrderBySpillEnabled, true),
+          NUM_PROP(kMaxSpillBytes, 100UL << 30), // 100GB
+          NUM_PROP(kRequestDataSizesMaxWaitSec, 10),
+          STR_PROP(kPluginDir, ""),
+          NUM_PROP(kExchangeIoEvbViolationThresholdMs, 1000),
+          NUM_PROP(kHttpSrvIoEvbViolationThresholdMs, 1000),
+          NUM_PROP(kMaxLocalExchangePartitionBufferSize, 65536),
+          BOOL_PROP(kTextWriterEnabled, true),
+          BOOL_PROP(kCharNToVarcharImplicitCast, false),
+          BOOL_PROP(kEnumTypesEnabled, true),
       };
 }
 
@@ -265,6 +293,10 @@ bool SystemConfig::httpServerHttpsEnabled() const {
   return optionalProperty<bool>(kHttpServerHttpsEnabled).value();
 }
 
+bool SystemConfig::httpServerHttp2Enabled() const {
+  return optionalProperty<bool>(kHttpServerHttp2Enabled).value();
+}
+
 std::string SystemConfig::httpsSupportedCiphers() const {
   return optionalProperty(kHttpsSupportedCiphers).value();
 }
@@ -285,6 +317,43 @@ std::string SystemConfig::prestoVersion() const {
   return requiredProperty(std::string(kPrestoVersion));
 }
 
+std::string SystemConfig::poolType() const {
+  static const std::unordered_set<std::string> kPoolTypes = {
+      "LEAF", "INTERMEDIATE", "DEFAULT"};
+  static constexpr std::string_view kPoolTypeDefault = "DEFAULT";
+  auto value = optionalProperty<std::string>(kPoolType).value_or(
+      std::string(kPoolTypeDefault));
+  VELOX_USER_CHECK(
+      kPoolTypes.count(value),
+      "{} must be one of 'LEAF', 'INTERMEDIATE', or 'DEFAULT'",
+      kPoolType);
+  return value;
+}
+
+bool SystemConfig::spillEnabled() const {
+  return optionalProperty<bool>(kSpillEnabled).value();
+}
+
+bool SystemConfig::joinSpillEnabled() const {
+  return optionalProperty<bool>(kJoinSpillEnabled).value();
+}
+
+bool SystemConfig::aggregationSpillEnabled() const {
+  return optionalProperty<bool>(kAggregationSpillEnabled).value();
+}
+
+bool SystemConfig::orderBySpillEnabled() const {
+  return optionalProperty<bool>(kOrderBySpillEnabled).value();
+}
+
+uint64_t SystemConfig::maxSpillBytes() const {
+  return optionalProperty<uint64_t>(kMaxSpillBytes).value();
+}
+
+int SystemConfig::requestDataSizesMaxWaitSec() const {
+  return optionalProperty<int>(kRequestDataSizesMaxWaitSec).value();
+}
+
 bool SystemConfig::mutableConfig() const {
   return optionalProperty<bool>(kMutableConfig).value();
 }
@@ -298,7 +367,7 @@ SystemConfig::remoteFunctionServerLocation() const {
   // First check if there is a UDS path registered. If there's one, use it.
   auto remoteServerUdsPath =
       optionalProperty(kRemoteFunctionServerThriftUdsPath);
-  if (remoteServerUdsPath.hasValue()) {
+  if (remoteServerUdsPath.has_value()) {
     return folly::SocketAddress::makeFromPath(remoteServerUdsPath.value());
   }
 
@@ -308,13 +377,13 @@ SystemConfig::remoteFunctionServerLocation() const {
   auto remoteServerPort =
       optionalProperty<uint16_t>(kRemoteFunctionServerThriftPort);
 
-  if (remoteServerPort.hasValue()) {
+  if (remoteServerPort.has_value()) {
     // Fallback to localhost if address is not specified.
-    return remoteServerAddress.hasValue()
+    return remoteServerAddress.has_value()
         ? folly::
               SocketAddress{remoteServerAddress.value(), remoteServerPort.value()}
         : folly::SocketAddress{"::1", remoteServerPort.value()};
-  } else if (remoteServerAddress.hasValue()) {
+  } else if (remoteServerAddress.has_value()) {
     VELOX_FAIL(
         "Remote function server port not provided using '{}'.",
         kRemoteFunctionServerThriftPort);
@@ -341,6 +410,18 @@ int32_t SystemConfig::maxDriversPerTask() const {
   return optionalProperty<int32_t>(kMaxDriversPerTask).value();
 }
 
+int32_t SystemConfig::driverMaxSplitPreload() const {
+  return optionalProperty<int32_t>(kDriverMaxSplitPreload).value();
+}
+
+folly::Optional<int32_t> SystemConfig::taskWriterCount() const {
+  return optionalProperty<int32_t>(kTaskWriterCount);
+}
+
+folly::Optional<int32_t> SystemConfig::taskPartitionedWriterCount() const {
+  return optionalProperty<int32_t>(kTaskPartitionedWriterCount);
+}
+
 int32_t SystemConfig::concurrentLifespansPerTask() const {
   return optionalProperty<int32_t>(kConcurrentLifespansPerTask).value();
 }
@@ -361,6 +442,10 @@ double SystemConfig::exchangeHttpClientNumIoThreadsHwMultiplier() const {
 double SystemConfig::exchangeHttpClientNumCpuThreadsHwMultiplier() const {
   return optionalProperty<double>(kExchangeHttpClientNumCpuThreadsHwMultiplier)
       .value();
+}
+
+double SystemConfig::connectorNumCpuThreadsHwMultiplier() const {
+  return optionalProperty<double>(kConnectorNumCpuThreadsHwMultiplier).value();
 }
 
 double SystemConfig::connectorNumIoThreadsHwMultiplier() const {
@@ -385,12 +470,21 @@ size_t SystemConfig::driverCancelTasksWithStuckOperatorsThresholdMs() const {
       .value();
 }
 
+size_t SystemConfig::driverNumStuckOperatorsToDetachWorker() const {
+  return optionalProperty<size_t>(kDriverNumStuckOperatorsToDetachWorker)
+      .value();
+}
+
 double SystemConfig::spillerNumCpuThreadsHwMultiplier() const {
   return optionalProperty<double>(kSpillerNumCpuThreadsHwMultiplier).value();
 }
 
 std::string SystemConfig::spillerFileCreateConfig() const {
   return optionalProperty<std::string>(kSpillerFileCreateConfig).value();
+}
+
+std::string SystemConfig::spillerDirectoryCreateConfig() const {
+  return optionalProperty<std::string>(kSpillerDirectoryCreateConfig).value();
 }
 
 folly::Optional<std::string> SystemConfig::spillerSpillPath() const {
@@ -423,6 +517,29 @@ bool SystemConfig::systemMemPushbackEnabled() const {
 
 bool SystemConfig::systemMemPushBackAbortEnabled() const {
   return optionalProperty<bool>(kSystemMemPushbackAbortEnabled).value();
+}
+
+uint64_t SystemConfig::workerOverloadedThresholdMemGb() const {
+  return optionalProperty<uint64_t>(kWorkerOverloadedThresholdMemGb).value();
+}
+
+uint32_t SystemConfig::workerOverloadedThresholdCpuPct() const {
+  return optionalProperty<uint32_t>(kWorkerOverloadedThresholdCpuPct).value();
+}
+
+double SystemConfig::workerOverloadedThresholdNumQueuedDriversHwMultiplier()
+    const {
+  return optionalProperty<double>(
+             kWorkerOverloadedThresholdNumQueuedDriversHwMultiplier)
+      .value();
+}
+
+uint32_t SystemConfig::workerOverloadedCooldownPeriodSec() const {
+  return optionalProperty<uint32_t>(kWorkerOverloadedCooldownPeriodSec).value();
+}
+
+bool SystemConfig::workerOverloadedTaskQueuingEnabled() const {
+  return optionalProperty<bool>(kWorkerOverloadedTaskQueuingEnabled).value();
 }
 
 bool SystemConfig::mallocMemHeapDumpEnabled() const {
@@ -547,21 +664,12 @@ std::string SystemConfig::sharedArbitratorMemoryPoolReservedCapacity() const {
           std::string(kSharedArbitratorMemoryPoolReservedCapacityDefault));
 }
 
-std::string SystemConfig::sharedArbitratorMemoryPoolTransferCapacity() const {
+std::string SystemConfig::sharedArbitratorMaxMemoryArbitrationTime() const {
   static constexpr std::string_view
-      kSharedArbitratorMemoryPoolTransferCapacityDefault = "32MB";
+      kSharedArbitratorMaxMemoryArbitrationTimeDefault = "5m";
   return optionalProperty<std::string>(
-             kSharedArbitratorMemoryPoolTransferCapacity)
-      .value_or(
-          std::string(kSharedArbitratorMemoryPoolTransferCapacityDefault));
-}
-
-std::string SystemConfig::sharedArbitratorMemoryReclaimWaitTime() const {
-  static constexpr std::string_view
-      kSharedArbitratorMemoryReclaimMaxWaitTimeDefault = "5m";
-  return optionalProperty<std::string>(
-             kSharedArbitratorMemoryReclaimMaxWaitTime)
-      .value_or(std::string(kSharedArbitratorMemoryReclaimMaxWaitTimeDefault));
+             kSharedArbitratorMaxMemoryArbitrationTime)
+      .value_or(std::string(kSharedArbitratorMaxMemoryArbitrationTimeDefault));
 }
 
 std::string SystemConfig::sharedArbitratorFastExponentialGrowthCapacityLimit()
@@ -598,6 +706,63 @@ std::string SystemConfig::sharedArbitratorMemoryPoolMinFreeCapacityPct() const {
           std::string(kSharedArbitratorMemoryPoolMinFreeCapacityPctDefault));
 }
 
+std::string SystemConfig::sharedArbitratorMemoryPoolAbortCapacityLimit() const {
+  static constexpr std::string_view
+      kSharedArbitratorMemoryPoolAbortCapacityLimitDefault = "1GB";
+  return optionalProperty<std::string>(
+             kSharedArbitratorMemoryPoolAbortCapacityLimit)
+      .value_or(
+          std::string(kSharedArbitratorMemoryPoolAbortCapacityLimitDefault));
+}
+
+std::string SystemConfig::sharedArbitratorMemoryPoolMinReclaimBytes() const {
+  static constexpr std::string_view
+      kSharedArbitratorMemoryPoolMinReclaimBytesDefault = "128MB";
+  return optionalProperty<std::string>(
+             kSharedArbitratorMemoryPoolMinReclaimBytes)
+      .value_or(std::string(kSharedArbitratorMemoryPoolMinReclaimBytesDefault));
+}
+
+std::string SystemConfig::sharedArbitratorMemoryReclaimThreadsHwMultiplier()
+    const {
+  static constexpr std::string_view
+      kSharedArbitratorMemoryReclaimThreadsHwMultiplierDefault = "0.5";
+  return optionalProperty<std::string>(
+             kSharedArbitratorMemoryReclaimThreadsHwMultiplier)
+      .value_or(std::string(
+          kSharedArbitratorMemoryReclaimThreadsHwMultiplierDefault));
+}
+
+std::string SystemConfig::sharedArbitratorGlobalArbitrationMemoryReclaimPct()
+    const {
+  static constexpr std::string_view
+      kSharedArbitratorGlobalArbitrationMemoryReclaimPctDefault = "10";
+  return optionalProperty<std::string>(
+             kSharedArbitratorGlobalArbitrationMemoryReclaimPct)
+      .value_or(std::string(
+          kSharedArbitratorGlobalArbitrationMemoryReclaimPctDefault));
+}
+
+std::string SystemConfig::sharedArbitratorGlobalArbitrationAbortTimeRatio()
+    const {
+  static constexpr std::string_view
+      kSharedArbitratorGlobalArbitrationAbortTimeRatioDefault = "0.5";
+  return optionalProperty<std::string>(
+             kSharedArbitratorGlobalArbitrationAbortTimeRatio)
+      .value_or(
+          std::string(kSharedArbitratorGlobalArbitrationAbortTimeRatioDefault));
+}
+
+std::string SystemConfig::sharedArbitratorGlobalArbitrationWithoutSpill()
+    const {
+  static constexpr std::string_view
+      kSharedArbitratorGlobalArbitrationWithoutSpillDefault = "false";
+  return optionalProperty<std::string>(
+             kSharedArbitratorGlobalArbitrationWithoutSpill)
+      .value_or(
+          std::string(kSharedArbitratorGlobalArbitrationWithoutSpillDefault));
+}
+
 bool SystemConfig::enableSystemMemoryPoolUsageTracking() const {
   return optionalProperty<bool>(kEnableSystemMemoryPoolUsageTracking)
       .value_or(true);
@@ -613,10 +778,6 @@ bool SystemConfig::enableHttpStatsFilter() const {
 
 bool SystemConfig::enableHttpEndpointLatencyFilter() const {
   return optionalProperty<bool>(kHttpEnableEndpointLatencyFilter).value();
-}
-
-bool SystemConfig::registerTestFunctions() const {
-  return optionalProperty<bool>(kRegisterTestFunctions).value();
 }
 
 uint64_t SystemConfig::httpMaxAllocateBytes() const {
@@ -742,6 +903,39 @@ bool SystemConfig::enableRuntimeMetricsCollection() const {
   return optionalProperty<bool>(kEnableRuntimeMetricsCollection).value();
 }
 
+std::string SystemConfig::prestoDefaultNamespacePrefix() const {
+  return optionalProperty(kPrestoDefaultNamespacePrefix).value().append(".");
+}
+
+std::string SystemConfig::pluginDir() const {
+  return optionalProperty(kPluginDir).value();
+}
+
+int32_t SystemConfig::exchangeIoEvbViolationThresholdMs() const {
+  return optionalProperty<int32_t>(kExchangeIoEvbViolationThresholdMs).value();
+}
+
+int32_t SystemConfig::httpSrvIoEvbViolationThresholdMs() const {
+  return optionalProperty<int32_t>(kHttpSrvIoEvbViolationThresholdMs).value();
+}
+
+uint64_t SystemConfig::maxLocalExchangePartitionBufferSize() const {
+  return optionalProperty<uint64_t>(kMaxLocalExchangePartitionBufferSize)
+      .value();
+}
+
+bool SystemConfig::textWriterEnabled() const {
+  return optionalProperty<bool>(kTextWriterEnabled).value();
+}
+
+bool SystemConfig::charNToVarcharImplicitCast() const {
+  return optionalProperty<bool>(kCharNToVarcharImplicitCast).value();
+}
+
+bool SystemConfig::enumTypesEnabled() const {
+  return optionalProperty<bool>(kEnumTypesEnabled).value();
+}
+
 NodeConfig::NodeConfig() {
   registeredProps_ =
       std::unordered_map<std::string, folly::Optional<std::string>>{
@@ -750,6 +944,7 @@ NodeConfig::NodeConfig() {
           NONE_PROP(kNodeIp),
           NONE_PROP(kNodeInternalAddress),
           NONE_PROP(kNodeLocation),
+          NONE_PROP(kNodePrometheusExecutorThreads),
       };
 }
 
@@ -762,9 +957,18 @@ std::string NodeConfig::nodeEnvironment() const {
   return requiredProperty(kNodeEnvironment);
 }
 
+int NodeConfig::prometheusExecutorThreads() const {
+  static constexpr int kNodePrometheusExecutorThreadsDefault = 2;
+  auto resultOpt = optionalProperty<int>(kNodePrometheusExecutorThreads);
+  if (resultOpt.has_value()) {
+    return resultOpt.value();
+  }
+  return kNodePrometheusExecutorThreadsDefault;
+}
+
 std::string NodeConfig::nodeId() const {
   auto resultOpt = optionalProperty(kNodeId);
-  if (resultOpt.hasValue()) {
+  if (resultOpt.has_value()) {
     return resultOpt.value();
   }
   // Generate the nodeId which must be a UUID. nodeId must be a singleton.
@@ -782,7 +986,7 @@ std::string NodeConfig::nodeInternalAddress(
   auto resultOpt = optionalProperty(kNodeInternalAddress);
   /// node.ip(kNodeIp) is legacy config replaced with node.internal-address, but
   /// still valid config in Presto, so handling both.
-  if (!resultOpt.hasValue()) {
+  if (!resultOpt.has_value()) {
     resultOpt = optionalProperty(kNodeIp);
   }
   if (resultOpt.has_value()) {
@@ -793,117 +997,6 @@ std::string NodeConfig::nodeInternalAddress(
     VELOX_FAIL(
         "Node Internal Address or IP was not found in NodeConfigs. Default IP was not provided "
         "either.");
-  }
-}
-
-BaseVeloxQueryConfig::BaseVeloxQueryConfig() {
-  // Use empty instance to get default property values.
-  velox::core::QueryConfig c{{}};
-  using namespace velox::core;
-  registeredProps_ =
-      std::unordered_map<std::string, folly::Optional<std::string>>{
-          BOOL_PROP(kMutableConfig, false),
-          STR_PROP(QueryConfig::kSessionTimezone, c.sessionTimezone()),
-          BOOL_PROP(
-              QueryConfig::kAdjustTimestampToTimezone,
-              c.adjustTimestampToTimezone()),
-          BOOL_PROP(QueryConfig::kExprEvalSimplified, c.exprEvalSimplified()),
-          BOOL_PROP(QueryConfig::kExprTrackCpuUsage, c.exprTrackCpuUsage()),
-          BOOL_PROP(
-              QueryConfig::kOperatorTrackCpuUsage, c.operatorTrackCpuUsage()),
-          BOOL_PROP(
-              QueryConfig::kCastMatchStructByName, c.isMatchStructByName()),
-          NUM_PROP(
-              QueryConfig::kMaxLocalExchangeBufferSize,
-              c.maxLocalExchangeBufferSize()),
-          NUM_PROP(
-              QueryConfig::kMaxPartialAggregationMemory,
-              c.maxPartialAggregationMemoryUsage()),
-          NUM_PROP(
-              QueryConfig::kMaxExtendedPartialAggregationMemory,
-              c.maxExtendedPartialAggregationMemoryUsage()),
-          NUM_PROP(
-              QueryConfig::kAbandonPartialAggregationMinRows,
-              c.abandonPartialAggregationMinRows()),
-          NUM_PROP(
-              QueryConfig::kAbandonPartialAggregationMinPct,
-              c.abandonPartialAggregationMinPct()),
-          NUM_PROP(
-              QueryConfig::kMaxPartitionedOutputBufferSize,
-              c.maxPartitionedOutputBufferSize()),
-          NUM_PROP(
-              QueryConfig::kPreferredOutputBatchBytes,
-              c.preferredOutputBatchBytes()),
-          NUM_PROP(
-              QueryConfig::kPreferredOutputBatchRows,
-              c.preferredOutputBatchRows()),
-          NUM_PROP(QueryConfig::kMaxOutputBatchRows, c.maxOutputBatchRows()),
-          BOOL_PROP(
-              QueryConfig::kHashAdaptivityEnabled, c.hashAdaptivityEnabled()),
-          BOOL_PROP(
-              QueryConfig::kAdaptiveFilterReorderingEnabled,
-              c.adaptiveFilterReorderingEnabled()),
-          BOOL_PROP(QueryConfig::kSpillEnabled, c.spillEnabled()),
-          BOOL_PROP(
-              QueryConfig::kAggregationSpillEnabled,
-              c.aggregationSpillEnabled()),
-          BOOL_PROP(QueryConfig::kJoinSpillEnabled, c.joinSpillEnabled()),
-          BOOL_PROP(QueryConfig::kOrderBySpillEnabled, c.orderBySpillEnabled()),
-          NUM_PROP(QueryConfig::kMaxSpillLevel, c.maxSpillLevel()),
-          NUM_PROP(QueryConfig::kMaxSpillFileSize, c.maxSpillFileSize()),
-          NUM_PROP(
-              QueryConfig::kSpillStartPartitionBit, c.spillStartPartitionBit()),
-          NUM_PROP(
-              QueryConfig::kSpillNumPartitionBits, c.spillNumPartitionBits()),
-          NUM_PROP(
-              QueryConfig::kSpillableReservationGrowthPct,
-              c.spillableReservationGrowthPct()),
-          BOOL_PROP(
-              QueryConfig::kPrestoArrayAggIgnoreNulls,
-              c.prestoArrayAggIgnoreNulls()),
-          BOOL_PROP(
-              QueryConfig::kSelectiveNimbleReaderEnabled,
-              c.selectiveNimbleReaderEnabled()),
-          NUM_PROP(QueryConfig::kMaxOutputBufferSize, c.maxOutputBufferSize()),
-      };
-}
-
-BaseVeloxQueryConfig* BaseVeloxQueryConfig::instance() {
-  static std::unique_ptr<BaseVeloxQueryConfig> instance =
-      std::make_unique<BaseVeloxQueryConfig>();
-  return instance.get();
-}
-
-void BaseVeloxQueryConfig::updateLoadedValues(
-    std::unordered_map<std::string, std::string>& values) const {
-  // Update velox config with values from presto system config.
-  auto systemConfig = SystemConfig::instance();
-
-  using namespace velox::core;
-  const std::unordered_map<std::string, std::string> updatedValues{
-      {QueryConfig::kPrestoArrayAggIgnoreNulls,
-       bool2String(systemConfig->useLegacyArrayAgg())},
-      {QueryConfig::kMaxOutputBufferSize,
-       systemConfig->capacityPropertyAsBytesString(
-           SystemConfig::kSinkMaxBufferSize)},
-      {QueryConfig::kMaxPartitionedOutputBufferSize,
-       systemConfig->capacityPropertyAsBytesString(
-           SystemConfig::kDriverMaxPagePartitioningBufferSize)},
-      {QueryConfig::kMaxPartialAggregationMemory,
-       systemConfig->capacityPropertyAsBytesString(
-           SystemConfig::kTaskMaxPartialAggregationMemory)},
-  };
-
-  std::stringstream updated;
-  for (const auto& pair : updatedValues) {
-    updated << "  " << pair.first << "=" << pair.second << "\n";
-    values[pair.first] = pair.second;
-  }
-  auto str = updated.str();
-  if (!str.empty()) {
-    PRESTO_STARTUP_LOG(INFO)
-        << "Updated in '" << filePath_ << "' from SystemProperties:\n"
-        << str;
   }
 }
 

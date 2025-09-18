@@ -16,7 +16,6 @@ package com.facebook.presto.iceberg;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
 import com.google.common.base.Joiner;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
@@ -24,7 +23,7 @@ import org.testng.annotations.Test;
 import java.util.Arrays;
 import java.util.stream.Collectors;
 
-import static com.facebook.presto.iceberg.IcebergQueryRunner.createIcebergQueryRunner;
+import static com.facebook.presto.iceberg.CatalogType.HADOOP;
 
 public class TestIcebergTableChangelog
         extends AbstractTestQueryFramework
@@ -33,7 +32,10 @@ public class TestIcebergTableChangelog
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        return createIcebergQueryRunner(ImmutableMap.of(), CatalogType.HADOOP);
+        return IcebergQueryRunner.builder()
+                .setCatalogType(HADOOP)
+                .build()
+                .getQueryRunner();
     }
 
     private long[] snapshots = new long[0];
@@ -63,10 +65,10 @@ public class TestIcebergTableChangelog
     {
         assertQuery(String.format("SHOW COLUMNS FROM \"ctas_orders@%d$changelog\"", snapshots[0]),
                 "VALUES" +
-                        "('operation', 'varchar', '', '')," +
-                        "('ordinal', 'bigint', '', '')," +
-                        "('snapshotid', 'bigint', '', '')," +
-                        "('rowdata', 'row(\"orderkey\" bigint, \"custkey\" bigint, \"orderstatus\" varchar, \"totalprice\" double, \"orderdate\" date, \"orderpriority\" varchar, \"clerk\" varchar, \"shippriority\" integer, \"comment\" varchar)', '', '')");
+                        "('operation', 'varchar', '', '', null ,null, 2147483647)," +
+                        "('ordinal', 'bigint', '', '', 19, null, null)," +
+                        "('snapshotid', 'bigint', '', '', 19, null, null)," +
+                        "('rowdata', 'row(\"orderkey\" bigint, \"custkey\" bigint, \"orderstatus\" varchar, \"totalprice\" double, \"orderdate\" date, \"orderpriority\" varchar, \"clerk\" varchar, \"shippriority\" integer, \"comment\" varchar)', '', '', null, null, null)");
     }
 
     @Test
@@ -305,5 +307,29 @@ public class TestIcebergTableChangelog
         return getQueryRunner().execute(String.format("SELECT snapshot_id FROM \"%s$snapshots\" ORDER BY committed_at", tableName)).getOnlyColumn()
                 .mapToLong(Long.class::cast)
                 .skip(idx).findFirst().getAsLong();
+    }
+
+    @Test
+    public void testApplyChangelogFunctionInSystemNamespace()
+    {
+        assertQuery(
+                "SELECT iceberg.system.apply_changelog(1, 'INSERT', 'test_value') IS NOT NULL",
+                "SELECT true");
+    }
+
+    @Test
+    public void testApplyChangelogFunctionNotInGlobalNamespace()
+    {
+        assertQueryFails(
+                "SELECT apply_changelog(1, 'INSERT', 'test_value')",
+                "line 1:8: Function apply_changelog not registered");
+    }
+
+    @Test
+    public void testApplyChangelogFunctionNotInPrestoDefaultNamespace()
+    {
+        assertQueryFails(
+                "SELECT presto.default.apply_changelog(1, 'INSERT', 'test_value')",
+                "line 1:8: Function apply_changelog not registered");
     }
 }

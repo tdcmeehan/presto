@@ -16,6 +16,7 @@ package com.facebook.presto.spark.execution.task;
 import com.facebook.airlift.json.Codec;
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.log.Logger;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.Session;
 import com.facebook.presto.common.RuntimeUnit;
 import com.facebook.presto.common.block.BlockEncodingManager;
@@ -63,17 +64,16 @@ import com.facebook.presto.spi.page.SerializedPage;
 import com.facebook.presto.spi.plan.PlanFragmentId;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
+import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.security.TokenAuthenticator;
 import com.facebook.presto.split.RemoteSplit;
 import com.facebook.presto.sql.planner.PlanFragment;
 import com.facebook.presto.sql.planner.plan.RemoteSourceNode;
-import com.facebook.presto.sql.planner.plan.TableWriterNode;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.sun.management.OperatingSystemMXBean;
-import io.airlift.units.Duration;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.util.CollectionAccumulator;
 import scala.Tuple2;
@@ -94,6 +94,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static com.facebook.airlift.units.DataSize.succinctBytes;
 import static com.facebook.presto.operator.ExchangeOperator.REMOTE_CONNECTOR_ID;
 import static com.facebook.presto.spark.PrestoSparkSessionProperties.getNativeExecutionBroadcastBasePath;
 import static com.facebook.presto.spark.PrestoSparkSessionProperties.getNativeTerminateWithCoreTimeout;
@@ -108,7 +109,6 @@ import static com.facebook.presto.sql.planner.SystemPartitioningHandle.FIXED_BRO
 import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
-import static io.airlift.units.DataSize.succinctBytes;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
@@ -398,7 +398,7 @@ public class PrestoSparkNativeTaskExecutorFactory
             RuntimeException failure = taskInfo.getTaskStatus().getFailures().stream()
                     .findFirst()
                     .map(ExecutionFailureInfo::toException)
-                    .orElse(new PrestoException(GENERIC_INTERNAL_ERROR, "Native task failed for an unknown reason"));
+                    .orElseGet(() -> new PrestoException(GENERIC_INTERNAL_ERROR, "Native task failed for an unknown reason"));
             throw failure;
         }
 

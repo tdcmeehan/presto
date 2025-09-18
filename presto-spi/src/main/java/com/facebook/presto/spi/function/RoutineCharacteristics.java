@@ -19,6 +19,7 @@ import com.facebook.drift.annotations.ThriftEnumValue;
 import com.facebook.drift.annotations.ThriftField;
 import com.facebook.drift.annotations.ThriftStruct;
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonValue;
 
@@ -39,6 +40,7 @@ public class RoutineCharacteristics
     public static class Language
     {
         public static final Language SQL = new Language("SQL");
+        public static final Language JAVA = new Language("Java");
         public static final Language CPP = new Language("CPP");
 
         private final String language;
@@ -86,8 +88,8 @@ public class RoutineCharacteristics
     @ThriftEnum
     public enum Determinism
     {
-        DETERMINISTIC(1),
-        NOT_DETERMINISTIC(2);
+        DETERMINISTIC(0),
+        NOT_DETERMINISTIC(1);
         private final int value;
 
         private Determinism(int value)
@@ -105,8 +107,8 @@ public class RoutineCharacteristics
     @ThriftEnum
     public enum NullCallClause
     {
-        RETURNS_NULL_ON_NULL_INPUT(1),
-        CALLED_ON_NULL_INPUT(2);
+        RETURNS_NULL_ON_NULL_INPUT(0),
+        CALLED_ON_NULL_INPUT(1);
         private final int value;
 
         private NullCallClause(int value)
@@ -165,11 +167,13 @@ public class RoutineCharacteristics
         return nullCallClause;
     }
 
+    @JsonIgnore
     public boolean isDeterministic()
     {
         return determinism == DETERMINISTIC;
     }
 
+    @JsonIgnore
     public boolean isCalledOnNullInput()
     {
         return nullCallClause == CALLED_ON_NULL_INPUT;

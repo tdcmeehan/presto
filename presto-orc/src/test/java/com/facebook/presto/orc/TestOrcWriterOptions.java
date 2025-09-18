@@ -13,21 +13,21 @@
  */
 package com.facebook.presto.orc;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.orc.metadata.DwrfStripeCacheMode;
 import com.facebook.presto.orc.writer.StreamLayoutFactory;
 import com.facebook.presto.orc.writer.StreamLayoutFactory.ColumnSizeLayoutFactory;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
-import io.airlift.units.DataSize;
 import org.testng.annotations.Test;
 
 import java.util.Optional;
 import java.util.OptionalInt;
 
+import static com.facebook.airlift.units.DataSize.Unit.BYTE;
+import static com.facebook.airlift.units.DataSize.Unit.KILOBYTE;
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.orc.metadata.DwrfStripeCacheMode.INDEX_AND_FOOTER;
-import static io.airlift.units.DataSize.Unit.BYTE;
-import static io.airlift.units.DataSize.Unit.KILOBYTE;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.lang.Math.toIntExact;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
@@ -160,6 +160,8 @@ public class TestOrcWriterOptions
         int preserveDirectEncodingStripeCount = 0;
         boolean mapStatisticsEnabled = true;
         int maxFlattenedMapKeyCount = 27;
+        boolean resetOutputBuffer = false;
+        boolean lazyOutputBuffer = false;
 
         OrcWriterOptions writerOptions = OrcWriterOptions.builder()
                 .withFlushPolicy(DefaultOrcWriterFlushPolicy.builder()
@@ -185,6 +187,8 @@ public class TestOrcWriterOptions
                 .withFlattenedColumns(ImmutableSet.of(4))
                 .withMapStatisticsEnabled(mapStatisticsEnabled)
                 .withMaxFlattenedMapKeyCount(maxFlattenedMapKeyCount)
+                .withResetOutputBuffer(resetOutputBuffer)
+                .withLazyOutputBuffer(lazyOutputBuffer)
                 .build();
 
         String expectedString = "OrcWriterOptions{flushPolicy=DefaultOrcWriterFlushPolicy{stripeMaxRowCount=1100000, " +
@@ -195,7 +199,7 @@ public class TestOrcWriterOptions
                 "stringDictionarySortingEnabled=true, stringDictionaryEncodingEnabled=true, " +
                 "dwrfWriterOptions=Optional[DwrfStripeCacheOptions{stripeCacheMode=INDEX_AND_FOOTER, stripeCacheMaxSize=4MB}], " +
                 "ignoreDictionaryRowGroupSizes=false, preserveDirectEncodingStripeCount=0, flattenedColumns=[4], mapStatisticsEnabled=true, " +
-                "maxFlattenedMapKeyCount=27}";
+                "maxFlattenedMapKeyCount=27, resetOutputBuffer=false, lazyOutputBuffer=false}";
         assertEquals(expectedString, writerOptions.toString());
     }
 }

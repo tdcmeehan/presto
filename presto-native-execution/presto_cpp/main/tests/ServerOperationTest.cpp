@@ -14,10 +14,10 @@
 #include "presto_cpp/main/ServerOperation.h"
 #include <gtest/gtest.h>
 #include "presto_cpp/main/PrestoServerOperations.h"
-#include "velox/common/base/Exceptions.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
 DECLARE_bool(velox_memory_leak_check_enabled);
@@ -26,10 +26,14 @@ using namespace facebook::velox;
 
 namespace facebook::presto {
 
-class ServerOperationTest : public testing::Test {
+class ServerOperationTest : public exec::test::OperatorTestBase {
   void SetUp() override {
     FLAGS_velox_memory_leak_check_enabled = true;
-    memory::MemoryManager::testingSetInstance({});
+    exec::test::OperatorTestBase::SetUp();
+  }
+
+  void TearDown() override {
+    exec::test::OperatorTestBase::TearDown();
   }
 };
 
@@ -136,6 +140,11 @@ TEST_F(ServerOperationTest, buildServerOp) {
 
 TEST_F(ServerOperationTest, taskEndpoint) {
   // Setup environment for TaskManager
+  if (!connector::hasConnectorFactory(
+          connector::hive::HiveConnectorFactory::kHiveConnectorName)) {
+    connector::registerConnectorFactory(
+        std::make_shared<connector::hive::HiveConnectorFactory>());
+  }
   auto hiveConnector =
       connector::getConnectorFactory(
           connector::hive::HiveConnectorFactory::kHiveConnectorName)
@@ -166,8 +175,9 @@ TEST_F(ServerOperationTest, taskEndpoint) {
             taskId,
             {},
             planFragment,
+            true,
             taskManager->getQueryContextManager()->findOrCreateQueryCtx(
-                taskId, updateRequest.session),
+                taskId, updateRequest),
             0);
       };
   std::vector<std::string> taskIds = {"task_0.0.0.0.0", "task_1.0.0.0.0"};
@@ -206,7 +216,7 @@ TEST_F(ServerOperationTest, taskEndpoint) {
 
   // Cleanup and shutdown
   for (const auto& taskId : taskIds) {
-    taskManager->deleteTask(taskId, true);
+    taskManager->deleteTask(taskId, true, true);
   }
   taskManager->shutdown();
   connector::unregisterConnector("test-hive");
@@ -230,7 +240,8 @@ TEST_F(ServerOperationTest, systemConfigEndpoint) {
       {.target = ServerOperation::Target::kSystemConfig,
        .action = ServerOperation::Action::kGetProperty},
       &httpMessage);
-  EXPECT_EQ(getPropertyResponse, "16\n");
+  EXPECT_EQ(
+      std::stoi(getPropertyResponse), std::thread::hardware_concurrency());
 }
 
 } // namespace facebook::presto

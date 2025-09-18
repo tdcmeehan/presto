@@ -69,7 +69,18 @@ public final class MemoryColumnHandle
 
     public ColumnMetadata toColumnMetadata()
     {
-        return new ColumnMetadata(name, columnType);
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(columnType)
+                .build();
+    }
+
+    public ColumnMetadata toColumnMetadata(String name)
+    {
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(columnType)
+                .build();
     }
 
     @Override

@@ -38,6 +38,8 @@ import com.facebook.presto.spi.plan.JoinType;
 import com.facebook.presto.spi.plan.PlanFragmentId;
 import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
+import com.facebook.presto.spiller.NodeSpillConfig;
+import com.facebook.presto.sql.analyzer.JavaFeaturesConfig;
 import com.facebook.presto.sql.planner.iterative.rule.test.RuleAssert;
 import com.facebook.presto.sql.planner.iterative.rule.test.RuleTester;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
@@ -51,6 +53,7 @@ import org.testng.annotations.Test;
 
 import java.util.Arrays;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static com.facebook.presto.SystemSessionProperties.JOIN_MAX_BROADCAST_TABLE_SIZE;
 import static com.facebook.presto.SystemSessionProperties.TASK_CONCURRENCY;
@@ -60,9 +63,11 @@ import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTAN
 import static com.facebook.presto.spark.PrestoSparkSessionProperties.ADAPTIVE_JOIN_SIDE_SWITCHING_ENABLED;
 import static com.facebook.presto.spi.plan.JoinDistributionType.PARTITIONED;
 import static com.facebook.presto.spi.plan.JoinDistributionType.REPLICATED;
+import static com.facebook.presto.spi.plan.JoinNode.flipType;
 import static com.facebook.presto.spi.plan.JoinType.INNER;
 import static com.facebook.presto.spi.plan.JoinType.LEFT;
 import static com.facebook.presto.spi.plan.JoinType.RIGHT;
+import static com.facebook.presto.spi.plan.JoinType.SOURCE_OUTER;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.equiJoinClause;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.exchange;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.filter;
@@ -70,7 +75,6 @@ import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.join;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.remoteSource;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.values;
 import static com.facebook.presto.sql.planner.iterative.rule.test.PlanBuilder.constantExpressions;
-import static com.facebook.presto.sql.planner.plan.JoinNode.flipType;
 import static com.facebook.presto.testing.TestngUtils.toDataProvider;
 
 @Test(singleThreaded = true)
@@ -86,7 +90,7 @@ public class TestPickJoinSides
         tester = new RuleTester(
                 ImmutableList.of(),
                 ImmutableMap.of(),
-                new PrestoSparkSessionPropertyManagerProvider(new SystemSessionProperties(), new PrestoSparkSessionProperties()).get(),
+                new PrestoSparkSessionPropertyManagerProvider(new SystemSessionProperties(), new PrestoSparkSessionProperties(), new ConcurrentHashMap<>(), new JavaFeaturesConfig(), new NodeSpillConfig()).get(),
                 Optional.of(NODES_COUNT),
                 new TpchConnectorFactory(1));
     }
@@ -102,6 +106,7 @@ public class TestPickJoinSides
     public static Object[][] joinTypes()
     {
         return Arrays.stream(JoinType.values())
+                .filter(type -> type != SOURCE_OUTER)
                 .collect(toDataProvider());
     }
 
@@ -379,7 +384,7 @@ public class TestPickJoinSides
     {
         int aSize = 100;
         int bSize = 10_000;
-        tester.assertThat(new PickJoinSides(tester.getMetadata()))
+        tester.assertThat(new PickJoinSides(tester.getMetadata(), false))
                 .setSystemProperty(ADAPTIVE_JOIN_SIDE_SWITCHING_ENABLED, "false")
                 .overrideStats("valuesA", PlanNodeStatsEstimate.builder()
                         .setTotalSize(aSize)
@@ -470,7 +475,7 @@ public class TestPickJoinSides
 
     private RuleAssert assertPickJoinSides()
     {
-        return tester.assertThat(new PickJoinSides(tester.getMetadata()))
+        return tester.assertThat(new PickJoinSides(tester.getMetadata(), false))
                 .setSystemProperty(JOIN_MAX_BROADCAST_TABLE_SIZE, "100MB")
                 .setSystemProperty(ADAPTIVE_JOIN_SIDE_SWITCHING_ENABLED, "true");
     }

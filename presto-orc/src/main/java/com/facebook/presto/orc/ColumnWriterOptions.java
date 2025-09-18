@@ -13,21 +13,25 @@
  */
 package com.facebook.presto.orc;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.orc.metadata.CompressionKind;
 import com.facebook.presto.orc.writer.CompressionBufferPool;
 import com.facebook.presto.orc.writer.CompressionBufferPool.LastUsedCompressionBufferPool;
 import com.google.common.collect.ImmutableSet;
-import io.airlift.units.DataSize;
 
 import java.util.OptionalInt;
 import java.util.Set;
 
+import static com.facebook.airlift.units.DataSize.Unit.BYTE;
+import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_LAZY_OUTPUT_BUFFER;
 import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_MAX_COMPRESSION_BUFFER_SIZE;
 import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_MAX_FLATTENED_MAP_KEY_COUNT;
+import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_MAX_OUTPUT_BUFFER_CHUNK_SIZE;
 import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_MAX_STRING_STATISTICS_LIMIT;
+import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_MIN_OUTPUT_BUFFER_CHUNK_SIZE;
 import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_PRESERVE_DIRECT_ENCODING_STRIPE_COUNT;
+import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_RESET_OUTPUT_BUFFER;
 import static com.google.common.base.Preconditions.checkArgument;
-import static io.airlift.units.DataSize.Unit.BYTE;
 import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
@@ -36,6 +40,8 @@ public class ColumnWriterOptions
     private final CompressionKind compressionKind;
     private final OptionalInt compressionLevel;
     private final int compressionMaxBufferSize;
+    private final int minOutputBufferChunkSize;
+    private final int maxOutputBufferChunkSize;
     private final DataSize stringStatisticsLimit;
     private final boolean integerDictionaryEncodingEnabled;
     private final boolean stringDictionarySortingEnabled;
@@ -46,11 +52,15 @@ public class ColumnWriterOptions
     private final Set<Integer> flattenedNodes;
     private final boolean mapStatisticsEnabled;
     private final int maxFlattenedMapKeyCount;
+    private final boolean resetOutputBuffer;
+    private final boolean lazyOutputBuffer;
 
     public ColumnWriterOptions(
             CompressionKind compressionKind,
             OptionalInt compressionLevel,
             DataSize compressionMaxBufferSize,
+            DataSize minOutputBufferChunkSize,
+            DataSize maxOutputBufferChunkSize,
             DataSize stringStatisticsLimit,
             boolean integerDictionaryEncodingEnabled,
             boolean stringDictionarySortingEnabled,
@@ -60,7 +70,9 @@ public class ColumnWriterOptions
             CompressionBufferPool compressionBufferPool,
             Set<Integer> flattenedNodes,
             boolean mapStatisticsEnabled,
-            int maxFlattenedMapKeyCount)
+            int maxFlattenedMapKeyCount,
+            boolean resetOutputBuffer,
+            boolean lazyOutputBuffer)
     {
         checkArgument(maxFlattenedMapKeyCount > 0, "maxFlattenedMapKeyCount must be positive: %s", maxFlattenedMapKeyCount);
         requireNonNull(compressionMaxBufferSize, "compressionMaxBufferSize is null");
@@ -68,6 +80,8 @@ public class ColumnWriterOptions
         this.compressionKind = requireNonNull(compressionKind, "compressionKind is null");
         this.compressionLevel = requireNonNull(compressionLevel, "compressionLevel is null");
         this.compressionMaxBufferSize = toIntExact(compressionMaxBufferSize.toBytes());
+        this.minOutputBufferChunkSize = toIntExact(minOutputBufferChunkSize.toBytes());
+        this.maxOutputBufferChunkSize = toIntExact(maxOutputBufferChunkSize.toBytes());
         this.stringStatisticsLimit = requireNonNull(stringStatisticsLimit, "stringStatisticsLimit is null");
         this.integerDictionaryEncodingEnabled = integerDictionaryEncodingEnabled;
         this.stringDictionarySortingEnabled = stringDictionarySortingEnabled;
@@ -78,6 +92,8 @@ public class ColumnWriterOptions
         this.flattenedNodes = requireNonNull(flattenedNodes, "flattenedNodes is null");
         this.mapStatisticsEnabled = mapStatisticsEnabled;
         this.maxFlattenedMapKeyCount = maxFlattenedMapKeyCount;
+        this.resetOutputBuffer = resetOutputBuffer;
+        this.lazyOutputBuffer = lazyOutputBuffer;
     }
 
     public CompressionKind getCompressionKind()
@@ -93,6 +109,16 @@ public class ColumnWriterOptions
     public int getCompressionMaxBufferSize()
     {
         return compressionMaxBufferSize;
+    }
+
+    public int getMinOutputBufferChunkSize()
+    {
+        return minOutputBufferChunkSize;
+    }
+
+    public int getMaxOutputBufferChunkSize()
+    {
+        return maxOutputBufferChunkSize;
     }
 
     public int getStringStatisticsLimit()
@@ -145,6 +171,15 @@ public class ColumnWriterOptions
         return maxFlattenedMapKeyCount;
     }
 
+    public boolean isResetOutputBuffer()
+    {
+        return resetOutputBuffer;
+    }
+
+    public boolean isLazyOutputBuffer()
+    {
+        return lazyOutputBuffer;
+    }
     /**
      * Create a copy of this ColumnWriterOptions, but disable string and integer dictionary encodings.
      */
@@ -162,6 +197,8 @@ public class ColumnWriterOptions
                 .setCompressionKind(getCompressionKind())
                 .setCompressionLevel(getCompressionLevel())
                 .setCompressionMaxBufferSize(new DataSize(getCompressionMaxBufferSize(), BYTE))
+                .setMinOutputBufferChunkSize(new DataSize(getMinOutputBufferChunkSize(), BYTE))
+                .setMaxOutputBufferChunkSize(new DataSize(getMaxOutputBufferChunkSize(), BYTE))
                 .setStringStatisticsLimit(new DataSize(getStringStatisticsLimit(), BYTE))
                 .setIntegerDictionaryEncodingEnabled(isIntegerDictionaryEncodingEnabled())
                 .setStringDictionarySortingEnabled(isStringDictionarySortingEnabled())
@@ -171,7 +208,9 @@ public class ColumnWriterOptions
                 .setCompressionBufferPool(getCompressionBufferPool())
                 .setFlattenedNodes(getFlattenedNodes())
                 .setMapStatisticsEnabled(isMapStatisticsEnabled())
-                .setMaxFlattenedMapKeyCount(getMaxFlattenedMapKeyCount());
+                .setMaxFlattenedMapKeyCount(getMaxFlattenedMapKeyCount())
+                .setResetOutputBuffer(resetOutputBuffer)
+                .setLazyOutputBuffer(lazyOutputBuffer);
     }
 
     public static Builder builder()
@@ -184,6 +223,8 @@ public class ColumnWriterOptions
         private CompressionKind compressionKind;
         private OptionalInt compressionLevel = OptionalInt.empty();
         private DataSize compressionMaxBufferSize = DEFAULT_MAX_COMPRESSION_BUFFER_SIZE;
+        private DataSize minOutputBufferChunkSize = DEFAULT_MIN_OUTPUT_BUFFER_CHUNK_SIZE;
+        private DataSize maxOutputBufferChunkSize = DEFAULT_MAX_OUTPUT_BUFFER_CHUNK_SIZE;
         private DataSize stringStatisticsLimit = DEFAULT_MAX_STRING_STATISTICS_LIMIT;
         private boolean integerDictionaryEncodingEnabled;
         private boolean stringDictionarySortingEnabled = true;
@@ -194,6 +235,8 @@ public class ColumnWriterOptions
         private Set<Integer> flattenedNodes = ImmutableSet.of();
         private boolean mapStatisticsEnabled;
         private int maxFlattenedMapKeyCount = DEFAULT_MAX_FLATTENED_MAP_KEY_COUNT;
+        private boolean resetOutputBuffer = DEFAULT_RESET_OUTPUT_BUFFER;
+        private boolean lazyOutputBuffer = DEFAULT_LAZY_OUTPUT_BUFFER;
 
         private Builder() {}
 
@@ -212,6 +255,18 @@ public class ColumnWriterOptions
         public Builder setCompressionMaxBufferSize(DataSize compressionMaxBufferSize)
         {
             this.compressionMaxBufferSize = compressionMaxBufferSize;
+            return this;
+        }
+
+        public Builder setMinOutputBufferChunkSize(DataSize minOutputBufferChunkSize)
+        {
+            this.minOutputBufferChunkSize = minOutputBufferChunkSize;
+            return this;
+        }
+
+        public Builder setMaxOutputBufferChunkSize(DataSize maxOutputBufferChunkSize)
+        {
+            this.maxOutputBufferChunkSize = maxOutputBufferChunkSize;
             return this;
         }
 
@@ -275,12 +330,26 @@ public class ColumnWriterOptions
             return this;
         }
 
+        public Builder setResetOutputBuffer(boolean resetOutputBuffer)
+        {
+            this.resetOutputBuffer = resetOutputBuffer;
+            return this;
+        }
+
+        public Builder setLazyOutputBuffer(boolean lazyOutputBuffer)
+        {
+            this.lazyOutputBuffer = lazyOutputBuffer;
+            return this;
+        }
+
         public ColumnWriterOptions build()
         {
             return new ColumnWriterOptions(
                     compressionKind,
                     compressionLevel,
                     compressionMaxBufferSize,
+                    minOutputBufferChunkSize,
+                    maxOutputBufferChunkSize,
                     stringStatisticsLimit,
                     integerDictionaryEncodingEnabled,
                     stringDictionarySortingEnabled,
@@ -290,7 +359,9 @@ public class ColumnWriterOptions
                     compressionBufferPool,
                     flattenedNodes,
                     mapStatisticsEnabled,
-                    maxFlattenedMapKeyCount);
+                    maxFlattenedMapKeyCount,
+                    resetOutputBuffer,
+                    lazyOutputBuffer);
         }
     }
 }

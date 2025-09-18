@@ -16,6 +16,7 @@ package com.facebook.presto.hive.security;
 
 import com.facebook.presto.common.Subfield;
 import com.facebook.presto.plugin.base.security.ForwardingConnectorAccessControl;
+import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.connector.ConnectorAccessControl;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
@@ -25,11 +26,14 @@ import com.facebook.presto.spi.security.ConnectorIdentity;
 import com.facebook.presto.spi.security.PrestoPrincipal;
 import com.facebook.presto.spi.security.Privilege;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
 import static com.facebook.presto.hive.HiveMetadata.getSourceTableNameFromSystemTable;
 import static com.facebook.presto.spi.security.AccessDeniedException.denySelectTable;
+import static com.facebook.presto.spi.security.AccessDeniedException.denyShowColumnsMetadata;
 import static java.util.Objects.requireNonNull;
 
 public class SystemTableAwareAccessControl
@@ -84,6 +88,12 @@ public class SystemTableAwareAccessControl
     }
 
     @Override
+    public void checkCanSetTableProperties(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName, Map<String, Object> properties)
+    {
+        delegate.checkCanSetTableProperties(transactionHandle, identity, context, tableName, properties);
+    }
+
+    @Override
     public void checkCanDropTable(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
     {
         delegate.checkCanDropTable(transactionHandle, identity, context, tableName);
@@ -105,6 +115,34 @@ public class SystemTableAwareAccessControl
     public Set<SchemaTableName> filterTables(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, Set<SchemaTableName> tableNames)
     {
         return delegate.filterTables(transactionHandle, identity, context, tableNames);
+    }
+
+    @Override
+    public void checkCanShowColumnsMetadata(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
+    {
+        Optional<SchemaTableName> sourceTableName = getSourceTableNameFromSystemTable(tableName);
+        if (sourceTableName.isPresent()) {
+            try {
+                checkCanShowColumnsMetadata(transactionHandle, identity, context, sourceTableName.get());
+                return;
+            }
+            catch (AccessDeniedException e) {
+                denyShowColumnsMetadata(tableName.toString());
+            }
+        }
+
+        delegate.checkCanShowColumnsMetadata(transactionHandle, identity, context, tableName);
+    }
+
+    @Override
+    public List<ColumnMetadata> filterColumns(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName, List<ColumnMetadata> columns)
+    {
+        Optional<SchemaTableName> sourceTableName = getSourceTableNameFromSystemTable(tableName);
+        if (sourceTableName.isPresent()) {
+            return filterColumns(transactionHandle, identity, context, sourceTableName.get(), columns);
+        }
+
+        return delegate.filterColumns(transactionHandle, identity, context, tableName, columns);
     }
 
     @Override
@@ -164,6 +202,12 @@ public class SystemTableAwareAccessControl
     public void checkCanCreateView(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName viewName)
     {
         delegate.checkCanCreateView(transactionHandle, identity, context, viewName);
+    }
+
+    @Override
+    public void checkCanRenameView(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName viewName, SchemaTableName newViewName)
+    {
+        delegate.checkCanRenameView(transactionHandle, identity, context, viewName, newViewName);
     }
 
     @Override

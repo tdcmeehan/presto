@@ -51,6 +51,10 @@ Property Name                         Description
 ``mongodb.write-concern``             The write concern
 ``mongodb.required-replica-set``      The required replica set name
 ``mongodb.cursor-batch-size``         The number of elements to return in a batch
+``case-sensitive-name-matching``      Enable case-sensitive identifier support for schema,
+                                      table, and column names for the connector. When disabled,
+                                      names are matched case-insensitively using lowercase
+                                      normalization. Default is ``false``
 ===================================== ==============================================================
 
 ``mongodb.seeds``
@@ -124,7 +128,9 @@ This property is optional; the default is ``false``.
 
 This flag enables SSL connections to MongoDB servers.
 
-This property is optional; the default is ``false``.
+This property is optional and defaults to ``false``. If you set it to ``true`` and host Presto yourself, it’s likely that you also use a TLS CA file.
+
+For setup instructions, see :ref:`tls-ca-definition-label`.
 
 ``mongodb.read-preference``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -165,6 +171,89 @@ If batchSize is negative, it will limit of number objects returned, that fit wit
 .. note:: Do not use a batch size of ``1``.
 
 This property is optional; the default is ``0``.
+
+.. _tls-ca-definition-label:
+
+Configuring the MongoDB Connector to Use a TLS CA File
+------------------------------------------------------
+
+A TLS CA file may be required to connect securely to a MongoDB cluster hosted on DigitalOcean. MongoDB clusters are hosted on multiple nodes, each with its own hostname. Cluster hostnames do not resolve using standard ``dig`` requests to the hostname in the connection string.
+
+Retrieve the Node Hostnames
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+To retrieve the node hostnames of a cluster using ``dig``, specify the ``srv`` record type in the request and prepend ``_mongodb._tcp.`` to the hostname in the connection string, as shown below:
+
+.. code-block:: bash
+
+    dig srv _mongodb._tcp.<cluster-hostname>
+
+For example, a properly formatted ``dig`` request would look like this:
+
+.. code-block:: bash
+
+    dig srv _mongodb._tcp.mongodb-prod-cluster-ba6e9b05.mongo.ondigitalocean.com
+
+The ``dig`` command returns the actual hosts (in the **Answer Section**) that you can use to connect to MongoDB through Presto. The regular hostname won’t work and will result in a ``host not found`` error.
+
+Set Up a TLS CA File
+^^^^^^^^^^^^^^^^^^^^
+
+The following steps were developed using CentOS. Adapt them as needed for your environment.
+
+1. Create the certificate file:
+
+   .. code-block:: bash
+
+       touch /etc/pki/ca-trust/source/anchors/mongo.prod-cluster.crt
+
+2. Paste the contents of the TLS CA file into the newly created file.
+
+3. Update the trust store by running the following command:
+
+   .. code-block:: bash
+
+       update-ca-trust
+
+4. Verify the setup by running the following command:
+
+   .. code-block:: bash
+
+       openssl s_client -connect <host-found-with-dig-above>:27017 < /dev/null
+
+   The output should include ``CONNECTED`` and ``Verification: OK``, indicating the SSL connection is properly configured.
+
+Configure the Catalog
+^^^^^^^^^^^^^^^^^^^^^
+
+To configure a MongoDB catalog for this cluster, follow these steps:
+
+1. Create the catalog configuration file:
+
+   .. code-block:: bash
+
+       touch etc/catalog/mongodb.properties
+
+2. Edit the file and include the host found using ``dig`` in `Retrieve the Node Hostnames <#retrieve-the-node-hostnames>`_. For example:
+
+   .. code-block:: none
+
+       connector.name=mongodb
+       mongodb.seeds=<host-found-with-dig-above>:27017
+       mongodb.credentials=<user>:<password>@<mongodb-auth-source>
+       mongodb.ssl.enabled=true
+       mongodb.required-replica-set=<mongodb-replica-set>
+
+Run Queries
+^^^^^^^^^^^
+
+After starting the Presto server, you should be able to connect to the catalog and execute queries. For instance:
+
+.. code-block:: sql
+
+    SELECT name
+    FROM users
+    WHERE _id = ObjectId('66fe8898c4ce1100c811cbe0');
 
 .. _table-definition-label:
 
@@ -220,6 +309,34 @@ Field           Required  Type      Description
 =============== ========= ========= =============================
 
 There is no limit on field descriptions for either key or message.
+
+JSON Type Handling
+------------------
+
+The connector supports writing ``json`` columns by converting their contents to BSON
+using ``.parse(...)``.
+
+For example:
+
+.. code-block:: sql
+
+    CREATE TABLE orders (
+        orderkey bigint,
+        orderstatus varchar,
+        totalprice double,
+        orderdate date,
+        metadata json
+    );
+
+    INSERT INTO orders VALUES (
+        3,
+        'processing',
+        150.0,
+        current_date,
+        JSON '{"created_by": "admin", "priority": "high"}'
+    );
+
+The JSON string must be well-formed. If it's not, the insert will fail with a parsing error.
 
 ObjectId
 --------

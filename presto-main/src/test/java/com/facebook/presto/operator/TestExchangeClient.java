@@ -16,6 +16,8 @@ package com.facebook.presto.operator;
 import com.facebook.airlift.http.client.Request;
 import com.facebook.airlift.http.client.Response;
 import com.facebook.airlift.http.client.testing.TestingHttpClient;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.block.BlockAssertions;
 import com.facebook.presto.common.Page;
 import com.facebook.presto.execution.TaskId;
@@ -27,8 +29,6 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.UncheckedTimeoutException;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
@@ -48,6 +48,8 @@ import java.util.function.Supplier;
 import static com.facebook.airlift.concurrent.MoreFutures.tryGetFutureValue;
 import static com.facebook.airlift.concurrent.Threads.daemonThreadsNamed;
 import static com.facebook.airlift.testing.Assertions.assertLessThan;
+import static com.facebook.airlift.units.DataSize.Unit.BYTE;
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.common.block.PageBuilderStatus.DEFAULT_MAX_PAGE_SIZE_IN_BYTES;
 import static com.facebook.presto.execution.buffer.TestingPagesSerdeFactory.testingPagesSerde;
 import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
@@ -55,8 +57,6 @@ import static com.google.common.collect.Maps.uniqueIndex;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.Uninterruptibles.awaitUninterruptibly;
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
-import static io.airlift.units.DataSize.Unit.BYTE;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -332,7 +332,8 @@ public class TestExchangeClient
         DataSize bufferCapacity = new DataSize(16, MEGABYTE);
         DataSize maxResponseSize = new DataSize(DEFAULT_MAX_PAGE_SIZE_IN_BYTES, BYTE);
         CountDownLatch countDownLatch = new CountDownLatch(1);
-        MockExchangeRequestProcessor processor = new MockExchangeRequestProcessor(maxResponseSize) {
+        MockExchangeRequestProcessor processor = new MockExchangeRequestProcessor(maxResponseSize)
+        {
             @Override
             public Response handle(Request request)
             {
@@ -559,8 +560,7 @@ public class TestExchangeClient
                 new Duration(1, MINUTES),
                 true,
                 0.2,
-                new TestingHttpClient(processor, testingHttpClientExecutor),
-                new TestingDriftClient<>(),
+                new HttpShuffleClientProvider(new TestingHttpClient(processor, testingHttpClientExecutor)),
                 scheduler,
                 new SimpleLocalMemoryContext(newSimpleAggregatedMemoryContext(), "test"),
                 pageBufferClientCallbackExecutor);

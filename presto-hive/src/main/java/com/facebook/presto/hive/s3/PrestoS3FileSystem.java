@@ -24,6 +24,7 @@ import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.auth.InstanceProfileCredentialsProvider;
 import com.amazonaws.auth.STSAssumeRoleSessionCredentialsProvider;
+import com.amazonaws.auth.WebIdentityTokenCredentialsProvider;
 import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration;
 import com.amazonaws.event.ProgressEvent;
 import com.amazonaws.event.ProgressEventType;
@@ -40,8 +41,8 @@ import com.amazonaws.services.s3.model.CannedAccessControlList;
 import com.amazonaws.services.s3.model.EncryptionMaterialsProvider;
 import com.amazonaws.services.s3.model.GetObjectRequest;
 import com.amazonaws.services.s3.model.KMSEncryptionMaterialsProvider;
-import com.amazonaws.services.s3.model.ListObjectsRequest;
-import com.amazonaws.services.s3.model.ObjectListing;
+import com.amazonaws.services.s3.model.ListObjectsV2Request;
+import com.amazonaws.services.s3.model.ListObjectsV2Result;
 import com.amazonaws.services.s3.model.ObjectMetadata;
 import com.amazonaws.services.s3.model.PutObjectRequest;
 import com.amazonaws.services.s3.model.S3ObjectInputStream;
@@ -53,6 +54,8 @@ import com.amazonaws.services.s3.transfer.TransferManager;
 import com.amazonaws.services.s3.transfer.TransferManagerBuilder;
 import com.amazonaws.services.s3.transfer.Upload;
 import com.facebook.airlift.log.Logger;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.hive.filesystem.ExtendedFileSystem;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.AbstractSequentialIterator;
@@ -60,8 +63,6 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterators;
 import com.google.common.io.Closer;
 import com.google.common.net.MediaType;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.BlockLocation;
@@ -104,6 +105,7 @@ import static com.amazonaws.services.s3.Headers.SERVER_SIDE_ENCRYPTION;
 import static com.amazonaws.services.s3.Headers.UNENCRYPTED_CONTENT_LENGTH;
 import static com.amazonaws.services.s3.model.StorageClass.DeepArchive;
 import static com.amazonaws.services.s3.model.StorageClass.Glacier;
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.hive.RetryDriver.retry;
 import static com.facebook.presto.hive.s3.S3ConfigurationUpdater.S3_ACCESS_KEY;
 import static com.facebook.presto.hive.s3.S3ConfigurationUpdater.S3_ACL_TYPE;
@@ -136,6 +138,7 @@ import static com.facebook.presto.hive.s3.S3ConfigurationUpdater.S3_STORAGE_CLAS
 import static com.facebook.presto.hive.s3.S3ConfigurationUpdater.S3_USER_AGENT_PREFIX;
 import static com.facebook.presto.hive.s3.S3ConfigurationUpdater.S3_USER_AGENT_SUFFIX;
 import static com.facebook.presto.hive.s3.S3ConfigurationUpdater.S3_USE_INSTANCE_CREDENTIALS;
+import static com.facebook.presto.hive.s3.S3ConfigurationUpdater.S3_WEB_IDENTITY_ENABLED;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkPositionIndexes;
 import static com.google.common.base.Strings.isNullOrEmpty;
@@ -144,7 +147,6 @@ import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static com.google.common.base.Throwables.throwIfUnchecked;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.Iterables.toArray;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.lang.Math.max;
 import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
@@ -196,6 +198,7 @@ public class PrestoS3FileSystem
     private PrestoS3AclType s3AclType;
     private boolean skipGlacierObjects;
     private PrestoS3StorageClass s3StorageClass;
+    private boolean webIdentityEnabled;
 
     @Override
     public void initialize(URI uri, Configuration conf)
@@ -237,7 +240,8 @@ public class PrestoS3FileSystem
         String userAgentPrefix = conf.get(S3_USER_AGENT_PREFIX, defaults.getS3UserAgentPrefix());
         this.skipGlacierObjects = conf.getBoolean(S3_SKIP_GLACIER_OBJECTS, defaults.isSkipGlacierObjects());
         this.s3StorageClass = conf.getEnum(S3_STORAGE_CLASS, defaults.getS3StorageClass());
-
+        this.webIdentityEnabled = conf.getBoolean(S3_WEB_IDENTITY_ENABLED, false);
+        checkArgument(!(webIdentityEnabled && isNullOrEmpty(s3IamRole)), "Invalid configuration: hive.s3.iam-role must be provided when hive.s3.web.identity.auth.enabled is set to true");
         ClientConfiguration configuration = new ClientConfiguration()
                 .withMaxErrorRetry(maxErrorRetries)
                 .withProtocol(sslEnabled ? Protocol.HTTPS : Protocol.HTTP)
@@ -568,25 +572,26 @@ public class PrestoS3FileSystem
             key += PATH_SEPARATOR;
         }
 
-        ListObjectsRequest request = new ListObjectsRequest()
+        ListObjectsV2Request request = new ListObjectsV2Request()
                 .withBucketName(getBucketName(uri))
                 .withPrefix(key)
                 .withDelimiter(mode == ListingMode.RECURSIVE_FILES_ONLY ? null : PATH_SEPARATOR)
                 .withMaxKeys(initialMaxKeys.isPresent() ? initialMaxKeys.getAsInt() : null);
 
         STATS.newListObjectsCall();
-        Iterator<ObjectListing> listings = new AbstractSequentialIterator<ObjectListing>(s3.listObjects(request))
+        Iterator<ListObjectsV2Result> listings = new AbstractSequentialIterator<ListObjectsV2Result>(s3.listObjectsV2(request))
         {
             @Override
-            protected ObjectListing computeNext(ObjectListing previous)
+            protected ListObjectsV2Result computeNext(ListObjectsV2Result previous)
             {
                 if (!previous.isTruncated()) {
                     return null;
                 }
-                // Clear any max keys set for the initial request before submitting subsequent requests. Values < 0
-                // are not sent in the request and the default limit is used
-                previous.setMaxKeys(-1);
-                return s3.listNextBatchOfObjects(previous);
+                // Clear any max keys set initially to allow AWS S3 to use its default batch size.
+                //Use the ContinuationToken from the previous response to fetch the next set of objects.
+                return s3.listObjectsV2(request
+                        .withMaxKeys(null)
+                        .withContinuationToken(previous.getNextContinuationToken()));
             }
         };
 
@@ -598,7 +603,7 @@ public class PrestoS3FileSystem
         return result;
     }
 
-    private Iterator<LocatedFileStatus> statusFromListing(ObjectListing listing)
+    private Iterator<LocatedFileStatus> statusFromListing(ListObjectsV2Result listing)
     {
         List<String> prefixes = listing.getCommonPrefixes();
         List<S3ObjectSummary> objects = listing.getObjectSummaries();
@@ -854,8 +859,17 @@ public class PrestoS3FileSystem
             return InstanceProfileCredentialsProvider.getInstance();
         }
 
-        if (s3IamRole != null) {
-            return new STSAssumeRoleSessionCredentialsProvider.Builder(s3IamRole, s3IamRoleSessionName).build();
+        if (!isNullOrEmpty(s3IamRole)) {
+            if (webIdentityEnabled) {
+                log.debug("Using Web Identity Token Credentials Provider.");
+                WebIdentityTokenCredentialsProvider.Builder providerBuilder = WebIdentityTokenCredentialsProvider.builder()
+                        .roleArn(s3IamRole)
+                        .roleSessionName(s3IamRoleSessionName);
+                return providerBuilder.build();
+            }
+            log.debug("Using STS Assume Role Session Credentials Provider.");
+            return new STSAssumeRoleSessionCredentialsProvider.Builder(s3IamRole, s3IamRoleSessionName)
+                    .build();
         }
 
         String providerClass = conf.get(S3_CREDENTIALS_PROVIDER);

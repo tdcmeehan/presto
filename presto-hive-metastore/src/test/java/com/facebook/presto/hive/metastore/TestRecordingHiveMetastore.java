@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.hive.metastore;
 
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.common.predicate.Domain;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.hive.HiveBasicStatistics;
@@ -31,7 +32,6 @@ import com.facebook.presto.spi.statistics.ColumnStatisticType;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import io.airlift.units.Duration;
 import org.testng.annotations.Test;
 
 import java.io.File;
@@ -67,7 +67,8 @@ public class TestRecordingHiveMetastore
             "owner",
             USER,
             Optional.of("comment"),
-            ImmutableMap.of("param", "value"));
+            ImmutableMap.of("param", "value"),
+            Optional.of("catalogName"));
     private static final Column TABLE_COLUMN = new Column(
             "column",
             HiveType.HIVE_INT,
@@ -96,6 +97,7 @@ public class TestRecordingHiveMetastore
             ImmutableMap.of("param", "value2"),
             ImmutableMap.of());
     private static final Table TABLE = new Table(
+            Optional.of("catalogName"),
             "database",
             "table",
             "owner",

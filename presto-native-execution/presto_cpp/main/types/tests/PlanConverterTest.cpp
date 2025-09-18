@@ -11,55 +11,28 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/replace.hpp>
-#include <boost/filesystem.hpp>
 #include <gtest/gtest.h>
 
 #include "presto_cpp/main/common/tests/test_json.h"
+#include "presto_cpp/main/connectors/PrestoToVeloxConnector.h"
 #include "presto_cpp/main/operators/LocalPersistentShuffle.h"
 #include "presto_cpp/main/operators/PartitionAndSerialize.h"
 #include "presto_cpp/main/operators/ShuffleRead.h"
 #include "presto_cpp/main/operators/ShuffleWrite.h"
-#include "presto_cpp/main/types/PrestoToVeloxConnector.h"
 #include "presto_cpp/main/types/PrestoToVeloxQueryPlan.h"
+#include "presto_cpp/main/types/tests/TestUtils.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
-
-namespace fs = boost::filesystem;
 
 using namespace facebook::presto;
 using namespace facebook::velox;
 
 namespace {
-std::string getDataPath(const std::string& fileName) {
-  std::string currentPath = fs::current_path().c_str();
-
-  if (boost::algorithm::ends_with(currentPath, "fbcode")) {
-    return currentPath +
-        "/github/presto-trunk/presto-native-execution/presto_cpp/main/types/tests/data/" +
-        fileName;
-  }
-
-  if (boost::algorithm::ends_with(currentPath, "fbsource")) {
-    return currentPath + "/third-party/presto_cpp/main/types/tests/data/" +
-        fileName;
-  }
-
-  // CLion runs the tests from cmake-build-release/ or cmake-build-debug/
-  // directory. Hard-coded json files are not copied there and test fails with
-  // file not found. Fixing the path so that we can trigger these tests from
-  // CLion.
-  boost::algorithm::replace_all(currentPath, "cmake-build-release/", "");
-  boost::algorithm::replace_all(currentPath, "cmake-build-debug/", "");
-
-  return currentPath + "/data/" + fileName;
-}
 
 core::PlanFragment assertToVeloxFragment(
     const std::string& fileName,
     memory::MemoryPool* pool = nullptr) {
-  std::string fragment = slurp(getDataPath(fileName));
+  std::string fragment = slurp(test::utils::getDataPath(fileName));
 
   protocol::PlanFragment prestoPlan = json::parse(fragment);
   std::shared_ptr<memory::MemoryPool> poolPtr;
@@ -85,7 +58,7 @@ std::shared_ptr<const core::PlanNode> assertToBatchVeloxQueryPlan(
     const std::string& shuffleName,
     std::shared_ptr<std::string>&& serializedShuffleWriteInfo,
     std::shared_ptr<std::string>&& broadcastBasePath) {
-  const std::string fragment = slurp(getDataPath(fileName));
+  const std::string fragment = slurp(test::utils::getDataPath(fileName));
 
   protocol::PlanFragment prestoPlan = json::parse(fragment);
   auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
@@ -106,7 +79,7 @@ std::shared_ptr<const core::PlanNode> assertToBatchVeloxQueryPlan(
 class PlanConverterTest : public ::testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -166,11 +139,12 @@ TEST_F(PlanConverterTest, partitionedOutput) {
   // Test fragment's partitioning scheme.
   ASSERT_EQ(
       partitionedOutput->partitionFunctionSpec().toString(),
-      "HASH(\"1 elements starting at 0 {cluster_label_v2}\", expr_181)");
+      "HASH(\"{cluster_label_v2}\", expr_181)");
   auto keys = partitionedOutput->keys();
   ASSERT_EQ(keys.size(), 2);
-  ASSERT_EQ(keys[0]->toString(), "1 elements starting at 0 {cluster_label_v2}");
+  ASSERT_EQ(keys[0]->toString(), "{cluster_label_v2}");
   ASSERT_EQ(keys[1]->toString(), "\"expr_181\"");
+  ASSERT_EQ(partitionedOutput->serdeKind(), VectorSerde::Kind::kCompactRow);
 }
 
 // Final Agg stage plan for select regionkey, sum(1) from nation group by 1

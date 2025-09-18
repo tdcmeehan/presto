@@ -16,8 +16,8 @@ package com.facebook.presto.nativeworker;
 import com.facebook.presto.Session;
 import com.facebook.presto.execution.SqlQueryManager;
 import com.facebook.presto.spi.Plugin;
+import com.facebook.presto.spi.plan.JoinNode;
 import com.facebook.presto.spi.statistics.HistoryBasedPlanStatisticsProvider;
-import com.facebook.presto.sql.planner.plan.JoinNode;
 import com.facebook.presto.testing.ExpectedQueryRunner;
 import com.facebook.presto.testing.InMemoryHistoryBasedPlanStatisticsProvider;
 import com.facebook.presto.testing.QueryRunner;
@@ -52,9 +52,13 @@ public class TestPrestoNativeHistoryBasedStatistics
     }
 
     @Override
-    protected QueryRunner createQueryRunner() throws Exception
+    protected QueryRunner createQueryRunner()
+            throws Exception
     {
-        QueryRunner queryRunner = PrestoNativeQueryRunnerUtils.createNativeQueryRunner(true);
+        QueryRunner queryRunner = PrestoNativeQueryRunnerUtils.nativeHiveQueryRunnerBuilder()
+                .setAddStorageFormatToPath(true)
+                .setUseThrift(true)
+                .build();
         queryRunner.installPlugin(new Plugin()
         {
             @Override
@@ -67,9 +71,12 @@ public class TestPrestoNativeHistoryBasedStatistics
     }
 
     @Override
-    protected ExpectedQueryRunner createExpectedQueryRunner() throws Exception
+    protected ExpectedQueryRunner createExpectedQueryRunner()
+            throws Exception
     {
-        return PrestoNativeQueryRunnerUtils.createJavaQueryRunner();
+        return PrestoNativeQueryRunnerUtils.javaHiveQueryRunnerBuilder()
+                .setAddStorageFormatToPath(true)
+                .build();
     }
 
     @BeforeMethod(alwaysRun = true)

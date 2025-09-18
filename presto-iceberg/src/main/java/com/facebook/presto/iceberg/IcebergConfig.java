@@ -15,27 +15,28 @@ package com.facebook.presto.iceberg;
 
 import com.facebook.airlift.configuration.Config;
 import com.facebook.airlift.configuration.ConfigDescription;
+import com.facebook.airlift.configuration.LegacyConfig;
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.hive.HiveCompressionCodec;
 import com.facebook.presto.spi.statistics.ColumnStatisticType;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
-import io.airlift.units.DataSize;
+import jakarta.validation.constraints.DecimalMax;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
 import org.apache.iceberg.hadoop.HadoopFileIO;
-
-import javax.validation.constraints.DecimalMax;
-import javax.validation.constraints.DecimalMin;
-import javax.validation.constraints.Min;
-import javax.validation.constraints.NotNull;
 
 import java.util.EnumSet;
 import java.util.List;
 
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
+import static com.facebook.airlift.units.DataSize.succinctDataSize;
 import static com.facebook.presto.hive.HiveCompressionCodec.GZIP;
 import static com.facebook.presto.iceberg.CatalogType.HIVE;
 import static com.facebook.presto.iceberg.IcebergFileFormat.PARQUET;
 import static com.facebook.presto.iceberg.util.StatisticsUtil.decodeMergeFlags;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
-import static io.airlift.units.DataSize.succinctDataSize;
 import static org.apache.iceberg.CatalogProperties.IO_MANIFEST_CACHE_EXPIRATION_INTERVAL_MS_DEFAULT;
 import static org.apache.iceberg.CatalogProperties.IO_MANIFEST_CACHE_MAX_CONTENT_LENGTH_DEFAULT;
 import static org.apache.iceberg.CatalogProperties.IO_MANIFEST_CACHE_MAX_TOTAL_BYTES_DEFAULT;
@@ -49,6 +50,7 @@ public class IcebergConfig
     private HiveCompressionCodec compressionCodec = GZIP;
     private CatalogType catalogType = HIVE;
     private String catalogWarehouse;
+    private String catalogWarehouseDataDir;
     private int catalogCacheSize = 10;
     private int maxPartitionsPerWriter = 100;
     private List<String> hadoopConfigResources = ImmutableList.of();
@@ -58,17 +60,20 @@ public class IcebergConfig
     private double statisticSnapshotRecordDifferenceWeight;
     private boolean pushdownFilterEnabled;
     private boolean deleteAsJoinRewriteEnabled = true;
+    private int deleteAsJoinRewriteMaxDeleteColumns = 400;
     private int rowsForMetadataOptimizationThreshold = 1000;
     private int metadataPreviousVersionsMax = METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT;
     private boolean metadataDeleteAfterCommit = METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT;
     private int metricsMaxInferredColumn = METRICS_MAX_INFERRED_COLUMN_DEFAULTS_DEFAULT;
+    private int statisticsKllSketchKParameter = 1024;
 
     private EnumSet<ColumnStatisticType> hiveStatisticsMergeFlags = EnumSet.noneOf(ColumnStatisticType.class);
     private String fileIOImpl = HadoopFileIO.class.getName();
-    private boolean manifestCachingEnabled;
+    private boolean manifestCachingEnabled = true;
     private long maxManifestCacheSize = IO_MANIFEST_CACHE_MAX_TOTAL_BYTES_DEFAULT;
     private long manifestCacheExpireDuration = IO_MANIFEST_CACHE_EXPIRATION_INTERVAL_MS_DEFAULT;
     private long manifestCacheMaxContentLength = IO_MANIFEST_CACHE_MAX_CONTENT_LENGTH_DEFAULT;
+    private DataSize manifestCacheMaxChunkSize = succinctDataSize(2, MEGABYTE);
     private int splitManagerThreads = Runtime.getRuntime().availableProcessors();
     private DataSize maxStatisticsFileCacheSize = succinctDataSize(256, MEGABYTE);
 
@@ -122,6 +127,19 @@ public class IcebergConfig
     public IcebergConfig setCatalogWarehouse(String catalogWarehouse)
     {
         this.catalogWarehouse = catalogWarehouse;
+        return this;
+    }
+
+    public String getCatalogWarehouseDataDir()
+    {
+        return catalogWarehouseDataDir;
+    }
+
+    @Config("iceberg.catalog.hadoop.warehouse.datadir")
+    @ConfigDescription("Iceberg catalog default root data writing directory. This is only supported with Hadoop catalog.")
+    public IcebergConfig setCatalogWarehouseDataDir(String catalogWarehouseDataDir)
+    {
+        this.catalogWarehouseDataDir = catalogWarehouseDataDir;
         return this;
     }
 
@@ -250,17 +268,37 @@ public class IcebergConfig
         return pushdownFilterEnabled;
     }
 
-    @Config("iceberg.delete-as-join-rewrite-enabled")
-    @ConfigDescription("When enabled, equality delete row filtering will be implemented by rewriting the query plan to join with the delete keys.")
+    @LegacyConfig(value = "iceberg.delete-as-join-rewrite-enabled")
+    @Config("deprecated.iceberg.delete-as-join-rewrite-enabled")
+    @ConfigDescription("When enabled, equality delete row filtering will be implemented by rewriting the query plan to join with the delete keys. " +
+            "Deprecated: Set 'iceberg.delete-as-join-rewrite-max-delete-columns' to 0 to control the enabling of this feature.  This will be removed in a future release.")
+    @Deprecated
     public IcebergConfig setDeleteAsJoinRewriteEnabled(boolean deleteAsJoinPushdownEnabled)
     {
         this.deleteAsJoinRewriteEnabled = deleteAsJoinPushdownEnabled;
         return this;
     }
 
+    @Deprecated
     public boolean isDeleteAsJoinRewriteEnabled()
     {
         return deleteAsJoinRewriteEnabled;
+    }
+
+    @Config("iceberg.delete-as-join-rewrite-max-delete-columns")
+    @ConfigDescription("The maximum number of columns that can be used in a delete as join rewrite. " +
+            "If the number of columns exceeds this value, the delete as join rewrite will not be applied.")
+    @Min(0)
+    @Max(400)
+    public IcebergConfig setDeleteAsJoinRewriteMaxDeleteColumns(int deleteAsJoinRewriteMaxDeleteColumns)
+    {
+        this.deleteAsJoinRewriteMaxDeleteColumns = deleteAsJoinRewriteMaxDeleteColumns;
+        return this;
+    }
+
+    public int getDeleteAsJoinRewriteMaxDeleteColumns()
+    {
+        return deleteAsJoinRewriteMaxDeleteColumns;
     }
 
     @Config("iceberg.rows-for-metadata-optimization-threshold")
@@ -346,6 +384,20 @@ public class IcebergConfig
         return this;
     }
 
+    public DataSize getManifestCacheMaxChunkSize()
+    {
+        return manifestCacheMaxChunkSize;
+    }
+
+    @Min(1024)
+    @Config("iceberg.io.manifest.cache.max-chunk-size")
+    @ConfigDescription("Maximum length of a buffer used to cache manifest file content. Only applicable to HIVE catalog.")
+    public IcebergConfig setManifestCacheMaxChunkSize(DataSize manifestCacheMaxChunkSize)
+    {
+        this.manifestCacheMaxChunkSize = manifestCacheMaxChunkSize;
+        return this;
+    }
+
     @Min(0)
     public int getSplitManagerThreads()
     {
@@ -410,6 +462,21 @@ public class IcebergConfig
     public IcebergConfig setMaxStatisticsFileCacheSize(DataSize maxStatisticsFileCacheSize)
     {
         this.maxStatisticsFileCacheSize = maxStatisticsFileCacheSize;
+        return this;
+    }
+
+    public int getStatisticsKllSketchKParameter()
+    {
+        return this.statisticsKllSketchKParameter;
+    }
+
+    @Config("iceberg.statistics-kll-sketch-k-parameter")
+    @Min(8)
+    @Max(65535)
+    @ConfigDescription("K parameter for KLL sketches when generating histogram statistics")
+    public IcebergConfig setStatisticsKllSketchKParameter(int kllSketchKParameter)
+    {
+        this.statisticsKllSketchKParameter = kllSketchKParameter;
         return this;
     }
 }

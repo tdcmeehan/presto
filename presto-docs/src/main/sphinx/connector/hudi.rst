@@ -38,7 +38,15 @@ Property Name                           Description                             
 ======================================= ============================================= ===========
 ``hudi.metadata-table-enabled``         Fetch the list of file names and sizes from   false
                                         Hudi's metadata table rather than storage.
+``hive.metastore.catalog.name``         Specifies the catalog name to be passed to
+                                        the metastore.
 ======================================= ============================================= ===========
+
+File-Based Metastore
+^^^^^^^^^^^^^^^^^^^^
+
+For testing or development purposes, this connector can be configured to use a local 
+filesystem directory as a Hive Metastore. See :ref:`installation/deployment:File-Based Metastore`.  
 
 SQL Support
 -----------

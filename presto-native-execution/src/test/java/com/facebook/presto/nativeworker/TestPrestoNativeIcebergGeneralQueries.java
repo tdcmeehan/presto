@@ -18,6 +18,7 @@ import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
 import org.testng.annotations.Test;
 
+import static com.facebook.presto.nativeworker.PrestoNativeQueryRunnerUtils.ICEBERG_DEFAULT_STORAGE_FORMAT;
 import static java.lang.String.format;
 import static org.testng.Assert.assertEquals;
 
@@ -28,29 +29,47 @@ public class TestPrestoNativeIcebergGeneralQueries
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        return PrestoNativeQueryRunnerUtils.createNativeIcebergQueryRunner(false, true);
+        return PrestoNativeQueryRunnerUtils.nativeIcebergQueryRunnerBuilder()
+                .setStorageFormat(ICEBERG_DEFAULT_STORAGE_FORMAT)
+                .setAddStorageFormatToPath(true)
+                .build();
     }
 
     @Override
     protected ExpectedQueryRunner createExpectedQueryRunner()
             throws Exception
     {
-        return PrestoNativeQueryRunnerUtils.createJavaIcebergQueryRunner(true);
+        return PrestoNativeQueryRunnerUtils.javaIcebergQueryRunnerBuilder()
+                .setStorageFormat(ICEBERG_DEFAULT_STORAGE_FORMAT)
+                .setAddStorageFormatToPath(true)
+                .build();
     }
 
     @Override
     protected void createTables()
     {
-        createTableToTestHiddenColumns();
+        createTestTables();
     }
 
-    private void createTableToTestHiddenColumns()
+    private void createTestTables()
     {
         QueryRunner javaQueryRunner = ((QueryRunner) getExpectedQueryRunner());
-        if (!javaQueryRunner.tableExists(getSession(), "test_hidden_columns")) {
-            javaQueryRunner.execute("CREATE TABLE test_hidden_columns AS SELECT * FROM tpch.tiny.region WHERE regionkey=0");
-            javaQueryRunner.execute("INSERT INTO test_hidden_columns SELECT * FROM tpch.tiny.region WHERE regionkey=1");
-        }
+
+        javaQueryRunner.execute("DROP TABLE IF EXISTS test_hidden_columns");
+        javaQueryRunner.execute("CREATE TABLE test_hidden_columns AS SELECT * FROM tpch.tiny.region WHERE regionkey=0");
+        javaQueryRunner.execute("INSERT INTO test_hidden_columns SELECT * FROM tpch.tiny.region WHERE regionkey=1");
+
+        javaQueryRunner.execute("DROP TABLE IF EXISTS ice_table_partitioned");
+        javaQueryRunner.execute("CREATE TABLE ice_table_partitioned(c1 INT, ds DATE) WITH (partitioning = ARRAY['ds'])");
+        javaQueryRunner.execute("INSERT INTO ice_table_partitioned VALUES(1, date'2022-04-09'), (2, date'2022-03-18'), (3, date'1993-01-01')");
+
+        javaQueryRunner.execute("DROP TABLE IF EXISTS ice_table");
+        javaQueryRunner.execute("CREATE TABLE ice_table(c1 INT, ds DATE)");
+        javaQueryRunner.execute("INSERT INTO ice_table VALUES(1, date'2022-04-09'), (2, date'2022-03-18'), (3, date'1993-01-01')");
+
+        javaQueryRunner.execute("DROP TABLE IF EXISTS test_analyze");
+        javaQueryRunner.execute("CREATE TABLE test_analyze(i int)");
+        javaQueryRunner.execute("INSERT INTO test_analyze VALUES 1, 2, 3, 4, 5");
     }
 
     @Test
@@ -93,5 +112,18 @@ public class TestPrestoNativeIcebergGeneralQueries
                 (Long) computeActual(format("SELECT count(*) from test_hidden_columns WHERE \"$data_sequence_number\"=%d", 1000))
                         .getOnlyValue(),
                 0L);
+    }
+
+    @Test
+    public void testDateQueries()
+    {
+        assertQuery("SELECT * FROM ice_table_partitioned WHERE ds >= date'1994-01-01'", "VALUES (1, date'2022-04-09'), (2, date'2022-03-18')");
+        assertQuery("SELECT * FROM ice_table WHERE ds = date'2022-04-09'", "VALUES (1, date'2022-04-09')");
+    }
+
+    @Test
+    public void testAnalyze()
+    {
+        assertUpdate(getSession(), "ANALYZE test_analyze", 5);
     }
 }

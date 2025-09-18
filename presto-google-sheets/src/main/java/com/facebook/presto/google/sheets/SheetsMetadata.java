@@ -29,8 +29,7 @@ import com.facebook.presto.spi.TableNotFoundException;
 import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
@@ -82,13 +81,15 @@ public class SheetsMetadata
     }
 
     @Override
-    public List<ConnectorTableLayoutResult> getTableLayouts(
-            ConnectorSession session, ConnectorTableHandle table,
-            Constraint<ColumnHandle> constraint, Optional<Set<ColumnHandle>> desiredColumns)
+    public ConnectorTableLayoutResult getTableLayoutForConstraint(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            Constraint<ColumnHandle> constraint,
+            Optional<Set<ColumnHandle>> desiredColumns)
     {
         SheetsTableHandle tableHandle = (SheetsTableHandle) table;
         ConnectorTableLayout layout = new ConnectorTableLayout(new SheetsTableLayoutHandle(tableHandle));
-        return ImmutableList.of(new ConnectorTableLayoutResult(layout, constraint.getSummary()));
+        return new ConnectorTableLayoutResult(layout, constraint.getSummary());
     }
 
     @Override
@@ -100,21 +101,27 @@ public class SheetsMetadata
     @Override
     public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle table)
     {
-        Optional<ConnectorTableMetadata> connectorTableMetadata = getTableMetadata(((SheetsTableHandle) table).toSchemaTableName());
+        Optional<ConnectorTableMetadata> connectorTableMetadata = getTableMetadata(session, ((SheetsTableHandle) table).toSchemaTableName());
         if (!connectorTableMetadata.isPresent()) {
             throw new PrestoException(SHEETS_UNKNOWN_TABLE_ERROR, "Metadata not found for table " + ((SheetsTableHandle) table).getTableName());
         }
         return connectorTableMetadata.get();
     }
 
-    private Optional<ConnectorTableMetadata> getTableMetadata(SchemaTableName tableName)
+    private Optional<ConnectorTableMetadata> getTableMetadata(ConnectorSession session, SchemaTableName tableName)
     {
         if (!listSchemaNames().contains(tableName.getSchemaName())) {
             return Optional.empty();
         }
         Optional<SheetsTable> table = sheetsClient.getTable(tableName.getTableName());
         if (table.isPresent()) {
-            return Optional.of(new ConnectorTableMetadata(tableName, table.get().getColumnsMetadata()));
+            List<ColumnMetadata> columns = table.get().getColumnsMetadata().stream()
+                    .map(column -> column.toBuilder()
+                            .setName(normalizeIdentifier(session, column.getName()))
+                            .build())
+                    .collect(toImmutableList());
+
+            return Optional.of(new ConnectorTableMetadata(tableName, columns));
         }
         return Optional.empty();
     }
@@ -130,7 +137,13 @@ public class SheetsMetadata
 
         ImmutableMap.Builder<String, ColumnHandle> columnHandles = ImmutableMap.builder();
         int index = 0;
-        for (ColumnMetadata column : table.get().getColumnsMetadata()) {
+        List<ColumnMetadata> columns = table.get().getColumnsMetadata().stream()
+                .map(column -> column.toBuilder()
+                        .setName(normalizeIdentifier(session, column.getName()))
+                        .build())
+                .collect(toImmutableList());
+
+        for (ColumnMetadata column : columns) {
             columnHandles.put(column.getName(), new SheetsColumnHandle(column.getName(), column.getType(), index));
             index++;
         }
@@ -148,8 +161,8 @@ public class SheetsMetadata
     {
         requireNonNull(prefix, "prefix is null");
         ImmutableMap.Builder<SchemaTableName, List<ColumnMetadata>> columns = ImmutableMap.builder();
-        for (SchemaTableName tableName : listTables(session, Optional.of(prefix.getSchemaName()))) {
-            Optional<ConnectorTableMetadata> tableMetadata = getTableMetadata(tableName);
+        for (SchemaTableName tableName : listTables(session, Optional.ofNullable(prefix.getSchemaName()))) {
+            Optional<ConnectorTableMetadata> tableMetadata = getTableMetadata(session, tableName);
             // table can disappear during listing operation
             if (tableMetadata.isPresent()) {
                 columns.put(tableName, tableMetadata.get().getColumns());
@@ -161,7 +174,7 @@ public class SheetsMetadata
     @Override
     public List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName)
     {
-        String schema = schemaName.orElse(getOnlyElement(SCHEMAS));
+        String schema = schemaName.orElseGet(() -> getOnlyElement(SCHEMAS));
 
         if (listSchemaNames().contains(schema)) {
             return sheetsClient.getTableNames().stream()

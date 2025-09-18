@@ -18,6 +18,8 @@ import com.facebook.airlift.json.Codec;
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.json.smile.SmileCodec;
 import com.facebook.airlift.log.Logger;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.execution.LocationFactory;
 import com.facebook.presto.execution.QueryExecution;
 import com.facebook.presto.execution.QueryIdGenerator;
@@ -45,15 +47,12 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Streams;
 import com.google.common.io.Closer;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
+import jakarta.annotation.PreDestroy;
+import jakarta.inject.Inject;
 import org.weakref.jmx.JmxException;
 import org.weakref.jmx.MBeanExporter;
 import org.weakref.jmx.Managed;
-
-import javax.annotation.PreDestroy;
-import javax.annotation.concurrent.GuardedBy;
-import javax.inject.Inject;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -72,6 +71,8 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
+import static com.facebook.airlift.units.DataSize.succinctBytes;
+import static com.facebook.airlift.units.Duration.nanosSince;
 import static com.facebook.presto.ExceededMemoryLimitException.exceededGlobalTotalLimit;
 import static com.facebook.presto.ExceededMemoryLimitException.exceededGlobalUserLimit;
 import static com.facebook.presto.SystemSessionProperties.RESOURCE_OVERCOMMIT;
@@ -94,8 +95,6 @@ import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.collect.MoreCollectors.toOptional;
 import static com.google.common.collect.Sets.difference;
-import static io.airlift.units.DataSize.succinctBytes;
-import static io.airlift.units.Duration.nanosSince;
 import static java.lang.Math.min;
 import static java.lang.String.format;
 import static java.util.AbstractMap.SimpleEntry;
@@ -118,8 +117,8 @@ public class ClusterMemoryManager
     private final MBeanExporter exporter;
     private final Codec<MemoryInfo> memoryInfoCodec;
     private final Codec<MemoryPoolAssignmentsRequest> assignmentsRequestCodec;
-    private final DataSize maxQueryMemory;
-    private final DataSize maxQueryTotalMemory;
+    private final long maxQueryMemoryInBytes;
+    private final long maxQueryTotalMemoryInBytes;
     private final boolean enabled;
     private final LowMemoryKiller lowMemoryKiller;
     private final Duration killOnOutOfMemoryDelay;
@@ -177,8 +176,8 @@ public class ClusterMemoryManager
         this.httpClient = requireNonNull(httpClient, "httpClient is null");
         this.exporter = requireNonNull(exporter, "exporter is null");
         this.lowMemoryKiller = requireNonNull(lowMemoryKiller, "lowMemoryKiller is null");
-        this.maxQueryMemory = config.getMaxQueryMemory();
-        this.maxQueryTotalMemory = config.getMaxQueryTotalMemory();
+        this.maxQueryMemoryInBytes = config.getMaxQueryMemory().toBytes();
+        this.maxQueryTotalMemoryInBytes = config.getMaxQueryTotalMemory().toBytes();
         this.coordinatorId = queryIdGenerator.getCoordinatorId();
         this.enabled = serverConfig.isCoordinator();
         this.killOnOutOfMemoryDelay = config.getKillOnOutOfMemoryDelay();
@@ -193,11 +192,11 @@ public class ClusterMemoryManager
             this.assignmentsRequestCodec = requireNonNull(assignmentsRequestJsonCodec, "assignmentsRequestJsonCodec is null");
         }
 
-        verify(maxQueryMemory.toBytes() <= maxQueryTotalMemory.toBytes(),
+        verify(maxQueryMemoryInBytes <= maxQueryTotalMemoryInBytes,
                 "maxQueryMemory cannot be greater than maxQueryTotalMemory");
-        verify(config.getSoftMaxQueryMemory().toBytes() <= maxQueryMemory.toBytes(),
+        verify(config.getSoftMaxQueryMemory().toBytes() <= maxQueryMemoryInBytes,
                 "Soft max query memory cannot be greater than hard limit");
-        verify(config.getSoftMaxQueryTotalMemory().toBytes() <= maxQueryTotalMemory.toBytes(),
+        verify(config.getSoftMaxQueryTotalMemory().toBytes() <= maxQueryTotalMemoryInBytes,
                 "Soft max query total memory cannot be greater than hard limit");
 
         this.pools = createClusterMemoryPools(nodeMemoryConfig.isReservedPoolEnabled());
@@ -253,8 +252,8 @@ public class ClusterMemoryManager
         long totalMemoryBytes = 0L;
         for (QueryExecution query : runningQueries) {
             boolean resourceOvercommit = resourceOvercommit(query.getSession());
-            long userMemoryReservation = query.getUserMemoryReservation().toBytes();
-            long totalMemoryReservation = query.getTotalMemoryReservation().toBytes();
+            long userMemoryReservation = query.getUserMemoryReservationInBytes();
+            long totalMemoryReservation = query.getTotalMemoryReservationInBytes();
 
             if (resourceOvercommit && outOfMemory) {
                 // If a query has requested resource overcommit, only kill it if the cluster has run out of memory
@@ -265,20 +264,20 @@ public class ClusterMemoryManager
             }
 
             if (!resourceOvercommit) {
-                long userMemoryLimit = min(maxQueryMemory.toBytes(), getQueryMaxMemory(query.getSession()).toBytes());
+                long userMemoryLimit = min(maxQueryMemoryInBytes, getQueryMaxMemory(query.getSession()).toBytes());
                 if (userMemoryReservation > userMemoryLimit) {
                     query.fail(exceededGlobalUserLimit(succinctBytes(userMemoryLimit)));
                     queryKilled = true;
                 }
-                QueryLimit<DataSize> queryTotalMemoryLimit = getMinimum(
-                        createDataSizeLimit(maxQueryTotalMemory, SYSTEM),
+                QueryLimit<Long> queryTotalMemoryLimit = getMinimum(
+                        createDataSizeLimit(maxQueryTotalMemoryInBytes, SYSTEM),
                         query.getResourceGroupQueryLimits()
                                 .flatMap(ResourceGroupQueryLimits::getTotalMemoryLimit)
-                                .map(rgLimit -> createDataSizeLimit(rgLimit, RESOURCE_GROUP))
+                                .map(rgLimit -> createDataSizeLimit(rgLimit.toBytes(), RESOURCE_GROUP))
                                 .orElse(null),
-                        createDataSizeLimit(getQueryMaxTotalMemory(query.getSession()), QUERY));
-                if (totalMemoryReservation > queryTotalMemoryLimit.getLimit().toBytes()) {
-                    query.fail(exceededGlobalTotalLimit(queryTotalMemoryLimit.getLimit(), queryTotalMemoryLimit.getLimitSource().name()));
+                        createDataSizeLimit(getQueryMaxTotalMemory(query.getSession()).toBytes(), QUERY));
+                if (totalMemoryReservation > queryTotalMemoryLimit.getLimit()) {
+                    query.fail(exceededGlobalTotalLimit(succinctBytes(queryTotalMemoryLimit.getLimit()), queryTotalMemoryLimit.getLimitSource().name()));
                     queryKilled = true;
                 }
             }
@@ -342,17 +341,17 @@ public class ClusterMemoryManager
         if (memoryManagerService.isPresent()) {
             // We are in the multi-coordinator codepath, and thus care about the globally running queries
             allRunningQueries = getClusterInfo(GENERAL_POOL)
-                            .getRunningQueries()
-                            .orElse(ImmutableList.of())
-                            .stream().collect(toImmutableMap(identity(), t -> Optional.empty()));
+                    .getRunningQueries()
+                    .orElse(ImmutableList.of())
+                    .stream().collect(toImmutableMap(identity(), t -> Optional.empty()));
         }
         else {
             // We are in the single coordinator setup, and thus care about the local queries. Ie, global queries
             // does not make sense.
             allRunningQueries = Maps.uniqueIndex(
                     allQueryInfoSupplier.get().stream()
-                        .map(Optional::of)
-                        .iterator(),
+                            .map(Optional::of)
+                            .iterator(),
                     queryInfo -> queryInfo.get().getQueryId());
         }
         memoryLeakDetector.checkForMemoryLeaks(allRunningQueries, pools.get(GENERAL_POOL).getQueryMemoryReservations());
@@ -497,8 +496,8 @@ public class ClusterMemoryManager
         // If present, this means the resource manager is determining the largest query, so do not make this determination locally
         if (memoryManagerService.isPresent()) {
             return largestMemoryQuery.flatMap(largestMemoryQueryId -> Streams.stream(queries)
-                    .filter(query -> query.getQueryId().equals(largestMemoryQueryId))
-                    .findFirst())
+                            .filter(query -> query.getQueryId().equals(largestMemoryQueryId))
+                            .findFirst())
                     .orElse(null);
         }
         for (QueryExecution queryExecution : queries) {
@@ -519,12 +518,12 @@ public class ClusterMemoryManager
 
     private QueryMemoryInfo createQueryMemoryInfo(QueryExecution query)
     {
-        return new QueryMemoryInfo(query.getQueryId(), query.getMemoryPool().getId(), query.getTotalMemoryReservation().toBytes());
+        return new QueryMemoryInfo(query.getQueryId(), query.getMemoryPool().getId(), query.getTotalMemoryReservationInBytes());
     }
 
     private long getQueryMemoryReservation(QueryExecution query)
     {
-        return query.getTotalMemoryReservation().toBytes();
+        return query.getTotalMemoryReservationInBytes();
     }
 
     private synchronized boolean allAssignmentsHavePropagated(Iterable<QueryExecution> queries)

@@ -28,8 +28,7 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.google.common.collect.ImmutableSet;
 import com.singlestore.jdbc.Driver;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
@@ -82,8 +81,7 @@ public class SingleStoreClient
             while (resultSet.next()) {
                 String schemaName = resultSet.getString("TABLE_CAT");
                 // skip internal schemas
-                if (!schemaName.equalsIgnoreCase("information_schema") && !schemaName.equalsIgnoreCase("memsql")
-                        && !schemaName.equalsIgnoreCase("cluster")) {
+                if (!listSchemasIgnoredSchemas.contains(schemaName.toLowerCase(ENGLISH))) {
                     schemaNames.add(schemaName);
                 }
             }
@@ -200,5 +198,11 @@ public class SingleStoreClient
             SchemaTableName newTable)
     {
         super.renameTable(identity, null, oldTable, newTable);
+    }
+
+    @Override
+    public String normalizeIdentifier(ConnectorSession session, String identifier)
+    {
+        return caseSensitiveNameMatchingEnabled ? identifier : identifier.toLowerCase(ENGLISH);
     }
 }

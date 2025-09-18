@@ -15,6 +15,7 @@ package com.facebook.presto.tests;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.metadata.SessionPropertyManager;
+import com.facebook.presto.scalar.sql.SqlInvokedFunctionsPlugin;
 import com.facebook.presto.spi.CatalogSchemaTableName;
 import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.ColumnConstraint;
@@ -78,6 +79,8 @@ public class TestLocalQueries
         sessionPropertyManager.addSystemSessionProperties(TEST_SYSTEM_PROPERTIES);
         sessionPropertyManager.addConnectorSessionProperties(new ConnectorId(TESTING_CATALOG), TEST_CATALOG_PROPERTIES);
 
+        localQueryRunner.installPlugin(new SqlInvokedFunctionsPlugin());
+
         return localQueryRunner;
     }
 
@@ -118,6 +121,12 @@ public class TestLocalQueries
     }
 
     @Test
+    public void testUse()
+    {
+        // USE statement is not supported
+    }
+
+    @Test
     public void testIOExplain()
     {
         String query = "SELECT * FROM orders";
@@ -143,5 +152,10 @@ public class TestLocalQueries
         assertEquals(
                 jsonCodec(IOPlan.class).fromJson((String) getOnlyElement(result.getOnlyColumnAsSet())),
                 new IOPlan(ImmutableSet.of(input), Optional.empty()));
+    }
+
+    @Override
+    public void testSetSessionNativeWorkerSessionProperty()
+    {
     }
 }

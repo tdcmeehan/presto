@@ -14,12 +14,16 @@
 package com.facebook.presto.iceberg.rest;
 
 import com.facebook.airlift.bootstrap.Bootstrap;
+import com.facebook.airlift.http.server.HttpServerConfig;
 import com.facebook.airlift.http.server.TheServlet;
 import com.facebook.airlift.http.server.testing.TestingHttpServer;
 import com.facebook.airlift.http.server.testing.TestingHttpServerModule;
 import com.facebook.airlift.node.NodeInfo;
 import com.facebook.presto.hive.HdfsContext;
 import com.facebook.presto.hive.HdfsEnvironment;
+import com.facebook.presto.hive.HiveClientConfig;
+import com.facebook.presto.hive.MetastoreClientConfig;
+import com.facebook.presto.hive.s3.HiveS3Config;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.testing.TestingConnectorSession;
 import com.google.common.collect.ImmutableList;
@@ -40,7 +44,8 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
-import static com.facebook.presto.iceberg.CatalogType.REST;
+import static com.facebook.airlift.configuration.ConfigBinder.configBinder;
+import static com.facebook.airlift.http.server.UriCompliance.LEGACY;
 import static com.facebook.presto.iceberg.IcebergDistributedTestBase.getHdfsEnvironment;
 import static java.util.Objects.requireNonNull;
 import static org.apache.iceberg.CatalogProperties.URI;
@@ -56,13 +61,13 @@ public class IcebergRestTestUtil
 
     public static Map<String, String> restConnectorProperties(String serverUri)
     {
-        return ImmutableMap.of("iceberg.catalog.type", REST.name(), "iceberg.rest.uri", serverUri);
+        return ImmutableMap.of("iceberg.rest.uri", serverUri);
     }
 
     public static TestingHttpServer getRestServer(String location)
     {
         JdbcCatalog backingCatalog = new JdbcCatalog();
-        HdfsEnvironment hdfsEnvironment = getHdfsEnvironment();
+        HdfsEnvironment hdfsEnvironment = getHdfsEnvironment(new HiveClientConfig(), new MetastoreClientConfig(), new HiveS3Config());
         backingCatalog.setConf(hdfsEnvironment.getConfiguration(new HdfsContext(SESSION), new Path(location)));
 
         Map<String, String> properties = ImmutableMap.<String, String>builder()
@@ -70,6 +75,7 @@ public class IcebergRestTestUtil
                 .put(WAREHOUSE_LOCATION, location)
                 .put("jdbc.username", "user")
                 .put("jdbc.password", "password")
+                .put("jdbc.schema-version", "V1")
                 .build();
         backingCatalog.initialize("rest_jdbc_backend", properties);
 
@@ -121,8 +127,13 @@ public class IcebergRestTestUtil
             @Override
             public void configure(Binder binder)
             {
+                configBinder(binder)
+                        .bindConfigDefaults(HttpServerConfig.class, config -> {
+                            // This is required to support nested namespace URI paths
+                            config.setUriComplianceMode(LEGACY);
+                        });
                 binder.bind(new TypeLiteral<Map<String, String>>() {}).annotatedWith(TheServlet.class).toInstance(ImmutableMap.of());
-                binder.bind(javax.servlet.Servlet.class).annotatedWith(TheServlet.class).toInstance(new IcebergRestCatalogServlet(adapter));
+                binder.bind(jakarta.servlet.Servlet.class).annotatedWith(TheServlet.class).toInstance(new IcebergRestCatalogServlet(adapter));
                 binder.bind(NodeInfo.class).toInstance(new NodeInfo("test"));
             }
         }

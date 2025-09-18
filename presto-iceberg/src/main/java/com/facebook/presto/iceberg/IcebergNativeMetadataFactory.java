@@ -21,8 +21,7 @@ import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
 import com.facebook.presto.spi.plan.FilterStatsCalculatorService;
 import com.facebook.presto.spi.relation.RowExpressionService;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import static java.util.Objects.requireNonNull;
 
@@ -38,6 +37,7 @@ public class IcebergNativeMetadataFactory
     final NodeVersion nodeVersion;
     final FilterStatsCalculatorService filterStatsCalculatorService;
     final StatisticsFileCache statisticsFileCache;
+    final IcebergTableProperties tableProperties;
 
     @Inject
     public IcebergNativeMetadataFactory(
@@ -49,7 +49,8 @@ public class IcebergNativeMetadataFactory
             JsonCodec<CommitTaskData> commitTaskCodec,
             NodeVersion nodeVersion,
             FilterStatsCalculatorService filterStatsCalculatorService,
-            StatisticsFileCache statisticsFileCache)
+            StatisticsFileCache statisticsFileCache,
+            IcebergTableProperties tableProperties)
     {
         this.catalogFactory = requireNonNull(catalogFactory, "catalogFactory is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
@@ -61,10 +62,11 @@ public class IcebergNativeMetadataFactory
         this.catalogType = config.getCatalogType();
         this.filterStatsCalculatorService = requireNonNull(filterStatsCalculatorService, "filterStatsCalculatorService is null");
         this.statisticsFileCache = requireNonNull(statisticsFileCache, "statisticsFileCache is null");
+        this.tableProperties = requireNonNull(tableProperties, "tableProperties is null");
     }
 
     public ConnectorMetadata create()
     {
-        return new IcebergNativeMetadata(catalogFactory, typeManager, functionResolution, rowExpressionService, commitTaskCodec, catalogType, nodeVersion, filterStatsCalculatorService, statisticsFileCache);
+        return new IcebergNativeMetadata(catalogFactory, typeManager, functionResolution, rowExpressionService, commitTaskCodec, catalogType, nodeVersion, filterStatsCalculatorService, statisticsFileCache, tableProperties);
     }
 }

@@ -47,7 +47,9 @@
           "name":"$hashvalue",
           "type":"bigint"
         },
-        "replicateNullsAndAny":false
+        "replicateNullsAndAny":false,
+        "scaleWriters": false,
+        "encoding":"COLUMNAR"
       },
       "sources":[
         {
@@ -74,7 +76,8 @@
             }
           ],
           "ensureSourceOrdering":false,
-          "exchangeType":"REPARTITION"
+          "exchangeType":"REPARTITION",
+          "encoding":"COLUMNAR"
         }
       ],
       "inputs":[
@@ -119,7 +122,8 @@
                 "bigint"
               ],
               "variableArity":false
-            }
+            },
+            "builtInFunctionKind": "ENGINE"
           },
           "returnType":"bigint",
           "arguments":[
@@ -154,7 +158,8 @@
               "bigint"
             ],
             "variableArity":false
-          }
+          },
+          "builtInFunctionKind": "ENGINE"
         }
       }
     },
@@ -239,6 +244,8 @@
       }
     ],
     "replicateNullsAndAny":false,
+    "scaleWriters": false,
+    "encoding":"COLUMNAR",
     "bucketToPartition":[
       0
     ]

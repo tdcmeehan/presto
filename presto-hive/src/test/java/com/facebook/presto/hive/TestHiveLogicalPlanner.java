@@ -35,7 +35,9 @@ import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.plan.AggregationNode;
+import com.facebook.presto.spi.plan.JoinNode;
 import com.facebook.presto.spi.plan.PlanNode;
+import com.facebook.presto.spi.plan.SemiJoinNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.ConstantExpression;
@@ -48,8 +50,6 @@ import com.facebook.presto.sql.planner.assertions.MatchResult;
 import com.facebook.presto.sql.planner.assertions.Matcher;
 import com.facebook.presto.sql.planner.assertions.PlanMatchPattern;
 import com.facebook.presto.sql.planner.assertions.SymbolAliases;
-import com.facebook.presto.sql.planner.plan.JoinNode;
-import com.facebook.presto.sql.planner.plan.SemiJoinNode;
 import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.tree.FunctionCall;
 import com.facebook.presto.sql.tree.LongLiteral;
@@ -84,6 +84,8 @@ import static com.facebook.presto.SystemSessionProperties.OPTIMIZE_METADATA_QUER
 import static com.facebook.presto.SystemSessionProperties.OPTIMIZE_METADATA_QUERIES_IGNORE_STATS;
 import static com.facebook.presto.SystemSessionProperties.PUSHDOWN_DEREFERENCE_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.PUSHDOWN_SUBFIELDS_ENABLED;
+import static com.facebook.presto.SystemSessionProperties.PUSHDOWN_SUBFIELDS_FOR_MAP_FUNCTIONS;
+import static com.facebook.presto.SystemSessionProperties.UTILIZE_UNIQUE_PROPERTY_IN_QUERY_PLANNING;
 import static com.facebook.presto.common.function.OperatorType.EQUAL;
 import static com.facebook.presto.common.predicate.Domain.create;
 import static com.facebook.presto.common.predicate.Domain.multipleValues;
@@ -129,6 +131,7 @@ import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.join;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.node;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.output;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.project;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.semiJoin;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.strictTableScan;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.values;
 import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
@@ -148,6 +151,7 @@ import static io.airlift.tpch.TpchTable.ORDERS;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotSame;
 import static org.testng.Assert.assertTrue;
 
 @Test(singleThreaded = true)
@@ -163,6 +167,13 @@ public class TestHiveLogicalPlanner
                 ImmutableMap.of("experimental.pushdown-subfields-enabled", "true",
                         "pushdown-subfields-from-lambda-enabled", "true"),
                 Optional.empty());
+    }
+
+    @Override
+    protected QueryRunner createExpectedQueryRunner()
+            throws Exception
+    {
+        return getQueryRunner();
     }
 
     @Test
@@ -929,6 +940,7 @@ public class TestHiveLogicalPlanner
     private static Partition createDummyPartition(Table table, String partitionName)
     {
         return Partition.builder()
+                .setCatalogName(Optional.of("hive"))
                 .setDatabaseName(table.getDatabaseName())
                 .setTableName(table.getTableName())
                 .setColumns(table.getDataColumns())
@@ -1278,7 +1290,7 @@ public class TestHiveLogicalPlanner
                     "am array(map(int,row(a1 bigint, a2 double))), " +
                     "aa array(array(row(a1 bigint, a2 double))), " +
                     "z array(array(row(p bigint, e row(e1 bigint, e2 varchar)))))");
-           // transform
+            // transform
             assertPushdownSubfields("SELECT TRANSFORM(y, x -> x.d.d1) FROM " + tableName, tableName,
                     ImmutableMap.of("y", toSubfields("y[*].d.d1")));
 
@@ -1364,6 +1376,25 @@ public class TestHiveLogicalPlanner
         assertPushdownSubfields("SELECT x.a FROM test_pushdown_struct_subfields WHERE x.a > 10 AND x.b LIKE 'abc%'", "test_pushdown_struct_subfields",
                 ImmutableMap.of("x", toSubfields("x.a", "x.b")));
 
+        assertQuery("SELECT struct.b FROM (SELECT CUSTOM_STRUCT_WITH_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)");
+        assertQuery("SELECT struct.b FROM (SELECT CUSTOM_STRUCT_WITHOUT_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)");
+        assertQuery("SELECT struct FROM (SELECT CUSTOM_STRUCT_WITH_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)");
+        assertQuery("SELECT struct FROM (SELECT CUSTOM_STRUCT_WITHOUT_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)");
+
+        assertPushdownSubfields("SELECT struct.b FROM (SELECT x AS struct FROM test_pushdown_struct_subfields)", "test_pushdown_struct_subfields",
+                ImmutableMap.of("x", toSubfields("x.b")));
+        assertPushdownSubfields("SELECT struct.b FROM (SELECT CUSTOM_STRUCT_WITH_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)", "test_pushdown_struct_subfields",
+                ImmutableMap.of("x", toSubfields("x.b")));
+        assertPushdownSubfields("SELECT struct.b FROM (SELECT CUSTOM_STRUCT_WITHOUT_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)", "test_pushdown_struct_subfields",
+                ImmutableMap.of());
+
+        assertPushdownSubfields("SELECT struct FROM (SELECT x AS struct FROM test_pushdown_struct_subfields)", "test_pushdown_struct_subfields",
+                ImmutableMap.of());
+        assertPushdownSubfields("SELECT struct FROM (SELECT CUSTOM_STRUCT_WITH_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)", "test_pushdown_struct_subfields",
+                ImmutableMap.of());
+        assertPushdownSubfields("SELECT struct FROM (SELECT CUSTOM_STRUCT_WITHOUT_PASSTHROUGH(x) AS struct FROM test_pushdown_struct_subfields)", "test_pushdown_struct_subfields",
+                ImmutableMap.of());
+
         // Join
         assertPlan("SELECT l.orderkey, x.a, mod(x.d.d1, 2) FROM lineitem l, test_pushdown_struct_subfields a WHERE l.linenumber = a.id",
                 anyTree(
@@ -1438,6 +1469,172 @@ public class TestHiveLogicalPlanner
                 ImmutableMap.of("x", toSubfields("x.d")));
 
         assertUpdate("DROP TABLE test_pushdown_struct_subfields");
+    }
+
+    @Test
+    public void testPushdownNegativeSubfiels()
+    {
+        assertUpdate("CREATE TABLE test_pushdown_subfields_negative_key(id bigint, arr array(bigint), mp map(integer, varchar))");
+        assertPushdownSubfields("select element_at(arr, -1) from test_pushdown_subfields_negative_key", "test_pushdown_subfields_negative_key", ImmutableMap.of("arr", toSubfields()));
+        assertPushdownSubfields("select element_at(mp, -1) from test_pushdown_subfields_negative_key", "test_pushdown_subfields_negative_key", ImmutableMap.of("mp", toSubfields("mp[-1]")));
+        assertPushdownSubfields("select element_at(arr, -1), element_at(arr, 2) from test_pushdown_subfields_negative_key", "test_pushdown_subfields_negative_key", ImmutableMap.of("arr", toSubfields()));
+        assertPushdownSubfields("select element_at(mp, -1), element_at(mp, 2) from test_pushdown_subfields_negative_key", "test_pushdown_subfields_negative_key", ImmutableMap.of("mp", toSubfields("mp[-1]", "mp[2]")));
+
+        assertUpdate("DROP TABLE test_pushdown_subfields_negative_key");
+    }
+
+    @Test
+    public void testPushdownSubfieldsForMapSubset()
+    {
+        Session mapSubset = Session.builder(getSession()).setSystemProperty(PUSHDOWN_SUBFIELDS_FOR_MAP_FUNCTIONS, "true").build();
+        assertUpdate("CREATE TABLE test_pushdown_map_subfields(id integer, x map(integer, double))");
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array[1, 2, 3]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[1]", "x[2]", "x[3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array[-1, -2, 3]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[-1]", "x[-2]", "x[3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array[1, 2, null]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array[1, 2, 3, id]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array[id]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertUpdate("DROP TABLE test_pushdown_map_subfields");
+
+        assertUpdate("CREATE TABLE test_pushdown_map_subfields(id integer, x array(map(integer, double)))");
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_subset(mp, array[1, 2, 3])) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[*][1]", "x[*][2]", "x[*][3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_subset(mp, array[1, 2, null])) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_subset(mp, array[1, 2, id])) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertUpdate("DROP TABLE test_pushdown_map_subfields");
+
+        assertUpdate("CREATE TABLE test_pushdown_map_subfields(id varchar, x map(varchar, double))");
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array['ab', 'c', 'd']) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[\"ab\"]", "x[\"c\"]", "x[\"d\"]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array['ab', 'c', null]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array['ab', 'c', 'd', id]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_subset(x, array[id]) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertUpdate("DROP TABLE test_pushdown_map_subfields");
+    }
+
+    @Test
+    public void testPushdownSubfieldsForMapFilter()
+    {
+        Session mapSubset = Session.builder(getSession()).setSystemProperty(PUSHDOWN_SUBFIELDS_FOR_MAP_FUNCTIONS, "true").build();
+        assertUpdate("CREATE TABLE test_pushdown_map_subfields(id integer, x map(integer, double))");
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in (1, 2, 3)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[1]", "x[2]", "x[3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> v in (1, 2, 3)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array[1, 2, 3], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[1]", "x[2]", "x[3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array[1, 2, 3], v)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k = 1) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[1]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> v = 1) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> 1 = k) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[1]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> 1 = v) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in (-1, -2, 3)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[-1]", "x[-2]", "x[3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array[-1, -2, 3], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[-1]", "x[-2]", "x[3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k=-2) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[-2]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> -2=k) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[-2]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in (1, 2, null)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k is null) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array[1, 2, null], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in (1, 2, 3, id)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array[1, 2, 3, id], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k = id) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> id = k) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in (id)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array[id], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertUpdate("DROP TABLE test_pushdown_map_subfields");
+
+        assertUpdate("CREATE TABLE test_pushdown_map_subfields(id integer, x array(map(integer, double)))");
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> k in (1, 2, 3))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[*][1]", "x[*][2]", "x[*][3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> v in (1, 2, 3))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> contains(array[1, 2, 3], k))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[*][1]", "x[*][2]", "x[*][3]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> contains(array[1, 2, 3], v))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> k=2)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[*][2]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> v=2)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> 2=k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[*][2]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> 2=v)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> k in (1, 2, null))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> contains(array[1, 2, null], k))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> k in (1, 2, id))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> k=id)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> id=k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, transform(x, mp -> map_filter(mp, (k, v) -> contains(array[1, 2, id], k))) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertUpdate("DROP TABLE test_pushdown_map_subfields");
+
+        assertUpdate("CREATE TABLE test_pushdown_map_subfields(id varchar, x map(varchar, varchar))");
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in ('ab', 'c', 'd')) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[\"ab\"]", "x[\"c\"]", "x[\"d\"]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array['ab', 'c', 'd'], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[\"ab\"]", "x[\"c\"]", "x[\"d\"]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k='d') FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[\"d\"]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> 'd'=k) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields("x[\"d\"]")));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> v in ('ab', 'c', 'd')) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array['ab', 'c', 'd'], v)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> v='d') FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> 'd'=v) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in ('ab', 'c', null)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array['ab', 'c', null], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in ('ab', 'c', 'd', id)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k = id) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> id = k) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array['ab', 'c', 'd', id], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> k in (id)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertPushdownSubfields(mapSubset, "SELECT t.id, map_filter(x, (k, v) -> contains(array[id], k)) FROM test_pushdown_map_subfields t", "test_pushdown_map_subfields",
+                ImmutableMap.of("x", toSubfields()));
+        assertUpdate("DROP TABLE test_pushdown_map_subfields");
     }
 
     @Test
@@ -1958,6 +2155,336 @@ public class TestHiveLogicalPlanner
         }
     }
 
+    @Test
+    public void testRowId()
+    {
+        Session session = Session.builder(getQueryRunner().getDefaultSession())
+                .setSystemProperty(UTILIZE_UNIQUE_PROPERTY_IN_QUERY_PLANNING, "true")
+                .build();
+        String sql;
+        sql = "SELECT\n" +
+                "    unique_id AS unique_id,\n" +
+                "    ARBITRARY(name) AS customer_name,\n" +
+                "    ARRAY_AGG(orderkey) AS orders_info\n" +
+                "FROM (\n" +
+                "    SELECT\n" +
+                "        customer.name,\n" +
+                "        orders.orderkey,\n" +
+                "        customer.\"$row_id\" AS unique_id\n" +
+                "    FROM customer\n" +
+                "    LEFT JOIN orders\n" +
+                "        ON customer.custkey = orders.custkey\n" +
+                "        AND orders.orderstatus IN ('O', 'F')\n" +
+                "        AND orders.orderdate BETWEEN DATE '1995-01-01' AND DATE '1995-12-31'\n" +
+                "    WHERE\n" +
+                "        customer.nationkey IN (1, 2, 3, 4, 5)\n" +
+                ")\n" +
+                "GROUP BY\n" +
+                "    unique_id";
+
+        assertPlan(session,
+                sql,
+                anyTree(
+                        aggregation(
+                                ImmutableMap.of(),
+                                join(
+                                        anyTree(tableScan("customer")),
+                                        anyTree(tableScan("orders"))))));
+
+        sql = "select \"$row_id\", count(*) from orders group by 1";
+        assertPlan(sql, anyTree(aggregation(ImmutableMap.of(), tableScan("orders"))));
+        sql = "SELECT\n" +
+                "    customer.\"$row_id\" AS unique_id,\n" +
+                "    COUNT(orders.orderkey) AS order_count,\n" +
+                "    ARRAY_AGG(orders.orderkey) AS order_keys\n" +
+                "FROM customer\n" +
+                "LEFT JOIN orders\n" +
+                "    ON customer.custkey = orders.custkey\n" +
+                "WHERE customer.acctbal > 1000\n" +
+                "GROUP BY customer.\"$row_id\"";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        join(
+                                anyTree(tableScan("customer")),
+                                anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    unique_id,\n" +
+                "    MAX(orderdate) AS latest_order_date\n" +
+                "FROM (\n" +
+                "    SELECT\n" +
+                "        customer.\"$row_id\" AS unique_id,\n" +
+                "        orders.orderdate\n" +
+                "    FROM customer\n" +
+                "    JOIN orders\n" +
+                "        ON customer.custkey = orders.custkey\n" +
+                "    WHERE orders.orderstatus = 'O'\n" +
+                ") t\n" +
+                "GROUP BY unique_id";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        join(
+                                anyTree(tableScan("customer")),
+                                anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    DISTINCT customer.\"$row_id\" AS unique_id,\n" +
+                "    customer.name\n" +
+                "FROM customer\n" +
+                "WHERE customer.nationkey = 1";
+
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        project(filter(tableScan("customer"))))));
+
+        sql = "SELECT\n" +
+                "    c.name,\n" +
+                "    o.orderkey,\n" +
+                "    c.\"$row_id\" AS customer_row_id,\n" +
+                "    o.\"$row_id\" AS order_row_id\n" +
+                "FROM customer c\n" +
+                "JOIN orders o\n" +
+                "    ON c.\"$row_id\" = o.\"$row_id\"\n" +
+                "WHERE o.totalprice > 10000";
+        assertPlan(sql, anyTree(
+                join(
+                        exchange(anyTree(tableScan("customer"))),
+                        exchange(anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    \"$row_id\" AS unique_id,\n" +
+                "    orderstatus,\n" +
+                "    COUNT(*) AS cnt\n" +
+                "FROM orders\n" +
+                "GROUP BY \"$row_id\", orderstatus";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        project(tableScan("orders")))));
+
+        sql = "SELECT\n" +
+                "    o1.orderkey,\n" +
+                "    o2.totalprice\n" +
+                "FROM orders o1\n" +
+                "JOIN orders o2\n" +
+                "    ON o1.\"$row_id\" = o2.\"$row_id\"\n" +
+                "WHERE o1.orderstatus = 'O'";
+        assertPlan(sql, anyTree(
+                join(
+                        exchange(anyTree(tableScan("orders"))),
+                        exchange(anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    orderkey,\n" +
+                "    totalprice\n" +
+                "FROM orders o1\n" +
+                "WHERE EXISTS (\n" +
+                "    SELECT 1\n" +
+                "    FROM orders o2\n" +
+                "    WHERE o1.\"$row_id\" = o2.\"$row_id\"\n" +
+                "    AND o2.orderstatus = 'F'\n" +
+                ")";
+        assertPlan(sql, anyTree(
+                join(
+                        exchange(anyTree(tableScan("orders"))),
+                        exchange(anyTree(aggregation(ImmutableMap.of(), project(filter(tableScan("orders")))))))));
+
+        sql = "SELECT\n" +
+                "    custkey,\n" +
+                "    name\n" +
+                "FROM customer\n" +
+                "WHERE \"$row_id\" IN (\n" +
+                "    SELECT \"$row_id\"\n" +
+                "    FROM customer\n" +
+                "    WHERE acctbal > 5000\n" +
+                ")";
+        assertPlan(sql, anyTree(
+                semiJoin(
+                        anyTree(tableScan("customer")),
+                        anyTree(tableScan("customer")))));
+
+        sql = "SELECT \"$row_id\", orderkey FROM orders WHERE orderstatus = 'O'\n" +
+                "UNION\n" +
+                "SELECT \"$row_id\", orderkey FROM orders WHERE orderstatus = 'F'";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        project(filter(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    c.\"$row_id\",\n" +
+                "    COUNT(o.orderkey) AS order_count,\n" +
+                "    SUM(o.totalprice) AS total_spent,\n" +
+                "    MAX(o.orderdate) AS latest_order,\n" +
+                "    MIN(o.orderdate) AS first_order\n" +
+                "FROM customer c\n" +
+                "LEFT JOIN orders o ON c.custkey = o.custkey\n" +
+                "GROUP BY c.\"$row_id\"";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        join(
+                                anyTree(tableScan("customer")),
+                                anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    \"$row_id\",\n" +
+                "    COUNT(*) AS cnt\n" +
+                "FROM orders\n" +
+                "GROUP BY \"$row_id\"\n" +
+                "HAVING COUNT(*) = 1";
+        assertPlan(sql, anyTree(
+                project(filter(
+                        aggregation(ImmutableMap.of(),
+                                tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    c.custkey,\n" +
+                "    c.name,\n" +
+                "    (\n" +
+                "        SELECT COUNT(*)\n" +
+                "        FROM orders o\n" +
+                "        WHERE o.custkey = c.custkey\n" +
+                "        AND o.\"$row_id\" IS NOT NULL\n" +
+                "    ) AS order_count\n" +
+                "FROM customer c";
+        assertPlan(sql, anyTree(
+                project(
+                        join(
+                                anyTree(tableScan("customer")),
+                                anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    outer_query.customer_id,\n" +
+                "    outer_query.order_count\n" +
+                "FROM (\n" +
+                "    SELECT\n" +
+                "        c.\"$row_id\" AS customer_id,\n" +
+                "        COUNT(DISTINCT o.\"$row_id\") AS order_count\n" +
+                "    FROM customer c\n" +
+                "    LEFT JOIN orders o ON c.custkey = o.custkey\n" +
+                "    WHERE c.nationkey IN (1, 2, 3)\n" +
+                "    GROUP BY c.\"$row_id\"\n" +
+                ") outer_query\n" +
+                "WHERE outer_query.order_count > 2";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        project(
+                                join(
+                                        anyTree(tableScan("customer")),
+                                        anyTree(tableScan("orders")))))));
+
+        sql = "SELECT\n" +
+                "    c.custkey,\n" +
+                "    c.name\n" +
+                "FROM customer c\n" +
+                "WHERE NOT EXISTS (\n" +
+                "    SELECT 1\n" +
+                "    FROM orders o\n" +
+                "    WHERE c.\"$row_id\" = o.\"$row_id\"\n" +
+                ")";
+        assertPlan(sql, anyTree(
+                join(
+                        exchange(anyTree(tableScan("customer"))),
+                        exchange(anyTree(aggregation(ImmutableMap.of(), tableScan("orders")))))));
+
+        sql = "SELECT\n" +
+                "    c.name,\n" +
+                "    o.orderkey,\n" +
+                "    l.linenumber\n" +
+                "FROM customer c\n" +
+                "JOIN orders o ON c.custkey = o.custkey\n" +
+                "JOIN lineitem l ON o.orderkey = l.orderkey\n" +
+                "WHERE c.\"$row_id\" IS NOT NULL\n" +
+                "    AND o.\"$row_id\" IS NOT NULL\n" +
+                "    AND l.\"$row_id\" IS NOT NULL";
+        assertPlan(sql, anyTree(
+                join(
+                        anyTree(
+                                join(
+                                        anyTree(tableScan("customer")),
+                                        anyTree(tableScan("orders")))),
+                        anyTree(tableScan("lineitem")))));
+
+        sql = "SELECT\n" +
+                "    c.\"$row_id\" AS customer_row_id,\n" +
+                "    o.\"$row_id\" AS order_row_id,\n" +
+                "    c.name,\n" +
+                "    o.orderkey\n" +
+                "FROM customer c\n" +
+                "CROSS JOIN orders o\n" +
+                "WHERE c.nationkey = 1 AND o.orderstatus = 'O'";
+        assertPlan(sql, anyTree(
+                join(
+                        anyTree(tableScan("customer")),
+                        anyTree(tableScan("orders")))));
+
+        sql = "SELECT\n" +
+                "    orderstatus,\n" +
+                "    COUNT(\"$row_id\") AS row_count,\n" +
+                "    MIN(\"$row_id\") AS min_row_id\n" +
+                "FROM orders\n" +
+                "GROUP BY orderstatus";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        exchange(anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    xxhash64(\"$row_id\") AS bucket,\n" +
+                "    COUNT(*) AS cnt\n" +
+                "FROM orders\n" +
+                "GROUP BY xxhash64(\"$row_id\")";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        exchange(anyTree(tableScan("orders"))))));
+
+        sql = "SELECT \"$row_id\", 'customer' AS source FROM customer\n" +
+                "UNION ALL\n" +
+                "SELECT \"$row_id\", 'orders' AS source FROM orders";
+        assertPlan(sql, anyTree(
+                exchange(
+                        anyTree(tableScan("customer")),
+                        anyTree(tableScan("orders")))));
+
+        sql = "SELECT\n" +
+                "    o.\"$row_id\" AS order_row_id,\n" +
+                "    o.orderkey,\n" +
+                "    l.linenumber\n" +
+                "FROM orders o\n" +
+                "JOIN lineitem l ON o.orderkey = l.orderkey\n" +
+                "WHERE o.orderstatus = 'O'";
+        assertPlan(sql, anyTree(
+                join(
+                        exchange(anyTree(tableScan("lineitem"))),
+                        exchange(anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    orderkey,\n" +
+                "    totalprice\n" +
+                "FROM orders o1\n" +
+                "WHERE \"$row_id\" > (\n" +
+                "    SELECT MIN(\"$row_id\")\n" +
+                "    FROM orders o2\n" +
+                "    WHERE o2.orderstatus = 'F'\n" +
+                ")";
+        assertPlan(sql, anyTree(
+                join(
+                        tableScan("orders"),
+                        exchange(anyTree(tableScan("orders"))))));
+
+        sql = "SELECT\n" +
+                "    CASE \n" +
+                "        WHEN nationkey = 1 THEN \"$row_id\"\n" +
+                "        ELSE cast('default' as varbinary)\n" +
+                "    END AS conditional_row_id,\n" +
+                "    COUNT(*) AS cnt\n" +
+                "FROM customer\n" +
+                "GROUP BY CASE \n" +
+                "        WHEN nationkey = 1 THEN \"$row_id\"\n" +
+                "        ELSE cast('default' as varbinary)\n" +
+                "    END";
+        assertPlan(sql, anyTree(
+                aggregation(ImmutableMap.of(),
+                        exchange(anyTree(tableScan("customer"))))));
+    }
+
     private static Set<Subfield> toSubfields(String... subfieldPaths)
     {
         return Arrays.stream(subfieldPaths)
@@ -1973,6 +2500,11 @@ public class TestHiveLogicalPlanner
     private void assertPushdownSubfields(Session session, String query, String tableName, Map<String, Set<Subfield>> requiredSubfields)
     {
         assertPlan(session, query, anyTree(tableScan(tableName, requiredSubfields)));
+    }
+
+    private static PlanMatchPattern tableScan(String expectedTableName)
+    {
+        return PlanMatchPattern.tableScan(expectedTableName);
     }
 
     private static PlanMatchPattern tableScan(String expectedTableName, Map<String, Set<Subfield>> expectedRequiredSubfields)
@@ -2126,7 +2658,7 @@ public class TestHiveLogicalPlanner
         for (ColumnHandle columnHandle : tableScan.getAssignments().values()) {
             assertTrue(columnHandle instanceof HiveColumnHandle);
             HiveColumnHandle hiveColumnHandle = (HiveColumnHandle) columnHandle;
-            assertFalse(hiveColumnHandle.getColumnType() == HiveColumnHandle.ColumnType.AGGREGATED);
+            assertNotSame(hiveColumnHandle.getColumnType(), HiveColumnHandle.ColumnType.AGGREGATED);
             assertFalse(hiveColumnHandle.getPartialAggregation().isPresent());
         }
     }

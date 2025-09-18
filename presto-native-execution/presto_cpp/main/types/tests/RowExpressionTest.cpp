@@ -14,10 +14,13 @@
 #include <gtest/gtest.h>
 #include <array>
 
+#include "presto_cpp/main/common/Configs.h"
+#include "presto_cpp/main/common/tests/MutableConfigs.h"
 #include "presto_cpp/main/types/PrestoToVeloxExpr.h"
-#include "presto_cpp/presto_protocol/presto_protocol.h"
+#include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
+#include "velox/common/file/FileSystems.h"
 #include "velox/core/Expressions.h"
-#include "velox/type/Type.h"
+#include "velox/functions/prestosql/types/JsonRegistration.h"
 
 using namespace facebook::presto;
 using namespace facebook::velox;
@@ -26,10 +29,13 @@ using namespace facebook::velox::core;
 class RowExpressionTest : public ::testing::Test {
  public:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
+    registerJsonType();
+    filesystems::registerLocalFileSystem();
+    test::setupMutableSystemConfig();
     pool_ = memory::MemoryManager::getInstance()->addLeafPool();
     converter_ =
         std::make_unique<VeloxExprConverter>(pool_.get(), &typeParser_);
@@ -87,7 +93,8 @@ class RowExpressionTest : public ::testing::Test {
         returnTypeField + R"##(,
             "typeVariableConstraints": [],
             "variableArity": false
-          }
+          },
+          "builtInFunctionKind": "ENGINE"
         },
     )##" +
         returnTypeField + R"##(
@@ -411,6 +418,18 @@ TEST_F(RowExpressionTest, varbinary5) {
           '"');
 }
 
+TEST_F(RowExpressionTest, char) {
+  SystemConfig::instance()->setValue(std::string(SystemConfig::kCharNToVarcharImplicitCast), "true");
+  std::string str = R"##(
+        {
+            "@type": "constant",
+            "type": "char(3)",
+            "valueBlock": "DgAAAFZBUklBQkxFX1dJRFRIAQAAAAMAAAAAAwAAAGFiYw=="
+        }
+    )##";
+  testConstantExpression(str, "VARCHAR", "\"abc\"");
+}
+
 TEST_F(RowExpressionTest, timestamp) {
   std::string str = R"(
         {
@@ -475,7 +494,8 @@ TEST_F(RowExpressionTest, call) {
             "returnType": "boolean",
             "typeVariableConstraints": [],
             "variableArity": false
-          }
+          },
+          "builtInFunctionKind": "ENGINE"
         },
         "returnType": "boolean"
       }
@@ -497,7 +517,7 @@ TEST_F(RowExpressionTest, call) {
         ],
         "displayName": "EQUAL",
         "functionHandle": {
-          "@type": "json_file",
+          "@type": "sql_function_handle",
           "functionId": "json.x4.eq;INTEGER;INTEGER",
           "version": "1"
         },
@@ -548,7 +568,7 @@ TEST_F(RowExpressionTest, castToVarchar) {
 
     auto returnExpr = std::dynamic_pointer_cast<const CastTypedExpr>(expr);
     ASSERT_NE(returnExpr, nullptr);
-    ASSERT_FALSE(returnExpr->nullOnFailure());
+    ASSERT_FALSE(returnExpr->isTryCast());
     ASSERT_EQ(returnExpr->type()->toString(), "VARCHAR");
   }
   // TRY_CAST(varchar_col AS varchar)
@@ -560,7 +580,7 @@ TEST_F(RowExpressionTest, castToVarchar) {
 
     auto returnExpr = std::dynamic_pointer_cast<const CastTypedExpr>(expr);
     ASSERT_NE(returnExpr, nullptr);
-    ASSERT_TRUE(returnExpr->nullOnFailure());
+    ASSERT_TRUE(returnExpr->isTryCast());
     ASSERT_EQ(returnExpr->type()->toString(), "VARCHAR");
   }
   // CAST(varchar_col AS varchar(3))
@@ -600,7 +620,7 @@ TEST_F(RowExpressionTest, castToVarchar) {
     std::shared_ptr<protocol::CallExpression> p =
         json::parse(makeCastToVarchar(true, "varchar", "varchar(3)"));
 
-    ASSERT_THROW(converter_->toVeloxExpr(p), VeloxRuntimeError);
+    ASSERT_THROW(converter_->toVeloxExpr(p), VeloxUserError);
   }
   // CAST(nonvarchar_col AS varchar(3))
   {
@@ -611,7 +631,7 @@ TEST_F(RowExpressionTest, castToVarchar) {
 
     auto returnExpr = std::dynamic_pointer_cast<const CastTypedExpr>(expr);
     ASSERT_NE(returnExpr, nullptr);
-    ASSERT_FALSE(returnExpr->nullOnFailure());
+    ASSERT_FALSE(returnExpr->isTryCast());
     ASSERT_EQ(returnExpr->type()->toString(), "VARCHAR");
   }
   // TRY_CAST(nonvarchar_col AS varchar(3))
@@ -623,8 +643,31 @@ TEST_F(RowExpressionTest, castToVarchar) {
 
     auto returnExpr = std::dynamic_pointer_cast<const CastTypedExpr>(expr);
     ASSERT_NE(returnExpr, nullptr);
-    ASSERT_TRUE(returnExpr->nullOnFailure());
+    ASSERT_TRUE(returnExpr->isTryCast());
     ASSERT_EQ(returnExpr->type()->toString(), "VARCHAR");
+  }
+  // CAST(json AS varchar(3))
+  {
+    std::shared_ptr<protocol::CallExpression> p =
+        json::parse(makeCastToVarchar(false, "json", "varchar(3)"));
+    auto expr = converter_->toVeloxExpr(p);
+    auto returnExpr = std::dynamic_pointer_cast<const CallTypedExpr>(expr);
+
+    ASSERT_NE(returnExpr, nullptr);
+    ASSERT_EQ(returnExpr->name(), "presto.default.substr");
+
+    auto returnArg1 = std::dynamic_pointer_cast<const CastTypedExpr>(
+        returnExpr->inputs()[0]);
+    auto returnArg2 = std::dynamic_pointer_cast<const ConstantTypedExpr>(
+        returnExpr->inputs()[1]);
+    auto returnArg3 = std::dynamic_pointer_cast<const ConstantTypedExpr>(
+        returnExpr->inputs()[2]);
+
+    ASSERT_EQ(returnArg1->type()->toString(), "VARCHAR");
+    ASSERT_EQ(returnArg2->type()->toString(), "BIGINT");
+    ASSERT_EQ(returnArg2->value().toJson(returnArg2->type()), "1");
+    ASSERT_EQ(returnArg3->type()->toString(), "BIGINT");
+    ASSERT_EQ(returnArg3->value().toJson(returnArg3->type()), "3");
   }
 }
 
@@ -661,7 +704,8 @@ TEST_F(RowExpressionTest, special) {
                 "returnType": "boolean",
                 "typeVariableConstraints": [],
                 "variableArity": false
-              }
+              },
+              "builtInFunctionKind": "ENGINE"
             },
             "returnType": "boolean"
           },
@@ -693,7 +737,8 @@ TEST_F(RowExpressionTest, special) {
                 "returnType": "boolean",
                 "typeVariableConstraints": [],
                 "variableArity": false
-              }
+              },
+              "builtInFunctionKind": "ENGINE"
             },
             "returnType": "boolean"
           }
@@ -796,7 +841,8 @@ TEST_F(RowExpressionTest, bind) {
                            "bigint"
                         ],
                         "variableArity":false
-                     }
+                     },
+                     "builtInFunctionKind": "ENGINE"
                   },
                   "returnType":"bigint",
                   "arguments":[
@@ -819,7 +865,8 @@ TEST_F(RowExpressionTest, bind) {
                                  "integer"
                               ],
                               "variableArity":false
-                           }
+                           },
+                           "builtInFunctionKind": "ENGINE"
                         },
                         "returnType":"bigint",
                         "arguments":[
@@ -869,7 +916,8 @@ TEST_F(RowExpressionTest, likeSimple) {
                 "returnType" : "boolean",
                 "argumentTypes" : [ "varchar", "LikePattern" ],
                 "variableArity" : false
-              }
+              },
+              "builtInFunctionKind": "ENGINE"
             },
             "returnType" : "boolean",
             "arguments" : [ {
@@ -889,7 +937,8 @@ TEST_F(RowExpressionTest, likeSimple) {
                   "returnType" : "LikePattern",
                   "argumentTypes" : [ "varchar" ],
                   "variableArity" : false
-                }
+                },
+                "builtInFunctionKind": "ENGINE"
               },
               "returnType" : "LikePattern",
               "arguments" : [ {
@@ -910,7 +959,7 @@ TEST_F(RowExpressionTest, likeSimple) {
   ASSERT_NE(callExpr, nullptr);
 
   auto callExprToString = callExpr->toString();
-  ASSERT_EQ(callExprToString, "presto.default.like(\"type\",\"%BRASS\")");
+  ASSERT_EQ(callExprToString, "presto.default.like(\"type\",%BRASS)");
 }
 
 TEST_F(RowExpressionTest, likeWithEscape) {
@@ -928,7 +977,8 @@ TEST_F(RowExpressionTest, likeWithEscape) {
                 "returnType" : "boolean",
                 "argumentTypes" : [ "varchar", "LikePattern" ],
                 "variableArity" : false
-              }
+              },
+              "builtInFunctionKind": "ENGINE"
             },
             "returnType" : "boolean",
             "arguments" : [ {
@@ -948,7 +998,8 @@ TEST_F(RowExpressionTest, likeWithEscape) {
                   "returnType" : "LikePattern",
                   "argumentTypes" : [ "varchar", "varchar" ],
                   "variableArity" : false
-                }
+                },
+                "builtInFunctionKind": "ENGINE"
               },
               "returnType" : "LikePattern",
               "arguments" : [ {
@@ -974,7 +1025,7 @@ TEST_F(RowExpressionTest, likeWithEscape) {
 
   auto callExprToString = callExpr->toString();
   ASSERT_EQ(
-      callExpr->toString(), "presto.default.like(\"type\",\"%BRASS\",\"#\")");
+      callExpr->toString(), "presto.default.like(\"type\",%BRASS,#)");
 }
 
 TEST_F(RowExpressionTest, dereference) {
@@ -1004,7 +1055,8 @@ TEST_F(RowExpressionTest, dereference) {
                       "bigint"
                    ],
                    "variableArity":false
-                }
+                },
+                "builtInFunctionKind": "ENGINE"
              },
              "returnType":"row(partkey integer,suppkey integer,quantity integer,extendedprice double,discount double,tax double,returnflag varchar(1),linestatus varchar(1),shipdate varchar,commitdate varchar,receiptdate varchar,shipinstruct varchar(25),shipmode varchar(10))",
              "arguments":[
@@ -1028,7 +1080,8 @@ TEST_F(RowExpressionTest, dereference) {
                             "integer"
                          ],
                          "variableArity":false
-                      }
+                      },
+                      "builtInFunctionKind": "ENGINE"
                    },
                    "returnType":"array(row(partkey integer,suppkey integer,quantity integer,extendedprice double,discount double,tax double,returnflag varchar(1),linestatus varchar(1),shipdate varchar,commitdate varchar,receiptdate varchar,shipinstruct varchar(25),shipmode varchar(10)))",
                    "arguments":[

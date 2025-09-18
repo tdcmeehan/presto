@@ -14,6 +14,7 @@
 package com.facebook.presto.tests;
 
 import com.facebook.airlift.testing.Assertions;
+import com.facebook.airlift.units.Duration;
 import com.facebook.presto.Session;
 import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.dispatcher.DispatchManager;
@@ -22,6 +23,7 @@ import com.facebook.presto.execution.QueryManager;
 import com.facebook.presto.server.BasicQueryInfo;
 import com.facebook.presto.spi.plan.PlanFragmentId;
 import com.facebook.presto.spi.security.Identity;
+import com.facebook.presto.spi.security.SelectedRole;
 import com.facebook.presto.sql.planner.planPrinter.JsonRenderer;
 import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.testing.MaterializedRow;
@@ -31,7 +33,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.UncheckedTimeoutException;
-import io.airlift.units.Duration;
 import org.intellij.lang.annotations.Language;
 import org.testng.annotations.Test;
 
@@ -43,6 +44,7 @@ import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import static com.facebook.airlift.units.Duration.nanosSince;
 import static com.facebook.presto.SystemSessionProperties.JOIN_DISTRIBUTION_TYPE;
 import static com.facebook.presto.SystemSessionProperties.JOIN_REORDERING_STRATEGY;
 import static com.facebook.presto.SystemSessionProperties.OPTIMIZE_PAYLOAD_JOINS;
@@ -51,14 +53,18 @@ import static com.facebook.presto.SystemSessionProperties.QUERY_MAX_MEMORY;
 import static com.facebook.presto.SystemSessionProperties.REMOVE_REDUNDANT_CAST_TO_VARCHAR_IN_JOIN;
 import static com.facebook.presto.SystemSessionProperties.SHARDED_JOINS_STRATEGY;
 import static com.facebook.presto.SystemSessionProperties.VERBOSE_OPTIMIZER_INFO_ENABLED;
+import static com.facebook.presto.common.type.BigintType.BIGINT;
+import static com.facebook.presto.common.type.UuidType.UUID;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.connector.informationSchema.InformationSchemaMetadata.INFORMATION_SCHEMA;
+import static com.facebook.presto.spi.security.SelectedRole.Type.ROLE;
 import static com.facebook.presto.sql.tree.CreateView.Security.INVOKER;
 import static com.facebook.presto.testing.MaterializedResult.resultBuilder;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.ADD_COLUMN;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.CREATE_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.CREATE_VIEW;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.CREATE_VIEW_WITH_SELECT_COLUMNS;
+import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.DELETE_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.DROP_COLUMN;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.DROP_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.RENAME_COLUMN;
@@ -66,6 +72,7 @@ import static com.facebook.presto.testing.TestingAccessControlManager.TestingPri
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.SELECT_COLUMN;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.SET_SESSION;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.SET_USER;
+import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.SHOW_CREATE_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.privilege;
 import static com.facebook.presto.testing.TestingSession.TESTING_CATALOG;
 import static com.facebook.presto.testing.assertions.Assert.assertEquals;
@@ -73,7 +80,6 @@ import static com.facebook.presto.tests.QueryAssertions.assertContains;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
-import static io.airlift.units.Duration.nanosSince;
 import static java.lang.String.format;
 import static java.lang.Thread.currentThread;
 import static java.util.Collections.nCopies;
@@ -240,6 +246,74 @@ public abstract class AbstractTestDistributedQueries
 
         assertUpdate("DROP TABLE test_create_like");
         assertFalse(getQueryRunner().tableExists(getSession(), "test_create_like"));
+    }
+
+    @Test
+    public void testNonAutoCommitTransactionWithRollback()
+    {
+        assertUpdate("create table multi_statements_transaction_rollback(a int, b varchar)");
+        assertUpdate("insert into multi_statements_transaction_rollback values(1, '1001'), (2, '1002')", 2);
+
+        Session session = assertStartTransaction(getSession(), "start transaction");
+
+        assertQuery(session, "select * from multi_statements_transaction_rollback", "values(1, '1001'), (2, '1002')");
+        assertUpdate(session, "insert into multi_statements_transaction_rollback values(3, '1003'), (4, '1004')", 2);
+
+        // `Rollback` executes successfully, and the client gets a flag `clearTransactionId = true`
+        session = assertEndTransaction(session, "rollback");
+
+        assertQuery(session, "select * from multi_statements_transaction_rollback", "values(1, '1001'), (2, '1002')");
+        assertUpdate(session, "drop table if exists multi_statements_transaction_rollback");
+    }
+
+    @Test
+    public void testNonAutoCommitTransactionWithCommit()
+    {
+        assertUpdate("create table multi_statements_transaction_commit(a int, b varchar)");
+        assertUpdate("insert into multi_statements_transaction_commit values(1, '1001'), (2, '1002')", 2);
+        Session session = assertStartTransaction(getSession(), "start transaction");
+
+        assertQuery(session, "select * from multi_statements_transaction_commit", "values(1, '1001'), (2, '1002')");
+        assertUpdate(session, "insert into multi_statements_transaction_commit values(3, '1003'), (4, '1004')", 2);
+
+        // `Commit` executes successfully, and the client gets a flag `clearTransactionId = true`
+        session = assertEndTransaction(session, "commit");
+
+        assertQuery(session, "select * from multi_statements_transaction_commit",
+                "values(1, '1001'), (2, '1002'), (3, '1003'), (4, '1004')");
+        assertUpdate(session, "drop table if exists multi_statements_transaction_commit");
+    }
+
+    @Test
+    public void testNonAutoCommitTransactionWithFailAndRollback()
+    {
+        assertUpdate("create table test_non_autocommit_table(a int, b varchar)");
+        Session session = Session.builder(getSession())
+                .setIdentity(new Identity("admin",
+                        Optional.empty(),
+                        ImmutableMap.of(getSession().getCatalog().get(), new SelectedRole(ROLE, Optional.of("admin"))),
+                        ImmutableMap.of(),
+                        ImmutableMap.of(),
+                        Optional.empty(),
+                        Optional.empty()))
+                .build();
+
+        session = assertStartTransaction(session, "start transaction");
+
+        // simulate failure of SQL statement execution
+        assertQueryFails(session, "SELECT fail('forced failure')", "forced failure");
+
+        // cannot execute any SQLs except `rollback` in current session
+        assertQueryFails(session, "select count(*) from test_non_autocommit_table", "Current transaction is aborted, commands ignored until end of transaction block");
+        assertQueryFails(session, "show tables", "Current transaction is aborted, commands ignored until end of transaction block");
+        assertQueryFails(session, "insert into test_non_autocommit_table values(1, '1001')", "Current transaction is aborted, commands ignored until end of transaction block");
+        assertQueryFails(session, "create table test_table(a int, b varchar)", "Current transaction is aborted, commands ignored until end of transaction block");
+
+        // execute `rollback` successfully
+        session = assertEndTransaction(session, "rollback");
+
+        assertQuery(session, "select count(*) from test_non_autocommit_table", "values(0)");
+        assertUpdate(session, "drop table if exists test_non_autocommit_table");
     }
 
     @Test
@@ -807,7 +881,7 @@ public abstract class AbstractTestDistributedQueries
 
         // Test DELETE access control
         assertUpdate("CREATE TABLE test_delete AS SELECT * FROM orders", "SELECT count(*) FROM orders");
-        assertAccessDenied("DELETE FROM test_delete where orderkey < 12", "Cannot select from columns \\[orderkey\\] in table or view .*.test_delete.*", privilege("orderkey", SELECT_COLUMN));
+        assertAccessAllowed("DELETE FROM test_delete where orderkey < 12", privilege("orderkey", DELETE_TABLE));
         assertAccessAllowed("DELETE FROM test_delete where orderkey < 12", privilege("orderdate", SELECT_COLUMN));
         assertAccessAllowed("DELETE FROM test_delete", privilege("orders", SELECT_COLUMN));
     }
@@ -853,6 +927,35 @@ public abstract class AbstractTestDistributedQueries
         assertQuery("SELECT * FROM " + name, query);
 
         assertUpdate("DROP VIEW test_view");
+    }
+
+    @Test
+    public void testViewWithReservedKeywords()
+    {
+        skipTestUnless(supportsViews());
+
+        assertUpdate("CREATE TABLE \"group\" AS SELECT * FROM orders", "SELECT count(*) FROM orders");
+
+        @Language("SQL") String query = "SELECT orderkey, orderstatus, totalprice / 2 half FROM orders";
+        @Language("SQL") String groupQuery = "SELECT orderkey, orderstatus, totalprice / 2 half FROM \"group\"";
+
+        assertUpdate("CREATE OR REPLACE VIEW test_view_with_reserved_keywords AS " + groupQuery);
+
+        assertQuery("SELECT * FROM test_view_with_reserved_keywords", query);
+
+        String expectedSql = formatSqlText(format(
+                "CREATE VIEW %s.%s.%s SECURITY %s AS %s",
+                getSession().getCatalog().get(),
+                getSession().getSchema().get(),
+                "test_view_with_reserved_keywords",
+                "DEFINER",
+                groupQuery)).trim();
+
+        MaterializedResult actual = computeActual("SHOW CREATE VIEW test_view_with_reserved_keywords");
+
+        assertEquals(getOnlyElement(actual.getOnlyColumnAsSet()), expectedSql);
+
+        assertUpdate("DROP VIEW test_view_with_reserved_keywords");
     }
 
     @Test
@@ -959,19 +1062,20 @@ public abstract class AbstractTestDistributedQueries
         // test SHOW COLUMNS
         actual = computeActual("SHOW COLUMNS FROM meta_test_view");
 
-        expected = resultBuilder(getSession(), VARCHAR, VARCHAR, VARCHAR, VARCHAR)
-                .row("x", "bigint", "", "")
-                .row("y", "varchar(3)", "", "")
+        expected = resultBuilder(getSession(), VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, BIGINT, BIGINT)
+                .row("x", "bigint", "", "", 19L, null, null)
+                .row("y", "varchar(3)", "", "", null, null, 3L)
                 .build();
 
         assertEquals(actual, expected);
 
         // test SHOW CREATE VIEW
         String expectedSql = formatSqlText(format(
-                "CREATE VIEW %s.%s.%s AS %s",
+                "CREATE VIEW %s.%s.%s SECURITY %s AS %s",
                 getSession().getCatalog().get(),
                 getSession().getSchema().get(),
                 "meta_test_view",
+                "DEFINER",
                 query)).trim();
 
         actual = computeActual("SHOW CREATE VIEW meta_test_view");
@@ -1235,6 +1339,9 @@ public abstract class AbstractTestDistributedQueries
                 "SELECT * FROM test_invoker_view_access",
                 "Cannot select from columns \\[.*\\] in table .*.orders.*",
                 privilege(getSession().getUser(), "orders", SELECT_COLUMN));
+
+        assertAccessDenied("SHOW CREATE VIEW test_nested_view_access", "Cannot show create table for .*test_nested_view_access.*", privilege("test_nested_view_access", SHOW_CREATE_TABLE));
+        assertAccessAllowed("SHOW CREATE VIEW test_nested_view_access", privilege("test_denied_access_view", SHOW_CREATE_TABLE));
 
         assertAccessAllowed(nestedViewOwnerSession, "DROP VIEW test_nested_view_access");
         assertAccessAllowed(viewOwnerSession, "DROP VIEW test_view_access");
@@ -1567,5 +1674,27 @@ public abstract class AbstractTestDistributedQueries
                 .replaceAll("sum_[0-9][0-9]", "sumXXX")
                 .replaceAll("\\[PlanNodeId (\\d+(?:,\\d+)*)\\]", "")
                 .replaceAll("Values => .*\n", "\n");
+    }
+
+    @Test
+    public void testViewWithUUID()
+    {
+        skipTestUnless(supportsViews());
+
+        @Language("SQL") String query = "SELECT * FROM (VALUES (CAST(0 AS INTEGER), NULL), (CAST(1 AS INTEGER), UUID '12151fd2-7586-11e9-8f9e-2a86e4085a59')) AS t (rum, c1)";
+
+        // Create View with UUID type in Hive
+        assertQuerySucceeds("CREATE VIEW test_hive_view AS " + query);
+
+        // Select UUID from the view
+        MaterializedResult result = computeActual("SELECT c1 FROM test_hive_view WHERE rum = 1");
+
+        // Verify the result set is not empty
+        assertTrue(result.getMaterializedRows().size() > 0, "Result set is empty");
+        assertEquals(result.getTypes(), ImmutableList.of(UUID));
+        assertEquals(result.getOnlyValue(), "12151fd2-7586-11e9-8f9e-2a86e4085a59");
+
+        // Drop the view after the test
+        assertQuerySucceeds("DROP VIEW test_hive_view");
     }
 }

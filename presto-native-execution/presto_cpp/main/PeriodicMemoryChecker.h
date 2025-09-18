@@ -65,20 +65,25 @@ class PeriodicMemoryChecker {
     size_t mallocBytesUsageDumpThreshold{20UL * 1024 * 1024 * 1024};
   };
 
-  explicit PeriodicMemoryChecker(Config config);
+  explicit PeriodicMemoryChecker(const Config& config);
 
   virtual ~PeriodicMemoryChecker() = default;
 
   /// Starts the 'PeriodicMemoryChecker'. A background scheduler will be
   /// launched to perform the checks. This should only be called once.
-  void start();
+  virtual void start();
 
   /// Stops the 'PeriodicMemoryChecker'.
-  void stop();
+  virtual void stop();
+
+  /// Returns the last known cached 'current' system memory usage in bytes.
+  int64_t cachedSystemUsedMemoryBytes() const {
+    return cachedSystemUsedMemoryBytes_;
+  }
 
  protected:
-  /// Returns current system memory usage. The returned value is used to compare
-  /// with 'Config::systemMemLimitBytes'.
+  /// Fetches and returns current system memory usage in bytes.
+  /// The returned value is used to compare with 'Config::systemMemLimitBytes'.
   virtual int64_t systemUsedMemoryBytes() = 0;
 
   /// Returns current bytes allocated by malloc. The returned value is used to
@@ -87,7 +92,7 @@ class PeriodicMemoryChecker {
 
   /// Callback function that is invoked by 'PeriodicMemoryChecker' periodically.
   /// Light operations such as stats reporting can be done in this call back.
-  virtual void periodicCb() const = 0;
+  virtual void periodicCb() = 0;
 
   /// Callback function that performs a heap dump. Returns true if dump is
   /// successful.
@@ -97,7 +102,12 @@ class PeriodicMemoryChecker {
   /// Returns true if dump is successful.
   virtual void removeDumpFile(const std::string& filePath) const = 0;
 
+  /// Invoked by the periodic checker when 'Config::systemMemPushbackEnabled'
+  /// is true and system memory usage is above 'Config::systemMemLimitBytes'.
+  virtual void pushbackMemory();
+
   const Config config_;
+  std::atomic<int64_t> cachedSystemUsedMemoryBytes_{0};
 
  private:
   // Struct that stores the file names of the heap profiles dumped and the
@@ -119,10 +129,6 @@ class PeriodicMemoryChecker {
     }
   };
 
-  // Invoked by the periodic checker when 'Config::systemMemPushbackEnabled'
-  // is true and system memory usage is above 'Config::systemMemLimitBytes'.
-  void pushbackMemory();
-
   // Invoked by the periodic checker when 'Config::mallocMemHeapDumpEnabled' is
   // true.
   void maybeDumpHeap();
@@ -137,4 +143,6 @@ class PeriodicMemoryChecker {
       std::greater<DumpFileInfo>>
       dumpFilesByHeapMemUsageMinPq_;
 };
+
+std::unique_ptr<PeriodicMemoryChecker> createMemoryChecker();
 } // namespace facebook::presto

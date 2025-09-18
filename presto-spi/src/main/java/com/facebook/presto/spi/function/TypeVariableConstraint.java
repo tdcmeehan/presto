@@ -20,8 +20,7 @@ import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeUtils;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-
-import javax.annotation.Nullable;
+import jakarta.annotation.Nullable;
 
 import java.util.Objects;
 
@@ -48,7 +47,7 @@ public class TypeVariableConstraint
         this.name = name;
         this.comparableRequired = comparableRequired;
         this.orderableRequired = orderableRequired;
-        this.variadicBound = variadicBound;
+        this.variadicBound = (Objects.equals(variadicBound, "")) ? null : variadicBound;
         this.nonDecimalNumericRequired = nonDecimalNumericRequired;
     }
 

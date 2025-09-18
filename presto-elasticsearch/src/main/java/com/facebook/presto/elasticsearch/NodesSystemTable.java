@@ -29,8 +29,7 @@ import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.SystemTable;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
 import com.google.common.collect.ImmutableList;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.Set;
 
@@ -44,10 +43,10 @@ public class NodesSystemTable
     private static final ConnectorTableMetadata METADATA = new ConnectorTableMetadata(
             new SchemaTableName("system", "nodes"),
             ImmutableList.<ColumnMetadata>builder()
-                    .add(new ColumnMetadata("presto_node_id", createUnboundedVarcharType()))
-                    .add(new ColumnMetadata("presto_node_address", createUnboundedVarcharType()))
-                    .add(new ColumnMetadata("elasticsearch_node_id", createUnboundedVarcharType()))
-                    .add(new ColumnMetadata("elasticsearch_node_address", createUnboundedVarcharType()))
+                    .add(ColumnMetadata.builder().setName("presto_node_id").setType(createUnboundedVarcharType()).build())
+                    .add(ColumnMetadata.builder().setName("presto_node_address").setType(createUnboundedVarcharType()).build())
+                    .add(ColumnMetadata.builder().setName("elasticsearch_node_id").setType(createUnboundedVarcharType()).build())
+                    .add(ColumnMetadata.builder().setName("elasticsearch_node_address").setType(createUnboundedVarcharType()).build())
                     .build());
 
     private final ElasticsearchClient client;

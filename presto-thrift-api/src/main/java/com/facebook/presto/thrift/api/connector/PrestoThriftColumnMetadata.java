@@ -18,8 +18,7 @@ import com.facebook.drift.annotations.ThriftField;
 import com.facebook.drift.annotations.ThriftStruct;
 import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.spi.ColumnMetadata;
-
-import javax.annotation.Nullable;
+import jakarta.annotation.Nullable;
 
 import java.util.Objects;
 
@@ -73,11 +72,12 @@ public final class PrestoThriftColumnMetadata
 
     public ColumnMetadata toColumnMetadata(TypeManager typeManager)
     {
-        return new ColumnMetadata(
-                name,
-                typeManager.getType(parseTypeSignature(type)),
-                comment,
-                hidden);
+        return ColumnMetadata.builder()
+                .setName(name)
+                .setType(typeManager.getType(parseTypeSignature(type)))
+                .setComment(comment)
+                .setHidden(hidden)
+                .build();
     }
 
     @Override

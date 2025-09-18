@@ -20,9 +20,8 @@ import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
-
-import javax.validation.constraints.Min;
-import javax.validation.constraints.NotNull;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
 
 import java.util.Optional;
 import java.util.Set;
@@ -61,6 +60,7 @@ public class VerifierConfig
     private boolean teardownOnMainClusters = true;
     private boolean skipControl;
     private boolean skipChecksum;
+    private boolean runDeterminismAnalysisOnTest;
     private boolean concurrentControlAndTest;
 
     private boolean explain;
@@ -359,6 +359,19 @@ public class VerifierConfig
     public boolean isSkipChecksum()
     {
         return skipChecksum;
+    }
+
+    @ConfigDescription("Run Determinism Analysis on test rather than control. If the Determinism Analysis returns 'non-deterministic', we then re-run it in control")
+    @Config("run-determinism-analysis-on-test")
+    public VerifierConfig setRunDeterminismAnalysisOnTest(boolean runDeterminismAnalysisOnTest)
+    {
+        this.runDeterminismAnalysisOnTest = runDeterminismAnalysisOnTest;
+        return this;
+    }
+
+    public boolean isRunDeterminismAnalysisOnTest()
+    {
+        return runDeterminismAnalysisOnTest;
     }
 
     public boolean isExplain()

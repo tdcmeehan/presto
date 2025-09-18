@@ -13,6 +13,8 @@
  */
 package com.facebook.presto.orc;
 
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.DataSize.Unit;
 import com.facebook.hive.orc.lazy.OrcLazyObject;
 import com.facebook.presto.common.Page;
 import com.facebook.presto.common.RuntimeStats;
@@ -60,8 +62,6 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
-import io.airlift.units.DataSize;
-import io.airlift.units.DataSize.Unit;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.type.HiveChar;
@@ -128,6 +128,8 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
+import static com.facebook.airlift.units.DataSize.succinctBytes;
 import static com.facebook.hive.orc.OrcConf.ConfVars.HIVE_ORC_BUILD_STRIDE_DICTIONARY;
 import static com.facebook.hive.orc.OrcConf.ConfVars.HIVE_ORC_COMPRESSION;
 import static com.facebook.hive.orc.OrcConf.ConfVars.HIVE_ORC_DICTIONARY_ENCODING_INTERVAL;
@@ -155,6 +157,7 @@ import static com.facebook.presto.orc.DwrfEncryptionProvider.NO_ENCRYPTION;
 import static com.facebook.presto.orc.NoOpOrcWriterStats.NOOP_WRITER_STATS;
 import static com.facebook.presto.orc.NoopOrcAggregatedMemoryContext.NOOP_ORC_AGGREGATED_MEMORY_CONTEXT;
 import static com.facebook.presto.orc.OrcReader.MAX_BATCH_SIZE;
+import static com.facebook.presto.orc.OrcReader.MODIFICATION_TIME_NOT_SET;
 import static com.facebook.presto.orc.OrcTester.Format.DWRF;
 import static com.facebook.presto.orc.OrcTester.Format.ORC_11;
 import static com.facebook.presto.orc.OrcTester.Format.ORC_12;
@@ -174,8 +177,6 @@ import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.collect.Lists.newArrayList;
 import static io.airlift.slice.Slices.utf8Slice;
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
-import static io.airlift.units.DataSize.succinctBytes;
 import static java.lang.Math.toIntExact;
 import static java.util.Arrays.asList;
 import static java.util.Objects.requireNonNull;
@@ -1143,7 +1144,7 @@ public class OrcTester
             return;
         }
 
-        try (OrcBatchRecordReader recordReader = createCustomOrcRecordReader(tempFile, orcEncoding, orcPredicate, types, MAX_BATCH_SIZE, new StorageOrcFileTailSource(), new StorageStripeMetadataSource(), false, intermediateEncryptionKeys, false)) {
+        try (OrcBatchRecordReader recordReader = createCustomOrcRecordReader(tempFile, orcEncoding, orcPredicate, types, MAX_BATCH_SIZE, new StorageOrcFileTailSource(), new StorageStripeMetadataSource(), false, intermediateEncryptionKeys, false, tempFile.getFile().lastModified())) {
             assertEquals(recordReader.getReaderPosition(), 0);
             assertEquals(recordReader.getFilePosition(), 0);
 
@@ -1561,7 +1562,8 @@ public class OrcTester
                 new StorageStripeMetadataSource(),
                 cacheable,
                 ImmutableMap.of(),
-                mapNullKeysEnabled);
+                mapNullKeysEnabled,
+                MODIFICATION_TIME_NOT_SET);
     }
 
     static OrcBatchRecordReader createCustomOrcRecordReader(
@@ -1574,7 +1576,8 @@ public class OrcTester
             StripeMetadataSource stripeMetadataSource,
             boolean cacheable,
             Map<Integer, Slice> intermediateEncryptionKeys,
-            boolean mapNullKeysEnabled)
+            boolean mapNullKeysEnabled,
+            long fileModificationTime)
             throws IOException
     {
         OrcDataSource orcDataSource = new FileOrcDataSource(tempFile.getFile(), new DataSize(1, MEGABYTE), new DataSize(1, MEGABYTE), new DataSize(1, MEGABYTE), true);
@@ -1593,7 +1596,8 @@ public class OrcTester
                 cacheable,
                 new DwrfEncryptionProvider(new UnsupportedEncryptionLibrary(), new TestingEncryptionLibrary()),
                 DwrfKeyProvider.of(intermediateEncryptionKeys),
-                new RuntimeStats());
+                new RuntimeStats(),
+                fileModificationTime);
 
         assertEquals(orcReader.getFooter().getRowsInRowGroup(), 10_000);
 

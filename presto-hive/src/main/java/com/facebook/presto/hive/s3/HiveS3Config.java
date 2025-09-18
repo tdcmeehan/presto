@@ -16,19 +16,18 @@ package com.facebook.presto.hive.s3;
 import com.facebook.airlift.configuration.Config;
 import com.facebook.airlift.configuration.ConfigDescription;
 import com.facebook.airlift.configuration.ConfigSecuritySensitive;
+import com.facebook.airlift.units.DataSize;
+import com.facebook.airlift.units.Duration;
+import com.facebook.airlift.units.MinDataSize;
+import com.facebook.airlift.units.MinDuration;
 import com.google.common.base.StandardSystemProperty;
-import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
-import io.airlift.units.MinDataSize;
-import io.airlift.units.MinDuration;
-
-import javax.validation.constraints.Min;
-import javax.validation.constraints.NotNull;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
 
 import java.io.File;
 import java.util.concurrent.TimeUnit;
 
-import static io.airlift.units.DataSize.Unit.MEGABYTE;
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 
 public class HiveS3Config
 {
@@ -61,6 +60,20 @@ public class HiveS3Config
     private String s3UserAgentPrefix = "";
     private PrestoS3AclType s3AclType = PrestoS3AclType.PRIVATE;
     private boolean skipGlacierObjects;
+    private boolean s3WebIdentityEnabled;
+
+    public boolean isS3WebIdentityEnabled()
+    {
+        return s3WebIdentityEnabled;
+    }
+
+    @Config("hive.s3.web.identity.auth.enabled")
+    @ConfigDescription("Enable web identity token authentication for assuming an AWS IAM role")
+    public HiveS3Config setS3WebIdentityEnabled(boolean s3WebIdentityEnabled)
+    {
+        this.s3WebIdentityEnabled = s3WebIdentityEnabled;
+        return this;
+    }
 
     public String getS3AwsAccessKey()
     {
@@ -68,6 +81,7 @@ public class HiveS3Config
     }
 
     @Config("hive.s3.aws-access-key")
+    @ConfigSecuritySensitive
     public HiveS3Config setS3AwsAccessKey(String s3AwsAccessKey)
     {
         this.s3AwsAccessKey = s3AwsAccessKey;

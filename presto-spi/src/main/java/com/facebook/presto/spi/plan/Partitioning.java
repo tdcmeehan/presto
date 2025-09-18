@@ -17,8 +17,7 @@ import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-
-import javax.annotation.concurrent.Immutable;
+import com.google.errorprone.annotations.Immutable;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -70,6 +69,11 @@ public final class Partitioning
     public List<RowExpression> getArguments()
     {
         return arguments;
+    }
+
+    public boolean isSingleOrBroadcastOrArbitrary()
+    {
+        return handle.isSingleOrBroadcastOrArbitrary();
     }
 
     public Set<VariableReferenceExpression> getVariableReferences()

@@ -38,13 +38,11 @@ import com.facebook.presto.spi.connector.Connector;
 import com.facebook.presto.spi.connector.ConnectorAccessControl;
 import com.facebook.presto.spi.connector.ConnectorContext;
 import com.facebook.presto.spi.connector.ConnectorFactory;
-import com.facebook.presto.spi.connector.ConnectorMetadataUpdaterProvider;
 import com.facebook.presto.spi.connector.ConnectorNodePartitioningProvider;
 import com.facebook.presto.spi.connector.ConnectorPageSinkProvider;
 import com.facebook.presto.spi.connector.ConnectorPageSourceProvider;
 import com.facebook.presto.spi.connector.ConnectorPlanOptimizerProvider;
 import com.facebook.presto.spi.connector.ConnectorSplitManager;
-import com.facebook.presto.spi.connector.ConnectorTypeSerdeProvider;
 import com.facebook.presto.spi.connector.classloader.ClassLoaderSafeConnectorPageSinkProvider;
 import com.facebook.presto.spi.connector.classloader.ClassLoaderSafeConnectorPageSourceProvider;
 import com.facebook.presto.spi.connector.classloader.ClassLoaderSafeConnectorSplitManager;
@@ -158,8 +156,6 @@ public class HiveConnectorFactory
             ConnectorAccessControl accessControl = new SystemTableAwareAccessControl(injector.getInstance(ConnectorAccessControl.class));
             Set<Procedure> procedures = injector.getInstance(Key.get(new TypeLiteral<Set<Procedure>>() {}));
             ConnectorPlanOptimizerProvider planOptimizerProvider = injector.getInstance(ConnectorPlanOptimizerProvider.class);
-            ConnectorMetadataUpdaterProvider metadataUpdaterProvider = injector.getInstance(ConnectorMetadataUpdaterProvider.class);
-            ConnectorTypeSerdeProvider connectorTypeSerdeProvider = injector.getInstance(ConnectorTypeSerdeProvider.class);
 
             List<PropertyMetadata<?>> allSessionProperties = new ArrayList<>(hiveSessionProperties.getSessionProperties());
             allSessionProperties.addAll(hiveCommonSessionProperties.getSessionProperties());
@@ -175,13 +171,11 @@ public class HiveConnectorFactory
                     ImmutableSet.of(),
                     procedures,
                     allSessionProperties,
-                    HiveSchemaProperties.SCHEMA_PROPERTIES,
+                    SchemaProperties.SCHEMA_PROPERTIES,
                     hiveTableProperties.getTableProperties(),
                     hiveAnalyzeProperties.getAnalyzeProperties(),
                     accessControl,
                     planOptimizerProvider,
-                    metadataUpdaterProvider,
-                    connectorTypeSerdeProvider,
                     classLoader);
         }
         catch (Exception e) {

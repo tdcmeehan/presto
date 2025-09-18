@@ -13,6 +13,9 @@
  */
 
 #include "presto_cpp/main/TaskManager.h"
+
+#include <utility>
+
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <folly/container/F14Set.h>
@@ -24,7 +27,6 @@
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/time/Timer.h"
-#include "velox/exec/Exchange.h"
 
 using namespace facebook::velox;
 
@@ -37,6 +39,7 @@ namespace facebook::presto {
 constexpr uint32_t kMaxConcurrentLifespans{16};
 
 namespace {
+
 // We request cancellation for tasks which haven't been accessed by coordinator
 // for a considerable time.
 void cancelAbandonedTasksInternal(const TaskMap& taskMap, int32_t abandonedMs) {
@@ -67,14 +70,38 @@ static void maybeSetupTaskSpillDirectory(
   const auto includeNodeInSpillPath =
       SystemConfig::instance()->includeNodeInSpillPath();
   auto nodeConfig = NodeConfig::instance();
-  const auto taskSpillDirPath = TaskManager::buildTaskSpillDirectoryPath(
-      baseSpillDirectory,
-      nodeConfig->nodeInternalAddress(),
-      nodeConfig->nodeId(),
-      execTask.queryCtx()->queryId(),
-      execTask.taskId(),
-      includeNodeInSpillPath);
+  const auto [taskSpillDirPath, dateSpillDirPath] =
+      TaskManager::buildTaskSpillDirectoryPath(
+          baseSpillDirectory,
+          nodeConfig->nodeInternalAddress(),
+          nodeConfig->nodeId(),
+          execTask.queryCtx()->queryId(),
+          execTask.taskId(),
+          includeNodeInSpillPath);
   execTask.setSpillDirectory(taskSpillDirPath, /*alreadyCreated=*/false);
+
+  execTask.setCreateSpillDirectoryCb(
+      [spillDir = taskSpillDirPath, dateStrDir = dateSpillDirPath]() {
+        auto fs = filesystems::getFileSystem(dateStrDir, nullptr);
+        // First create the top level directory (date string of the query) with
+        // TTL or other configs if set.
+        filesystems::DirectoryOptions options;
+        // Do not fail if the directory already exist because another process
+        // may have already created the dateStrDir.
+        options.failIfExists = false;
+        auto config = SystemConfig::instance()->spillerDirectoryCreateConfig();
+        if (!config.empty()) {
+          options.values.emplace(
+              filesystems::DirectoryOptions::kMakeDirectoryConfig.toString(),
+              config);
+        }
+        fs->mkdir(dateStrDir, options);
+
+        // After the parent directory is created,
+        // then create the spill directory for the actual task.
+        fs->mkdir(spillDir);
+        return spillDir;
+      });
 }
 
 // Keep outstanding Promises in RequestHandler's state itself.
@@ -149,7 +176,7 @@ void getData(
               bytes += next->length();
               iobuf->prev()->appendChain(std::move(next));
             }
-            nextSequence++;
+            ++nextSequence;
           } else {
             complete = true;
           }
@@ -296,16 +323,42 @@ struct ZombieTaskStatsSet {
     }
   }
 };
+
+// Add task to the task queue.
+void enqueueTask(
+    TaskQueue& taskQueue,
+    std::shared_ptr<PrestoTask>& prestoTask) {
+  auto execTask = prestoTask->task;
+  if (execTask == nullptr) {
+    return;
+  }
+
+  // If an entry exists with tasks for the same query, then add the task to it.
+  for (auto& entry : taskQueue) {
+    if (!entry.empty()) {
+      if (auto queuedTask = entry[0].lock()) {
+        auto queuedExecTask = queuedTask->task;
+        if (queuedExecTask &&
+            (queuedExecTask->queryCtx() == execTask->queryCtx())) {
+          entry.emplace_back(prestoTask);
+          return;
+        }
+      }
+    }
+  }
+  // Otherwise create a new entry.
+  taskQueue.push_back({prestoTask});
+}
 } // namespace
 
 TaskManager::TaskManager(
     folly::Executor* driverExecutor,
     folly::Executor* httpSrvCpuExecutor,
     folly::Executor* spillerExecutor)
-    : bufferManager_(velox::exec::OutputBufferManager::getInstance().lock()),
-      queryContextManager_(std::make_unique<QueryContextManager>(
+    : queryContextManager_(std::make_unique<QueryContextManager>(
           driverExecutor,
           spillerExecutor)),
+      bufferManager_(velox::exec::OutputBufferManager::getInstanceRef()),
       httpSrvCpuExecutor_(httpSrvCpuExecutor) {
   VELOX_CHECK_NOT_NULL(bufferManager_, "invalid OutputBufferManager");
 }
@@ -322,6 +375,11 @@ void TaskManager::setBaseSpillDirectory(const std::string& baseSpillDirectory) {
   VELOX_CHECK(!baseSpillDirectory.empty());
   baseSpillDir_.withWLock(
       [&](auto& baseSpillDir) { baseSpillDir = baseSpillDirectory; });
+}
+
+std::string TaskManager::getBaseSpillDirectory() const {
+  return baseSpillDir_.withRLock(
+      [](const auto& baseSpillDir) { return baseSpillDir; });
 }
 
 bool TaskManager::emptyBaseSpillDirectory() const {
@@ -360,6 +418,7 @@ void TaskManager::acknowledgeResults(
 std::unique_ptr<TaskInfo> TaskManager::createOrUpdateErrorTask(
     const TaskId& taskId,
     const std::exception_ptr& exception,
+    bool summarize,
     long startProcessCpuTime) {
   auto prestoTask = findOrCreateTask(taskId, startProcessCpuTime);
   {
@@ -372,11 +431,12 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateErrorTask(
     prestoTask->info.needsPlan = false;
   }
 
-  auto info = prestoTask->updateInfo();
+  auto info = prestoTask->updateInfo(summarize);
   return std::make_unique<TaskInfo>(info);
 }
 
-/*static*/ std::string TaskManager::buildTaskSpillDirectoryPath(
+/*static*/ std::tuple<std::string, std::string>
+TaskManager::buildTaskSpillDirectoryPath(
     const std::string& baseSpillPath,
     const std::string& nodeIp,
     const std::string& nodeId,
@@ -394,13 +454,20 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateErrorTask(
             queryId.substr(6, 2))
       : "1970-01-01";
 
-  std::string path;
-  folly::toAppend(fmt::format("{}/presto_native/", baseSpillPath), &path);
+  std::string taskSpillDirPath;
+  folly::toAppend(
+      fmt::format("{}/presto_native/", baseSpillPath), &taskSpillDirPath);
   if (includeNodeInSpillPath) {
-    folly::toAppend(fmt::format("{}_{}/", nodeIp, nodeId), &path);
+    folly::toAppend(fmt::format("{}_{}/", nodeIp, nodeId), &taskSpillDirPath);
   }
-  folly::toAppend(fmt::format("{}/{}/{}/", dateString, queryId, taskId), &path);
-  return path;
+
+  std::string dateSpillDirPath = taskSpillDirPath;
+  folly::toAppend(fmt::format("{}/", dateString), &dateSpillDirPath);
+
+  folly::toAppend(
+      fmt::format("{}/{}/{}/", dateString, queryId, taskId), &taskSpillDirPath);
+  return std::make_tuple(
+      std::move(taskSpillDirPath), std::move(dateSpillDirPath));
 }
 
 void TaskManager::getDataForResultRequests(
@@ -427,6 +494,7 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateTask(
     const protocol::TaskId& taskId,
     const protocol::TaskUpdateRequest& updateRequest,
     const velox::core::PlanFragment& planFragment,
+    bool summarize,
     std::shared_ptr<velox::core::QueryCtx> queryCtx,
     long startProcessCpuTime) {
   return createOrUpdateTaskImpl(
@@ -434,7 +502,8 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateTask(
       planFragment,
       updateRequest.sources,
       updateRequest.outputIds,
-      queryCtx,
+      summarize,
+      std::move(queryCtx),
       startProcessCpuTime);
 }
 
@@ -442,6 +511,7 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateBatchTask(
     const protocol::TaskId& taskId,
     const protocol::BatchTaskUpdateRequest& batchUpdateRequest,
     const velox::core::PlanFragment& planFragment,
+    bool summarize,
     std::shared_ptr<velox::core::QueryCtx> queryCtx,
     long startProcessCpuTime) {
   auto updateRequest = batchUpdateRequest.taskUpdateRequest;
@@ -453,6 +523,7 @@ std::unique_ptr<protocol::TaskInfo> TaskManager::createOrUpdateBatchTask(
       planFragment,
       updateRequest.sources,
       updateRequest.outputIds,
+      summarize,
       std::move(queryCtx),
       startProcessCpuTime);
 }
@@ -462,19 +533,25 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateTaskImpl(
     const velox::core::PlanFragment& planFragment,
     const std::vector<protocol::TaskSource>& sources,
     const protocol::OutputBuffers& outputBuffers,
+    bool summarize,
     std::shared_ptr<velox::core::QueryCtx> queryCtx,
     long startProcessCpuTime) {
+  auto receiveTaskUpdateMs = getCurrentTimeMs();
   std::shared_ptr<exec::Task> execTask;
   bool startTask = false;
   auto prestoTask = findOrCreateTask(taskId, startProcessCpuTime);
+  if (prestoTask->firstTimeReceiveTaskUpdateMs == 0) {
+    prestoTask->firstTimeReceiveTaskUpdateMs = receiveTaskUpdateMs;
+  }
   {
     std::lock_guard<std::mutex> l(prestoTask->mutex);
     prestoTask->updateCoordinatorHeartbeatLocked();
-    if (not prestoTask->task && planFragment.planNode) {
+    if ((prestoTask->task == nullptr) && (planFragment.planNode != nullptr)) {
       // If the task is aborted, no need to do anything else.
       // This takes care of DELETE task message coming before CREATE task.
       if (prestoTask->info.taskStatus.state == protocol::TaskState::ABORTED) {
-        return std::make_unique<TaskInfo>(prestoTask->updateInfoLocked());
+        return std::make_unique<TaskInfo>(
+            prestoTask->updateInfoLocked(summarize));
       }
 
       // Uses a temp variable to store the created velox task to destroy it
@@ -488,7 +565,9 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateTaskImpl(
           planFragment,
           prestoTask->id.id(),
           std::move(queryCtx),
-          exec::Task::ExecutionMode::kParallel);
+          exec::Task::ExecutionMode::kParallel,
+          static_cast<exec::Consumer>(nullptr),
+          prestoTask->id.stageId());
       // TODO: move spill directory creation inside velox task execution
       // whenever spilling is triggered. It will reduce the unnecessary file
       // operations on remote storage.
@@ -498,6 +577,7 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateTaskImpl(
       prestoTask->task = std::move(newExecTask);
       prestoTask->info.needsPlan = false;
       startTask = true;
+      prestoTask->createFinishTimeMs = getCurrentTimeMs();
     }
     execTask = prestoTask->task;
   }
@@ -511,99 +591,276 @@ std::unique_ptr<TaskInfo> TaskManager::createOrUpdateTaskImpl(
   PromiseHolderWeakPtr<std::unique_ptr<protocol::TaskStatus>> statusRequest;
   PromiseHolderWeakPtr<std::unique_ptr<protocol::TaskInfo>> infoRequest;
 
-  // Create or update task can be called concurrently for the same task.
-  // We need to lock here for allow only one to be executed at a time.
-  // This is especially important for adding splits to the task.
-  std::lock_guard<std::mutex> l(prestoTask->mutex);
+  bool startNextQueuedTask = false;
+  std::unique_ptr<TaskInfo> ret;
+  {
+    // Create or update task can be called concurrently for the same task.
+    // We need to lock here for allow only one to be executed at a time.
+    // This is especially important for adding splits to the task.
+    std::lock_guard<std::mutex> l(prestoTask->mutex);
 
-  if (startTask) {
-    const uint32_t maxDrivers =
-        execTask->queryCtx()->queryConfig().get<int32_t>(
-            kMaxDriversPerTask.data(),
-            SystemConfig::instance()->maxDriversPerTask());
-    uint32_t concurrentLifespans =
-        execTask->queryCtx()->queryConfig().get<int32_t>(
-            kConcurrentLifespansPerTask.data(),
-            SystemConfig::instance()->concurrentLifespansPerTask());
-    // Zero concurrent lifespans means 'unlimited', but we still limit the
-    // number to some reasonable one.
-    if (concurrentLifespans == 0) {
-      concurrentLifespans = kMaxConcurrentLifespans;
+    if (startTask) {
+      maybeStartTaskLocked(prestoTask, startNextQueuedTask);
+
+      resultRequests = std::move(prestoTask->resultRequests);
+      statusRequest = prestoTask->statusRequest;
+      infoRequest = prestoTask->infoRequest;
     }
 
-    if (execTask->isGroupedExecution()) {
-      LOG(INFO) << "Starting task " << taskId << " with " << maxDrivers
-                << " max drivers and " << concurrentLifespans
-                << " concurrent lifespans (grouped execution).";
-    } else {
-      LOG(INFO) << "Starting task " << taskId << " with " << maxDrivers
-                << " max drivers.";
+    getDataForResultRequests(resultRequests);
+
+    if (outputBuffers.type != protocol::BufferType::PARTITIONED &&
+        !execTask->updateOutputBuffers(
+            outputBuffers.buffers.size(), outputBuffers.noMoreBufferIds)) {
+      VLOG(1) << "Failed to update output buffers for task: " << taskId;
     }
-    execTask->start(maxDrivers, concurrentLifespans);
 
-    prestoTask->taskStarted = true;
-    resultRequests = std::move(prestoTask->resultRequests);
-    statusRequest = prestoTask->statusRequest;
-    infoRequest = prestoTask->infoRequest;
-  }
+    folly::F14FastMap<protocol::PlanNodeId, protocol::TaskSource> sourcesMap;
+    for (const auto& source : sources) {
+      auto it = sourcesMap.find(source.planNodeId);
+      if (it == sourcesMap.end()) {
+        // No existing source with same planNodeId, add as new
+        sourcesMap.emplace(source.planNodeId, source);
+        continue;
+      }
 
-  getDataForResultRequests(resultRequests);
+      // Merge with existing source that has the same planNodeId
+      auto& merged = it->second;
 
-  if (outputBuffers.type != protocol::BufferType::PARTITIONED &&
-      !execTask->updateOutputBuffers(
-          outputBuffers.buffers.size(), outputBuffers.noMoreBufferIds)) {
-    LOG(WARNING) << "Failed to update output buffers for task: " << taskId;
-  }
+      // Merge splits
+      merged.splits.insert(
+          merged.splits.end(), source.splits.begin(), source.splits.end());
 
-  for (const auto& source : sources) {
-    // Add all splits from the source to the task.
-    VLOG(1) << "Adding " << source.splits.size() << " splits to " << taskId
-            << " for node " << source.planNodeId;
-    // Keep track of the max sequence for this batch of splits.
-    long maxSplitSequenceId{-1};
-    for (const auto& protocolSplit : source.splits) {
-      auto split = toVeloxSplit(protocolSplit);
-      if (split.hasConnectorSplit()) {
-        maxSplitSequenceId =
-            std::max(maxSplitSequenceId, protocolSplit.sequenceId);
-        execTask->addSplitWithSequence(
-            source.planNodeId, std::move(split), protocolSplit.sequenceId);
+      // Merge noMoreSplitsForLifespan
+      merged.noMoreSplitsForLifespan.insert(
+          merged.noMoreSplitsForLifespan.end(),
+          source.noMoreSplitsForLifespan.begin(),
+          source.noMoreSplitsForLifespan.end());
+
+      // Use OR logic for noMoreSplits flag
+      merged.noMoreSplits = merged.noMoreSplits || source.noMoreSplits;
+    }
+
+    for (const auto& [_, source] : sourcesMap) {
+      // Add all splits from the source to the task.
+      VLOG(1) << "Adding " << source.splits.size() << " splits to " << taskId
+              << " for node " << source.planNodeId;
+      // Keep track of the max sequence for this batch of splits.
+      int64_t maxSplitSequenceId{-1};
+      for (const auto& protocolSplit : source.splits) {
+        auto split = toVeloxSplit(protocolSplit);
+        if (split.hasConnectorSplit()) {
+          maxSplitSequenceId =
+              std::max(maxSplitSequenceId, protocolSplit.sequenceId);
+          execTask->addSplitWithSequence(
+              source.planNodeId, std::move(split), protocolSplit.sequenceId);
+        }
+      }
+      // Update task's max split sequence id after all splits have been added.
+      execTask->setMaxSplitSequenceId(source.planNodeId, maxSplitSequenceId);
+
+      for (const auto& lifespan : source.noMoreSplitsForLifespan) {
+        if (lifespan.isgroup) {
+          LOG(INFO) << "No more splits for group " << lifespan.groupid
+                    << " for " << taskId << " for node " << source.planNodeId;
+          execTask->noMoreSplitsForGroup(source.planNodeId, lifespan.groupid);
+        }
+      }
+
+      if (source.noMoreSplits) {
+        LOG(INFO) << "No more splits for " << taskId << " for node "
+                  << source.planNodeId;
+        // If the task has not been started yet, we collect the plan node to
+        // call 'no more splits' after the start.
+        if (prestoTask->taskStarted) {
+          execTask->noMoreSplits(source.planNodeId);
+        } else {
+          prestoTask->delayedNoMoreSplitsPlanNodes_.emplace(source.planNodeId);
+        }
       }
     }
-    // Update task's max split sequence id after all splits have been added.
-    execTask->setMaxSplitSequenceId(source.planNodeId, maxSplitSequenceId);
 
-    for (const auto& lifespan : source.noMoreSplitsForLifespan) {
-      if (lifespan.isgroup) {
-        LOG(INFO) << "No more splits for group " << lifespan.groupid << " for "
-                  << taskId << " for node " << source.planNodeId;
-        execTask->noMoreSplitsForGroup(source.planNodeId, lifespan.groupid);
-      }
+    // 'prestoTask' will exist by virtue of shared_ptr but may for example have
+    // been aborted.
+    auto info =
+        prestoTask->updateInfoLocked(summarize); // Presto task is locked above.
+    if (auto promiseHolder = infoRequest.lock()) {
+      promiseHolder->promise.setValue(
+          std::make_unique<protocol::TaskInfo>(info));
     }
-
-    if (source.noMoreSplits) {
-      LOG(INFO) << "No more splits for " << taskId << " for node "
-                << source.planNodeId;
-      execTask->noMoreSplits(source.planNodeId);
+    if (auto promiseHolder = statusRequest.lock()) {
+      promiseHolder->promise.setValue(
+          std::make_unique<protocol::TaskStatus>(info.taskStatus));
     }
+    ret = std::make_unique<TaskInfo>(info);
   }
 
-  // 'prestoTask' will exist by virtue of shared_ptr but may for example have
-  // been aborted.
-  auto info = prestoTask->updateInfoLocked(); // Presto task is locked above.
-  if (auto promiseHolder = infoRequest.lock()) {
-    promiseHolder->promise.setValue(std::make_unique<protocol::TaskInfo>(info));
+  if (startNextQueuedTask) {
+    maybeStartNextQueuedTask();
   }
-  if (auto promiseHolder = statusRequest.lock()) {
-    promiseHolder->promise.setValue(
-        std::make_unique<protocol::TaskStatus>(info.taskStatus));
-  }
-  return std::make_unique<TaskInfo>(info);
+
+  return ret;
 }
 
-std::unique_ptr<TaskInfo> TaskManager::deleteTask(
-    const TaskId& taskId,
-    bool /*abort*/) {
+void TaskManager::maybeStartTaskLocked(
+    std::shared_ptr<PrestoTask>& prestoTask,
+    bool& startNextQueuedTask) {
+  // Start the new task if the task queuing is disabled.
+  // Also start it if some tasks from this query have already started.
+  if (!SystemConfig::instance()->workerOverloadedTaskQueuingEnabled() ||
+      getQueryContextManager()->queryHasStartedTasks(prestoTask->info.taskId)) {
+    startTaskLocked(prestoTask);
+    return;
+  }
+
+  if (serverOverloaded_) {
+    // If server is overloaded, we don't start anything, but queue the new task.
+    LOG(INFO) << "TASK QUEUE: Server is overloaded. Queueing task "
+              << prestoTask->info.taskId;
+    auto lockedTaskQueue = taskQueue_.wlock();
+    enqueueTask(*lockedTaskQueue, prestoTask);
+  } else {
+    // If server is not overloaded, then we start the new task if the task queue
+    // is empty, otherwise we queue the new task and start the first queued task
+    // instead.
+    {
+      auto lockedTaskQueue = taskQueue_.wlock();
+      if (!lockedTaskQueue->empty()) {
+        LOG(INFO) << "TASK QUEUE: "
+                     "Server is not overloaded, but "
+                  << lockedTaskQueue->size()
+                  << " queued queries detected. Queueing task "
+                  << prestoTask->info.taskId;
+        enqueueTask(*lockedTaskQueue, prestoTask);
+        startNextQueuedTask = true;
+      }
+    }
+    if (!startNextQueuedTask) {
+      startTaskLocked(prestoTask);
+    }
+  }
+}
+
+void TaskManager::startTaskLocked(std::shared_ptr<PrestoTask>& prestoTask) {
+  auto execTask = prestoTask->task;
+  if (execTask == nullptr) {
+    return;
+  }
+
+  getQueryContextManager()->setQueryHasStartedTasks(prestoTask->info.taskId);
+
+  const uint32_t maxDrivers = execTask->queryCtx()->queryConfig().get<int32_t>(
+      kMaxDriversPerTask.data(), SystemConfig::instance()->maxDriversPerTask());
+  uint32_t concurrentLifespans =
+      execTask->queryCtx()->queryConfig().get<int32_t>(
+          kConcurrentLifespansPerTask.data(),
+          SystemConfig::instance()->concurrentLifespansPerTask());
+  // Zero concurrent lifespans means 'unlimited', but we still limit the
+  // number to some reasonable one.
+  if (concurrentLifespans == 0) {
+    concurrentLifespans = kMaxConcurrentLifespans;
+  }
+
+  if (execTask->isGroupedExecution()) {
+    LOG(INFO) << "Starting task " << prestoTask->info.taskId << " with "
+              << maxDrivers << " max drivers and " << concurrentLifespans
+              << " concurrent lifespans (grouped execution).";
+  } else {
+    LOG(INFO) << "Starting task " << prestoTask->info.taskId << " with "
+              << maxDrivers << " max drivers.";
+  }
+  execTask->start(maxDrivers, concurrentLifespans);
+  prestoTask->taskStarted = true;
+
+  // Record the time we spent between task creation and start, which is the
+  // planned (queued) time.
+  // Note task could be created at getTaskStatus/getTaskInfo endpoint and later
+  // receive taskUpdate to create and start task.
+  const auto queuedTimeInMs =
+      velox::getCurrentTimeMs() - prestoTask->createTimeMs;
+  prestoTask->info.stats.queuedTimeInNanos = queuedTimeInMs * 1'000'000;
+  RECORD_METRIC_VALUE(kCounterTaskPlannedTimeMs, queuedTimeInMs);
+}
+
+void TaskManager::maybeStartNextQueuedTask() {
+  if (serverOverloaded_) {
+    return;
+  }
+
+  // We will start all queued tasks from a single query.
+  std::vector<std::shared_ptr<PrestoTask>> tasksToStart;
+
+  // We run the loop here because some tasks might have failed or were aborted
+  // or cancelled. Despite that we want to start at least one task.
+  {
+    auto lockedTaskQueue = taskQueue_.wlock();
+    while (!lockedTaskQueue->empty()) {
+      // Get the next entry.
+      auto queuedTasks = std::move(lockedTaskQueue->front());
+      lockedTaskQueue->pop_front();
+
+      // Get all the still valid tasks from the entry.
+      bool queryTasksAreGoodToStart{true};
+      for (auto& queuedTask : queuedTasks) {
+        auto taskToStart = queuedTask.lock();
+
+        // Task is already gone or no Velox task (the latter will never happen).
+        if (taskToStart == nullptr || taskToStart->task == nullptr) {
+          LOG(WARNING) << "TASK QUEUE: Skipping null task in the queue.";
+          queryTasksAreGoodToStart = false;
+          break;
+        }
+
+        // Sanity check.
+        VELOX_CHECK(
+            !taskToStart->taskStarted,
+            "TASK QUEUE: "
+            "The queued task must not be started, but it is already started");
+
+        const auto taskState = taskToStart->taskState();
+        // If the status is not 'planned' then the tasks were likely aborted.
+        if (taskState != PrestoTaskState::kPlanned) {
+          LOG(INFO) << "TASK QUEUE: Discarding (not starting) queued task "
+                    << taskToStart->info.taskId << " because state is "
+                    << prestoTaskStateString(taskState);
+          queryTasksAreGoodToStart = false;
+          break;
+        }
+
+        tasksToStart.emplace_back(taskToStart);
+      }
+
+      if (queryTasksAreGoodToStart) {
+        break;
+      }
+      tasksToStart.clear();
+    }
+  }
+
+  for (auto& taskToStart : tasksToStart) {
+    std::lock_guard<std::mutex> l(taskToStart->mutex);
+    LOG(INFO) << "TASK QUEUE: Picking task to start from the queue: "
+              << taskToStart->info.taskId;
+    startTaskLocked(taskToStart);
+    // Make sure we call 'no more splits' we might have received before the task
+    // started.
+    auto execTask = taskToStart->task;
+    if (execTask != nullptr) {
+      for (const auto& planNodeId :
+           taskToStart->delayedNoMoreSplitsPlanNodes_) {
+        execTask->noMoreSplits(planNodeId);
+      }
+      taskToStart->delayedNoMoreSplitsPlanNodes_.clear();
+    }
+  }
+  const auto queuedTasksLeft = numQueuedTasks();
+  if (queuedTasksLeft > 0) {
+    LOG(INFO) << "TASK QUEUE: " << numQueuedTasks() << " queued tasks left";
+  }
+}
+
+std::unique_ptr<TaskInfo>
+TaskManager::deleteTask(const TaskId& taskId, bool /*abort*/, bool summarize) {
   LOG(INFO) << "Deleting task " << taskId;
   // Fast. non-blocking delete and cancel serialized on 'taskMap'.
   std::shared_ptr<facebook::presto::PrestoTask> prestoTask;
@@ -626,12 +883,11 @@ std::unique_ptr<TaskInfo> TaskManager::deleteTask(
   auto execTask = prestoTask->task;
   if (execTask) {
     auto state = execTask->state();
-    if (state == exec::kRunning) {
+    if (state == exec::TaskState::kRunning) {
       execTask->requestAbort();
     }
-    prestoTask->info.stats.endTime =
-        util::toISOTimestamp(velox::getCurrentTimeMs());
-    prestoTask->updateInfoLocked();
+    prestoTask->info.stats.endTimeInMillis = velox::getCurrentTimeMs();
+    prestoTask->updateInfoLocked(summarize);
   } else {
     // If task is not found than we observe DELETE message coming before
     // CREATE. In that case we create the task with ABORTED state, so we know
@@ -772,8 +1028,8 @@ folly::Future<std::unique_ptr<protocol::TaskInfo>> TaskManager::getTaskInfo(
   auto prestoTask = findOrCreateTask(taskId);
   if (!currentState || !maxWait) {
     // Return current TaskInfo without waiting.
-    promise.setValue(
-        std::make_unique<protocol::TaskInfo>(prestoTask->updateInfo()));
+    promise.setValue(std::make_unique<protocol::TaskInfo>(
+        prestoTask->updateInfo(summarize)));
     prestoTask->updateCoordinatorHeartbeat();
     return std::move(future).via(httpSrvCpuExecutor_);
   }
@@ -794,12 +1050,14 @@ folly::Future<std::unique_ptr<protocol::TaskInfo>> TaskManager::getTaskInfo(
 
       return std::move(future)
           .via(httpSrvCpuExecutor_)
-          .onTimeout(std::chrono::microseconds(maxWaitMicros), [prestoTask]() {
-            return std::make_unique<protocol::TaskInfo>(
-                prestoTask->updateInfo());
-          });
+          .onTimeout(
+              std::chrono::microseconds(maxWaitMicros),
+              [prestoTask, summarize]() {
+                return std::make_unique<protocol::TaskInfo>(
+                    prestoTask->updateInfo(summarize));
+              });
     }
-    info = prestoTask->updateInfoLocked();
+    info = prestoTask->updateInfoLocked(summarize);
   }
   if (currentState.value() != info.taskStatus.state ||
       isFinalState(info.taskStatus.state)) {
@@ -813,16 +1071,17 @@ folly::Future<std::unique_ptr<protocol::TaskInfo>> TaskManager::getTaskInfo(
 
   prestoTask->task->stateChangeFuture(maxWaitMicros)
       .via(httpSrvCpuExecutor_)
-      .thenValue([promiseHolder, prestoTask](auto&& /*done*/) {
-        promiseHolder->promise.setValue(
-            std::make_unique<protocol::TaskInfo>(prestoTask->updateInfo()));
+      .thenValue([promiseHolder, prestoTask, summarize](auto&& /*done*/) {
+        promiseHolder->promise.setValue(std::make_unique<protocol::TaskInfo>(
+            prestoTask->updateInfo(summarize)));
       })
       .thenError(
           folly::tag_t<std::exception>{},
-          [promiseHolder, prestoTask](const std::exception& /*e*/) {
+          [promiseHolder, prestoTask, summarize](const std::exception& /*e*/) {
             // We come here in the case of maxWait elapsed.
             promiseHolder->promise.setValue(
-                std::make_unique<protocol::TaskInfo>(prestoTask->updateInfo()));
+                std::make_unique<protocol::TaskInfo>(
+                    prestoTask->updateInfo(summarize)));
           });
   return std::move(future).via(httpSrvCpuExecutor_);
 }
@@ -878,13 +1137,13 @@ folly::Future<std::unique_ptr<Result>> TaskManager::getResults(
     for (;;) {
       if (prestoTask->taskStarted) {
         // If the task has finished, then send completion result.
-        if (prestoTask->task->state() == exec::kFinished) {
+        if (prestoTask->task->state() == exec::TaskState::kFinished) {
           promiseHolder->promise.setValue(createCompleteResult(token));
           return std::move(future).via(httpSrvCpuExecutor_);
         }
         // If task is not running let the request timeout. The task may have
         // failed at creation time and the coordinator hasn't yet caught up.
-        if (prestoTask->task->state() == exec::kRunning) {
+        if (prestoTask->task->state() == exec::TaskState::kRunning) {
           getData(
               promiseHolder,
               folly::to_weak_ptr(state),
@@ -1023,10 +1282,8 @@ std::shared_ptr<PrestoTask> TaskManager::findOrCreateTask(
 
   prestoTask =
       std::make_shared<PrestoTask>(taskId, nodeId_, startProcessCpuTime);
-  prestoTask->info.stats.createTime =
-      util::toISOTimestamp(velox::getCurrentTimeMs());
+  prestoTask->info.stats.createTimeInMillis = velox::getCurrentTimeMs();
   prestoTask->info.needsPlan = true;
-  prestoTask->info.metadataUpdates.connectorId = "unused";
 
   struct UuidSplit {
     int64_t lo;
@@ -1075,7 +1332,7 @@ std::string TaskManager::toString() const {
   return out.str();
 }
 
-velox::exec::Task::DriverCounts TaskManager::getDriverCounts() const {
+velox::exec::Task::DriverCounts TaskManager::getDriverCounts() {
   const auto taskMap = *taskMap_.rlock();
   velox::exec::Task::DriverCounts ret;
   for (const auto& pair : taskMap) {
@@ -1090,6 +1347,7 @@ velox::exec::Task::DriverCounts TaskManager::getDriverCounts() const {
       }
     }
   }
+  numQueuedDrivers_ = ret.numQueuedDrivers;
   return ret;
 }
 
@@ -1161,17 +1419,27 @@ int32_t TaskManager::yieldTasks(
   return numYields;
 }
 
-std::array<size_t, 5> TaskManager::getTaskNumbers(size_t& numTasks) const {
-  std::array<size_t, 5> res{0};
+std::array<size_t, 6> TaskManager::getTaskNumbers(size_t& numTasks) const {
+  std::array<size_t, 6> res{0};
   auto taskMap = taskMap_.rlock();
   numTasks = 0;
   for (const auto& pair : *taskMap) {
     if (pair.second->task != nullptr) {
-      ++res[pair.second->task->state()];
+      const auto prestoTaskState = pair.second->taskState();
+      ++res[static_cast<int>(prestoTaskState)];
       ++numTasks;
     }
   }
   return res;
+}
+
+size_t TaskManager::numQueuedTasks() const {
+  size_t num = 0;
+  auto lockedTaskQueue = taskQueue_.rlock();
+  for (const auto& entry : *lockedTaskQueue) {
+    num += entry.size();
+  }
+  return num;
 }
 
 int64_t TaskManager::getBytesProcessed() const {
@@ -1187,7 +1455,7 @@ void TaskManager::shutdown() {
   size_t numTasks;
   auto taskNumbers = getTaskNumbers(numTasks);
   size_t seconds = 0;
-  while (taskNumbers[velox::exec::TaskState::kRunning] > 0) {
+  while (taskNumbers[static_cast<int>(velox::exec::TaskState::kRunning)] > 0) {
     PRESTO_SHUTDOWN_LOG(INFO)
         << "Waited (" << seconds
         << " seconds so far) for 'Running' tasks to complete. " << numTasks

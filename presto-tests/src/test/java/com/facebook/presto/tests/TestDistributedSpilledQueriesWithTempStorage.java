@@ -15,10 +15,12 @@ package com.facebook.presto.tests;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.SystemSessionProperties;
+import com.facebook.presto.scalar.sql.SqlInvokedFunctionsPlugin;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tpch.TpchPlugin;
 import com.google.common.collect.ImmutableMap;
 
+import static com.facebook.presto.sessionpropertyproviders.JavaWorkerSessionPropertyProvider.AGGREGATION_OPERATOR_UNSPILL_MEMORY_LIMIT;
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
 import static com.facebook.presto.tpch.TpchMetadata.TINY_SCHEMA_NAME;
 
@@ -40,7 +42,7 @@ public class TestDistributedSpilledQueriesWithTempStorage
                 .setSchema(TINY_SCHEMA_NAME)
                 .setSystemProperty(SystemSessionProperties.TASK_CONCURRENCY, "2")
                 .setSystemProperty(SystemSessionProperties.SPILL_ENABLED, "true")
-                .setSystemProperty(SystemSessionProperties.AGGREGATION_OPERATOR_UNSPILL_MEMORY_LIMIT, "128kB")
+                .setSystemProperty(AGGREGATION_OPERATOR_UNSPILL_MEMORY_LIMIT, "128kB")
                 .setSystemProperty(SystemSessionProperties.USE_MARK_DISTINCT, "false")
                 .build();
 
@@ -56,6 +58,8 @@ public class TestDistributedSpilledQueriesWithTempStorage
         try {
             queryRunner.installPlugin(new TpchPlugin());
             queryRunner.createCatalog("tpch", "tpch");
+            queryRunner.installPlugin(new SqlInvokedFunctionsPlugin());
+
             return queryRunner;
         }
         catch (Exception e) {

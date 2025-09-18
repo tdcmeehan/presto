@@ -29,7 +29,7 @@ function hadoop_master_container(){
 function check_hadoop() {
   HADOOP_MASTER_CONTAINER=$(hadoop_master_container)
   docker exec ${HADOOP_MASTER_CONTAINER} supervisorctl status hive-server2 | grep -iq running && \
-    docker exec ${HADOOP_MASTER_CONTAINER} netstat -lpn | grep -iq 0.0.0.0:10000
+    docker exec ${HADOOP_MASTER_CONTAINER} netstat -lpn | grep -iq :10000
 }
 
 function run_in_application_runner_container() {
@@ -149,6 +149,8 @@ elif [[ "$ENVIRONMENT" == "singlenode-ldap" ]]; then
   EXTERNAL_SERVICES="hadoop-master ldapserver"
 elif [[ "$ENVIRONMENT" == "singlenode-mysql" ]]; then
   EXTERNAL_SERVICES="hadoop-master mysql"
+elif [[ "$ENVIRONMENT" == "singlenode-mysql-mixed-case-on" ]]; then
+  EXTERNAL_SERVICES="hadoop-master mysql-mixed-case-on"
 elif [[ "$ENVIRONMENT" == "singlenode-postgresql" ]]; then
   EXTERNAL_SERVICES="hadoop-master postgres"
 elif [[ "$ENVIRONMENT" == "singlenode-cassandra" ]]; then

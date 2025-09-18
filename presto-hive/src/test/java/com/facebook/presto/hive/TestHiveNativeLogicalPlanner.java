@@ -25,14 +25,13 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.testng.annotations.Test;
 
-import java.util.Optional;
-
 import static com.facebook.presto.hive.HiveQueryRunner.HIVE_CATALOG;
 import static com.facebook.presto.hive.HiveSessionProperties.PARTIAL_AGGREGATION_PUSHDOWN_ENABLED;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.anyTree;
 import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static io.airlift.tpch.TpchTable.ORDERS;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotSame;
 import static org.testng.Assert.assertTrue;
 
 @Test(singleThreaded = true)
@@ -46,7 +45,7 @@ public class TestHiveNativeLogicalPlanner
         return HiveQueryRunner.createQueryRunner(
                 ImmutableList.of(ORDERS),
                 ImmutableMap.of("native-execution-enabled", "true"),
-                Optional.empty());
+                ImmutableMap.of("tpcds.use-varchar-type", "true"));
     }
 
     @Test
@@ -74,7 +73,7 @@ public class TestHiveNativeLogicalPlanner
         for (ColumnHandle columnHandle : tableScan.getAssignments().values()) {
             assertTrue(columnHandle instanceof HiveColumnHandle);
             HiveColumnHandle hiveColumnHandle = (HiveColumnHandle) columnHandle;
-            assertFalse(hiveColumnHandle.getColumnType() == HiveColumnHandle.ColumnType.AGGREGATED);
+            assertNotSame(hiveColumnHandle.getColumnType(), HiveColumnHandle.ColumnType.AGGREGATED);
             assertFalse(hiveColumnHandle.getPartialAggregation().isPresent());
         }
     }

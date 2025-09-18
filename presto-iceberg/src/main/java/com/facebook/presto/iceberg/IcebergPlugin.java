@@ -13,28 +13,32 @@
  */
 package com.facebook.presto.iceberg;
 
-import com.facebook.presto.iceberg.function.changelog.ApplyChangelogFunction;
 import com.facebook.presto.spi.Plugin;
 import com.facebook.presto.spi.connector.ConnectorFactory;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
 
-import java.util.Set;
+import javax.management.MBeanServer;
+
+import java.lang.management.ManagementFactory;
 
 public class IcebergPlugin
         implements Plugin
 {
-    @Override
-    public Iterable<ConnectorFactory> getConnectorFactories()
+    private final MBeanServer mBeanServer;
+
+    public IcebergPlugin()
     {
-        return ImmutableList.of(new IcebergConnectorFactory());
+        this(ManagementFactory.getPlatformMBeanServer());
+    }
+
+    public IcebergPlugin(MBeanServer mBeanServer)
+    {
+        this.mBeanServer = mBeanServer;
     }
 
     @Override
-    public Set<Class<?>> getFunctions()
+    public Iterable<ConnectorFactory> getConnectorFactories()
     {
-        return ImmutableSet.<Class<?>>builder()
-                .add(ApplyChangelogFunction.class)
-                .build();
+        return ImmutableList.of(new IcebergConnectorFactory(mBeanServer));
     }
 }

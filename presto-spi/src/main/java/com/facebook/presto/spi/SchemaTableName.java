@@ -22,7 +22,6 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.Objects;
 
 import static com.facebook.presto.spi.SchemaUtil.checkNotEmpty;
-import static java.util.Locale.ENGLISH;
 
 @ThriftStruct
 public class SchemaTableName
@@ -34,8 +33,8 @@ public class SchemaTableName
     @ThriftConstructor
     public SchemaTableName(@JsonProperty("schema") String schemaName, @JsonProperty("table") String tableName)
     {
-        this.schemaName = checkNotEmpty(schemaName, "schemaName").toLowerCase(ENGLISH);
-        this.tableName = checkNotEmpty(tableName, "tableName").toLowerCase(ENGLISH);
+        this.schemaName = checkNotEmpty(schemaName, "schemaName");
+        this.tableName = checkNotEmpty(tableName, "tableName");
     }
 
     public static SchemaTableName valueOf(String schemaTableName)
@@ -50,14 +49,14 @@ public class SchemaTableName
     }
 
     @JsonProperty("schema")
-    @ThriftField(1)
+    @ThriftField(value = 1, name = "schema")
     public String getSchemaName()
     {
         return schemaName;
     }
 
     @JsonProperty("table")
-    @ThriftField(2)
+    @ThriftField(value = 2, name = "table")
     public String getTableName()
     {
         return tableName;

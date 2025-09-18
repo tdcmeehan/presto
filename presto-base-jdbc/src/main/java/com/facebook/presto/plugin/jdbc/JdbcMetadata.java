@@ -55,14 +55,15 @@ public class JdbcMetadata
     private final JdbcMetadataCache jdbcMetadataCache;
     private final JdbcClient jdbcClient;
     private final boolean allowDropTable;
-
+    private final String url;
     private final AtomicReference<Runnable> rollbackAction = new AtomicReference<>();
 
-    public JdbcMetadata(JdbcMetadataCache jdbcMetadataCache, JdbcClient jdbcClient, boolean allowDropTable)
+    public JdbcMetadata(JdbcMetadataCache jdbcMetadataCache, JdbcClient jdbcClient, boolean allowDropTable, TableLocationProvider tableLocationProvider)
     {
         this.jdbcMetadataCache = requireNonNull(jdbcMetadataCache, "jdbcMetadataCache is null");
         this.jdbcClient = requireNonNull(jdbcClient, "client is null");
         this.allowDropTable = allowDropTable;
+        this.url = requireNonNull(tableLocationProvider, "tableLocationProvider is null").getTableLocation();
     }
 
     @Override
@@ -84,11 +85,15 @@ public class JdbcMetadata
     }
 
     @Override
-    public List<ConnectorTableLayoutResult> getTableLayouts(ConnectorSession session, ConnectorTableHandle table, Constraint<ColumnHandle> constraint, Optional<Set<ColumnHandle>> desiredColumns)
+    public ConnectorTableLayoutResult getTableLayoutForConstraint(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            Constraint<ColumnHandle> constraint,
+            Optional<Set<ColumnHandle>> desiredColumns)
     {
         JdbcTableHandle tableHandle = (JdbcTableHandle) table;
         ConnectorTableLayout layout = new ConnectorTableLayout(new JdbcTableLayoutHandle(session.getSqlFunctionProperties(), tableHandle, constraint.getSummary(), Optional.empty()));
-        return ImmutableList.of(new ConnectorTableLayoutResult(layout, constraint.getSummary()));
+        return new ConnectorTableLayoutResult(layout, constraint.getSummary());
     }
 
     @Override
@@ -104,7 +109,7 @@ public class JdbcMetadata
 
         ImmutableList.Builder<ColumnMetadata> columnMetadata = ImmutableList.builder();
         for (JdbcColumnHandle column : jdbcMetadataCache.getColumns(session, handle)) {
-            columnMetadata.add(column.getColumnMetadata());
+            columnMetadata.add(column.getColumnMetadata(session, jdbcClient));
         }
         return new ConnectorTableMetadata(handle.getSchemaTableName(), columnMetadata.build());
     }
@@ -122,7 +127,7 @@ public class JdbcMetadata
 
         ImmutableMap.Builder<String, ColumnHandle> columnHandles = ImmutableMap.builder();
         for (JdbcColumnHandle column : jdbcMetadataCache.getColumns(session, jdbcTableHandle)) {
-            columnHandles.put(column.getColumnMetadata().getName(), column);
+            columnHandles.put(column.getColumnMetadata(session, jdbcClient).getName(), column);
         }
         return columnHandles.build();
     }
@@ -189,7 +194,7 @@ public class JdbcMetadata
         JdbcOutputTableHandle handle = (JdbcOutputTableHandle) tableHandle;
         jdbcClient.commitCreateTable(session, JdbcIdentity.from(session), handle);
         clearRollback();
-        return Optional.empty();
+        return Optional.of(new JdbcOutputMetadata(url));
     }
 
     private void setRollback(Runnable action)
@@ -266,5 +271,17 @@ public class JdbcMetadata
         JdbcTableHandle handle = (JdbcTableHandle) tableHandle;
         List<JdbcColumnHandle> columns = columnHandles.stream().map(JdbcColumnHandle.class::cast).collect(Collectors.toList());
         return jdbcClient.getTableStatistics(session, handle, columns, constraint.getSummary());
+    }
+
+    @Override
+    public String normalizeIdentifier(ConnectorSession session, String identifier)
+    {
+        return jdbcClient.normalizeIdentifier(session, identifier);
+    }
+
+    @Override
+    public Optional<Object> getInfo(ConnectorTableLayoutHandle tableHandle)
+    {
+        return Optional.of(new JdbcInputInfo(url));
     }
 }

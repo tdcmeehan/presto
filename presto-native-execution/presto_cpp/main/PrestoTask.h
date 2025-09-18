@@ -14,9 +14,10 @@
 #pragma once
 
 #include <memory>
+#include <unordered_set>
 #include "presto_cpp/main/http/HttpServer.h"
 #include "presto_cpp/main/types/PrestoTaskId.h"
-#include "presto_cpp/presto_protocol/presto_protocol.h"
+#include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
 #include "velox/exec/Task.h"
 
 namespace facebook::velox {
@@ -24,6 +25,19 @@ struct RuntimeMetric;
 }
 
 namespace facebook::presto {
+
+/// Velox Task does not have Planned state, so we add this enum to have this
+/// state.
+enum class PrestoTaskState : int {
+  kRunning = 0,
+  kFinished = 1,
+  kCanceled = 2,
+  kAborted = 3,
+  kFailed = 4,
+  kPlanned = 5
+};
+
+std::string prestoTaskStateString(PrestoTaskState state);
 
 template <typename T>
 struct PromiseHolder {
@@ -107,7 +121,13 @@ struct PrestoTask {
   uint64_t lastTaskStatsUpdateMs{0};
 
   uint64_t lastMemoryReservation{0};
+  /// Time point (in ms) when the time we start task creating.
   uint64_t createTimeMs{0};
+  /// Time point (in ms) when the first time we receive task update.
+  uint64_t firstTimeReceiveTaskUpdateMs{0};
+  /// Time point (in ms) when the time we finish task creating.
+  uint64_t createFinishTimeMs{0};
+  uint64_t startTimeMs{0};
   uint64_t firstSplitStartTimeMs{0};
   uint64_t lastEndTimeMs{0};
   mutable std::mutex mutex;
@@ -129,6 +149,10 @@ struct PrestoTask {
   /// Info request. May arrive before there is a Task.
   PromiseHolderWeakPtr<std::unique_ptr<protocol::TaskInfo>> infoRequest;
 
+  /// If the task has not been started yet, we collect all plan node IDs that
+  /// had 'no more splits' message to process them after the task starts.
+  std::unordered_set<velox::core::PlanNodeId> delayedNoMoreSplitsPlanNodes_;
+
   /// @param taskId Task ID.
   /// @param nodeId Node ID.
   /// @param startCpuTime CPU time in nanoseconds recorded when request to
@@ -137,6 +161,10 @@ struct PrestoTask {
       const std::string& taskId,
       const std::string& nodeId,
       long startProcessCpuTime = 0);
+
+  /// Returns current task state, including 'planning'.
+  /// If Velox task is null, it returns 'aborted'.
+  PrestoTaskState taskState() const;
 
   /// Updates when this task was touched last time.
   void updateHeartbeatLocked();
@@ -161,18 +189,18 @@ struct PrestoTask {
     return updateStatusLocked();
   }
 
-  protocol::TaskInfo updateInfo() {
+  protocol::TaskInfo updateInfo(bool summarize) {
     std::lock_guard<std::mutex> l(mutex);
-    return updateInfoLocked();
+    return updateInfoLocked(summarize);
   }
 
   /// Turns the task numbers (per state) into a string.
   static std::string taskStatesToString(
-      const std::array<size_t, 5>& taskStates);
+      const std::array<size_t, 6>& taskStates);
 
   /// Invoked to update presto task status from the updated velox task stats.
   protocol::TaskStatus updateStatusLocked();
-  protocol::TaskInfo updateInfoLocked();
+  protocol::TaskInfo updateInfoLocked(bool summarize);
 
   folly::dynamic toJson() const;
 
@@ -191,7 +219,8 @@ struct PrestoTask {
   void updateExecutionInfoLocked(
       const velox::exec::TaskStats& veloxTaskStats,
       const protocol::TaskStatus& prestoTaskStatus,
-      std::unordered_map<std::string, velox::RuntimeMetric>& taskRuntimeStats);
+      std::unordered_map<std::string, velox::RuntimeMetric>& taskRuntimeStats,
+      bool includePipelineStats);
 
   void updateMemoryInfoLocked(
       const velox::exec::TaskStats& veloxTaskStats,

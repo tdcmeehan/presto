@@ -14,8 +14,7 @@
 package com.facebook.presto.sql.analyzer;
 
 import com.facebook.presto.sql.tree.Node;
-
-import javax.annotation.Nullable;
+import jakarta.annotation.Nullable;
 
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static java.lang.String.format;
@@ -51,6 +50,11 @@ public class RelationId
     public boolean isAnonymous()
     {
         return sourceNode == null;
+    }
+
+    public Node getSourceNode()
+    {
+        return sourceNode;
     }
 
     @Override

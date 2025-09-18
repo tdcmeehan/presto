@@ -14,6 +14,8 @@ add_subdirectory(types)
 add_subdirectory(http)
 add_subdirectory(common)
 add_subdirectory(thrift)
+add_subdirectory(connectors)
+add_subdirectory(dynamic_registry)
 
 add_library(
   presto_server_lib
@@ -26,10 +28,10 @@ add_library(
   PrestoServer.cpp
   PrestoServerOperations.cpp
   PrestoTask.cpp
+  PrestoToVeloxQueryConfig.cpp
   QueryContextManager.cpp
   ServerOperation.cpp
   SignalHandler.cpp
-  SystemConnector.cpp
   SessionProperties.cpp
   TaskManager.cpp
   TaskResource.cpp
@@ -47,24 +49,39 @@ target_link_libraries(
   $<TARGET_OBJECTS:presto_protocol>
   presto_common
   presto_exception
+  presto_function_metadata
+  presto_connectors
   presto_http
   presto_operators
+  presto_velox_plan_conversion
+  velox_abfs
   velox_aggregates
   velox_caching
   velox_common_base
   velox_core
   velox_dwio_common_exception
+  velox_dwio_dwrf_reader
+  velox_dwio_dwrf_writer
+  velox_dwio_orc_reader
+  velox_dwio_parquet_reader
+  velox_dwio_parquet_writer
+  velox_dwio_text_writer_register
+  velox_dynamic_library_loader
   velox_encode
   velox_exec
+  velox_file
   velox_functions_lib
   velox_functions_prestosql
+  velox_gcs
+  velox_hdfs
   velox_hive_connector
   velox_hive_iceberg_splitreader
   velox_hive_partition_function
   velox_presto_serializer
+  velox_presto_type_parser
+  velox_s3fs
   velox_serialization
   velox_time
-  velox_type_parser
   velox_type
   velox_type_fbhive
   velox_type_tz
@@ -76,24 +93,16 @@ target_link_libraries(
   ${GFLAGS_LIBRARIES}
   pthread)
 
+if(PRESTO_ENABLE_CUDF)
+  target_link_libraries(presto_server_lib velox_cudf_exec)
+endif()
+
 # Enabling Parquet causes build errors with missing symbols on MacOS. This is
 # likely due to a conflict between Arrow Thrift from velox_hive_connector and
 # FBThrift libraries. The build issue is fixed by linking velox_hive_connector
 # dependencies first followed by FBThrift.
 target_link_libraries(presto_server_lib presto_thrift-cpp2 presto_thrift_extra
                       ${THRIFT_LIBRARY})
-
-set_property(TARGET presto_server_lib PROPERTY JOB_POOL_LINK
-                                               presto_link_job_pool)
-
-add_executable(presto_server PrestoMain.cpp)
-
-# Moving velox_hive_connector and velox_tpch_connector to presto_server_lib
-# results in multiple link errors similar to the one below only on GCC.
-# "undefined reference to `vtable for velox::connector::tpch::TpchTableHandle`"
-# TODO: Fix these errors.
-target_link_libraries(presto_server presto_server_lib velox_hive_connector
-                      velox_tpch_connector)
 
 if(PRESTO_ENABLE_REMOTE_FUNCTIONS)
   add_library(presto_server_remote_function JsonSignatureParser.cpp
@@ -102,6 +111,33 @@ if(PRESTO_ENABLE_REMOTE_FUNCTIONS)
   target_link_libraries(presto_server_remote_function velox_expression
                         velox_functions_remote ${FOLLY_WITH_DEPENDENCIES})
   target_link_libraries(presto_server_lib presto_server_remote_function)
+endif()
+
+set_property(TARGET presto_server_lib PROPERTY JOB_POOL_LINK
+                                               presto_link_job_pool)
+
+add_executable(presto_server PrestoMain.cpp)
+
+# The below additional flags are necessary for resolving dependencies for
+# loading dynamic libraries.
+if(APPLE)
+  target_link_options(presto_server BEFORE PUBLIC
+                      "-Wl,-undefined,dynamic_lookup")
+else()
+  target_link_options(presto_server BEFORE PUBLIC "-Wl,-export-dynamic")
+endif()
+
+# velox_tpch_connector is an OBJECT target in Velox and so needs to be linked to
+# the executable or use TARGET_OBJECT linkage for the presto_server_lib target.
+# However, we also would need to add its dependencies (tpch_gen etc). TODO
+# change the target in Velox to a library target then we can move this to the
+# presto_server_lib.
+target_link_libraries(presto_server presto_server_lib velox_tpch_connector)
+
+# Clang requires explicit linking with libatomic.
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"
+   AND "${CMAKE_CXX_COMPILER_VERSION}" VERSION_GREATER_EQUAL 15)
+  target_link_libraries(presto_server atomic)
 endif()
 
 set_property(TARGET presto_server PROPERTY JOB_POOL_LINK presto_link_job_pool)
@@ -119,5 +155,21 @@ if(PRESTO_STATS_REPORTER_TYPE)
     message(
       FATAL_ERROR
         "${PRESTO_STATS_REPORTER_TYPE} is not a valid stats reporter name")
+  endif()
+endif()
+
+if(PRESTO_MEMORY_CHECKER_TYPE)
+  add_compile_definitions(PRESTO_MEMORY_CHECKER_TYPE)
+  # Check if the current platform is Linux and the memory checker type is
+  # LINUX_MEMORY_CHECKER.
+  if(UNIX
+     AND NOT APPLE
+     AND (PRESTO_MEMORY_CHECKER_TYPE STREQUAL "LINUX_MEMORY_CHECKER"))
+    add_library(presto_linux_memory_checker OBJECT LinuxMemoryChecker.cpp)
+    target_link_libraries(presto_server presto_linux_memory_checker)
+  else()
+    message(
+      FATAL_ERROR
+        "${PRESTO_MEMORY_CHECKER_TYPE} is not a valid memory checker name")
   endif()
 endif()

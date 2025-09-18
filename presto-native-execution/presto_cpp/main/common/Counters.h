@@ -41,12 +41,22 @@ constexpr folly::StringPiece kCounterHTTPRequestLatencyMs{
 
 constexpr folly::StringPiece kCounterHttpClientNumConnectionsCreated{
     "presto_cpp.http.client.num_connections_created"};
+constexpr folly::StringPiece kCounterHTTPClientTransactionCreateDelay{
+    "presto_cpp.http.client.transaction_create_delay_ms"};
 /// Peak number of bytes queued in PrestoExchangeSource waiting for consume.
 constexpr folly::StringPiece kCounterExchangeSourcePeakQueuedBytes{
     "presto_cpp.exchange_source_peak_queued_bytes"};
 
+constexpr folly::StringPiece kCounterExchangeRequestDuration{
+    "presto_cpp.exchange.request.duration"};
+constexpr folly::StringPiece kCounterExchangeRequestNumTries{
+    "presto_cpp.exchange.request.num_tries"};
+
 constexpr folly::StringPiece kCounterNumQueryContexts{
     "presto_cpp.num_query_contexts"};
+/// Export total bytes used by memory manager (in queries' memory pools).
+constexpr folly::StringPiece kCounterMemoryManagerTotalBytes{
+    "presto_cpp.memory_manager_total_bytes"};
 
 constexpr folly::StringPiece kCounterNumTasks{"presto_cpp.num_tasks"};
 constexpr folly::StringPiece kCounterNumTasksBytesProcessed{
@@ -61,6 +71,13 @@ constexpr folly::StringPiece kCounterNumTasksAborted{
     "presto_cpp.num_tasks_aborted"};
 constexpr folly::StringPiece kCounterNumTasksFailed{
     "presto_cpp.num_tasks_failed"};
+/// Number of the created but not yet started tasks, including queued tasks.
+constexpr folly::StringPiece kCounterNumTasksPlanned{
+    "presto_cpp.num_tasks_planned"};
+/// Number of the created tasks in the task queue.
+constexpr folly::StringPiece kCounterNumTasksQueued{
+    "presto_cpp.num_tasks_queued"};
+
 constexpr folly::StringPiece kCounterNumZombieVeloxTasks{
     "presto_cpp.num_zombie_velox_tasks"};
 constexpr folly::StringPiece kCounterNumZombiePrestoTasks{
@@ -96,12 +113,21 @@ constexpr folly::StringPiece kCounterNumBlockedWaitForMemoryDrivers{
     "presto_cpp.num_blocked_wait_for_memory_drivers"};
 constexpr folly::StringPiece kCounterNumBlockedWaitForConnectorDrivers{
     "presto_cpp.num_blocked_wait_for_connector_drivers"};
-constexpr folly::StringPiece kCounterNumBlockedWaitForSpillDrivers{
-    "presto_cpp.num_blocked_wait_for_spill_drivers"};
 constexpr folly::StringPiece kCounterNumBlockedYieldDrivers{
     "presto_cpp.num_blocked_yield_drivers"};
 constexpr folly::StringPiece kCounterNumStuckDrivers{
     "presto_cpp.num_stuck_drivers"};
+
+/// Export 100 if worker is overloaded in terms of memory, 0 otherwise.
+constexpr folly::StringPiece kCounterOverloadedMem{"presto_cpp.overloaded_mem"};
+/// Export 100 if worker is overloaded in terms of CPU, 0 otherwise.
+constexpr folly::StringPiece kCounterOverloadedCpu{"presto_cpp.overloaded_cpu"};
+/// Export 100 if worker is overloaded in terms of memory or CPU, 0 otherwise.
+constexpr folly::StringPiece kCounterOverloaded{"presto_cpp.overloaded"};
+/// Worker exports the average time tasks spend in the queue (considered
+/// planned) in milliseconds.
+constexpr folly::StringPiece kCounterTaskPlannedTimeMs{
+    "presto_cpp.task_planned_time_ms"};
 
 /// Number of total OutputBuffer managed by all
 /// OutputBufferManager
@@ -157,6 +183,25 @@ constexpr std::string_view kCounterHiveFileHandleCacheNumHitsFormat{
 constexpr std::string_view kCounterHiveFileHandleCacheNumLookupsFormat{
     "presto_cpp.{}.hive_file_handle_cache_num_lookups"};
 
+/// ================== Thread Pool Counters ====================
+
+constexpr std::string_view kCounterThreadPoolNumThreadsFormat{
+    "presto_cpp.{}.num_threads"};
+constexpr std::string_view kCounterThreadPoolNumActiveThreadsFormat{
+    "presto_cpp.{}.num_active_threads"};
+constexpr std::string_view kCounterThreadPoolNumPendingTasksFormat{
+    "presto_cpp.{}.num_pending_tasks"};
+constexpr std::string_view kCounterThreadPoolNumTotalTasksFormat{
+    "presto_cpp.{}.num_total_tasks"};
+constexpr std::string_view kCounterThreadPoolMaxIdleTimeNsFormat{
+    "presto_cpp.{}.max_idle_time_ns"};
+
+/// ================== EVB Counters ====================
+constexpr folly::StringPiece kCounterExchangeIoEvbViolation{
+  "presto_cpp.exchange_io_evb_violation_count"};
+constexpr folly::StringPiece kCounterHttpServerIoEvbViolation{
+  "presto_cpp.http_server_io_evb_violation_count"};
+
 /// ================== Memory Pushback Counters =================
 
 /// Number of times memory pushback mechanism is triggered.
@@ -166,4 +211,16 @@ constexpr folly::StringPiece kCounterMemoryPushbackCount{
 /// reports P50, P90, P99, and P100.
 constexpr folly::StringPiece kCounterMemoryPushbackLatencyMs{
     "presto_cpp.memory_pushback_latency_ms"};
+/// Distribution of actual reduction in memory usage achieved by each memory
+/// pushback attempt. This is to gauge its effectiveness. In range of [0, 15GB]
+/// with 150 buckets and reports P50, P90, P99, and P100.
+constexpr folly::StringPiece kCounterMemoryPushbackReductionBytes{
+    "presto_cpp.memory_pushback_reduction_bytes"};
+/// Distribution of expected reduction in memory usage achieved by each memory
+/// pushback attempt. This is to gauge its effectiveness. In range of [0, 15GB]
+/// with 150 buckets and reports P50, P90, P99, and P100. The expected reduction
+/// can be different as other threads might have allocated memory in the
+/// meantime.
+constexpr folly::StringPiece kCounterMemoryPushbackExpectedReductionBytes{
+    "presto_cpp.memory_pushback_expected_reduction_bytes"};
 } // namespace facebook::presto

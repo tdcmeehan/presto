@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.iceberg;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.Session;
 import com.facebook.presto.common.transaction.TransactionId;
 import com.facebook.presto.spi.security.AllowAllAccessControl;
@@ -81,7 +82,7 @@ public class TestIcebergSystemTables
         assertUpdate("INSERT INTO test_schema.test_table VALUES (3, CAST('2019-09-09' AS DATE)), (4, CAST('2019-09-10' AS DATE)), (5, CAST('2019-09-10' AS DATE))", 3);
         assertQuery("SELECT count(*) FROM test_schema.test_table", "VALUES 6");
 
-        assertUpdate("CREATE TABLE test_schema.test_table_v1 (_bigint BIGINT, _date DATE) WITH (format_version = '1', partitioning = ARRAY['_date'])");
+        assertUpdate("CREATE TABLE test_schema.test_table_v1 (_bigint BIGINT, _date DATE) WITH (\"format-version\" = '1', partitioning = ARRAY['_date'])");
         assertUpdate("INSERT INTO test_schema.test_table_v1 VALUES (0, CAST('2019-09-08' AS DATE)), (1, CAST('2019-09-09' AS DATE)), (2, CAST('2019-09-09' AS DATE))", 3);
         assertUpdate("INSERT INTO test_schema.test_table_v1 VALUES (3, CAST('2019-09-09' AS DATE)), (4, CAST('2019-09-10' AS DATE)), (5, CAST('2019-09-10' AS DATE))", 3);
         assertQuery("SELECT count(*) FROM test_schema.test_table_v1", "VALUES 6");
@@ -96,14 +97,14 @@ public class TestIcebergSystemTables
         assertQuery("SELECT count(*) FROM test_schema.test_table_drop_column", "VALUES 6");
         assertUpdate("ALTER TABLE test_schema.test_table_drop_column DROP COLUMN _varchar");
 
-        assertUpdate("CREATE TABLE test_schema.test_table_orc (_bigint BIGINT) WITH (format_version = '1', format = 'ORC')");
+        assertUpdate("CREATE TABLE test_schema.test_table_orc (_bigint BIGINT) WITH (\"format-version\" = '1', \"write.format.default\" = 'ORC')");
         assertUpdate("INSERT INTO test_schema.test_table_orc VALUES (0), (1), (2)", 3);
 
         assertUpdate("CREATE TABLE test_schema.test_metadata_versions_maintain (_bigint BIGINT)" +
-                " WITH (metadata_previous_versions_max = 1, metadata_delete_after_commit = true)");
+                " WITH (\"write.metadata.previous-versions-max\" = 1, \"write.metadata.delete-after-commit.enabled\" = true)");
 
         assertUpdate("CREATE TABLE test_schema.test_metrics_max_inferred_column (_bigint BIGINT)" +
-                " WITH (metrics_max_inferred_column = 16)");
+                " WITH (\"write.metadata.metrics.max-inferred-column-defaults\" = 16)");
     }
 
     @Test
@@ -111,11 +112,11 @@ public class TestIcebergSystemTables
     {
         assertQuery("SELECT count(*) FROM test_schema.test_table", "VALUES 6");
         assertQuery("SHOW COLUMNS FROM test_schema.\"test_table$partitions\"",
-                "VALUES ('_date', 'date', '', '')," +
-                        "('row_count', 'bigint', '', '')," +
-                        "('file_count', 'bigint', '', '')," +
-                        "('total_size', 'bigint', '', '')," +
-                        "('_bigint', 'row(\"min\" bigint, \"max\" bigint, \"null_count\" bigint)', '', '')");
+                "VALUES ('_date', 'date', '', '', null, null, null)," +
+                        "('row_count', 'bigint', '', '', 19L, null, null)," +
+                        "('file_count', 'bigint', '', '', 19L, null, null)," +
+                        "('total_size', 'bigint', '', '', 19L, null, null)," +
+                        "('_bigint', 'row(\"min\" bigint, \"max\" bigint, \"null_count\" bigint)', '', '', null, null, null)");
 
         MaterializedResult result = computeActual("SELECT * from test_schema.\"test_table$partitions\"");
         assertEquals(result.getRowCount(), 3);
@@ -144,10 +145,10 @@ public class TestIcebergSystemTables
     public void testHistoryTable()
     {
         assertQuery("SHOW COLUMNS FROM test_schema.\"test_table$history\"",
-                "VALUES ('made_current_at', 'timestamp with time zone', '', '')," +
-                        "('snapshot_id', 'bigint', '', '')," +
-                        "('parent_id', 'bigint', '', '')," +
-                        "('is_current_ancestor', 'boolean', '', '')");
+                "VALUES ('made_current_at', 'timestamp with time zone', '', '', null, null, null)," +
+                        "('snapshot_id', 'bigint', '', '', 19l, null, null)," +
+                        "('parent_id', 'bigint', '', '', 19l, null, null)," +
+                        "('is_current_ancestor', 'boolean', '', '',null , null, null)");
 
         // Test the number of history entries
         assertQuery("SELECT count(*) FROM test_schema.\"test_table$history\"", "VALUES 2");
@@ -157,12 +158,12 @@ public class TestIcebergSystemTables
     public void testSnapshotsTable()
     {
         assertQuery("SHOW COLUMNS FROM test_schema.\"test_table$snapshots\"",
-                "VALUES ('committed_at', 'timestamp with time zone', '', '')," +
-                        "('snapshot_id', 'bigint', '', '')," +
-                        "('parent_id', 'bigint', '', '')," +
-                        "('operation', 'varchar', '', '')," +
-                        "('manifest_list', 'varchar', '', '')," +
-                        "('summary', 'map(varchar, varchar)', '', '')");
+                "VALUES ('committed_at', 'timestamp with time zone', '', '', null, null, null)," +
+                        "('snapshot_id', 'bigint', '', '', 19L, null, null)," +
+                        "('parent_id', 'bigint', '', '', 19L, null, null)," +
+                        "('operation', 'varchar', '', '', null, null, 2147483647L)," +
+                        "('manifest_list', 'varchar', '', '', null, null, 2147483647L)," +
+                        "('summary', 'map(varchar, varchar)', '', '', null, null, null)");
 
         assertQuery("SELECT operation FROM test_schema.\"test_table$snapshots\"", "VALUES 'append', 'append'");
         assertQuery("SELECT summary['total-records'] FROM test_schema.\"test_table$snapshots\"", "VALUES '3', '6'");
@@ -172,14 +173,14 @@ public class TestIcebergSystemTables
     public void testManifestsTable()
     {
         assertQuery("SHOW COLUMNS FROM test_schema.\"test_table$manifests\"",
-                "VALUES ('path', 'varchar', '', '')," +
-                        "('length', 'bigint', '', '')," +
-                        "('partition_spec_id', 'integer', '', '')," +
-                        "('added_snapshot_id', 'bigint', '', '')," +
-                        "('added_data_files_count', 'integer', '', '')," +
-                        "('existing_data_files_count', 'integer', '', '')," +
-                        "('deleted_data_files_count', 'integer', '', '')," +
-                        "('partitions', 'array(row(\"contains_null\" boolean, \"lower_bound\" varchar, \"upper_bound\" varchar))', '', '')");
+                "VALUES ('path', 'varchar', '', '', null, null, 2147483647L)," +
+                        "('length', 'bigint', '', '', 19L, null, null)," +
+                        "('partition_spec_id', 'integer', '', '', 10L, null, null)," +
+                        "('added_snapshot_id', 'bigint', '', '', 19L, null, null)," +
+                        "('added_data_files_count', 'integer', '', '', 10L, null, null)," +
+                        "('existing_data_files_count', 'integer', '', '', 10L, null, null)," +
+                        "('deleted_data_files_count', 'integer', '', '', 10L, null, null)," +
+                        "('partitions', 'array(row(\"contains_null\" boolean, \"lower_bound\" varchar, \"upper_bound\" varchar))', '', '', null, null, null)");
         assertQuerySucceeds("SELECT * FROM test_schema.\"test_table$manifests\"");
 
         assertQuerySucceeds("SELECT * FROM test_schema.\"test_table_multilevel_partitions$manifests\"");
@@ -189,20 +190,20 @@ public class TestIcebergSystemTables
     public void testFilesTable()
     {
         assertQuery("SHOW COLUMNS FROM test_schema.\"test_table$files\"",
-                "VALUES ('content', 'integer', '', '')," +
-                        "('file_path', 'varchar', '', '')," +
-                        "('file_format', 'varchar', '', '')," +
-                        "('record_count', 'bigint', '', '')," +
-                        "('file_size_in_bytes', 'bigint', '', '')," +
-                        "('column_sizes', 'map(integer, bigint)', '', '')," +
-                        "('value_counts', 'map(integer, bigint)', '', '')," +
-                        "('null_value_counts', 'map(integer, bigint)', '', '')," +
-                        "('nan_value_counts', 'map(integer, bigint)', '', '')," +
-                        "('lower_bounds', 'map(integer, varchar)', '', '')," +
-                        "('upper_bounds', 'map(integer, varchar)', '', '')," +
-                        "('key_metadata', 'varbinary', '', '')," +
-                        "('split_offsets', 'array(bigint)', '', '')," +
-                        "('equality_ids', 'array(integer)', '', '')");
+                "VALUES ('content', 'integer', '', '', 10L, null, null)," +
+                        "('file_path', 'varchar', '', '', null, null, 2147483647L)," +
+                        "('file_format', 'varchar', '', '', null, null, 2147483647L)," +
+                        "('record_count', 'bigint', '', '', 19L, null, null)," +
+                        "('file_size_in_bytes', 'bigint', '', '', 19L, null, null)," +
+                        "('column_sizes', 'map(integer, bigint)', '', '', null, null, null)," +
+                        "('value_counts', 'map(integer, bigint)', '', '', null, null, null)," +
+                        "('null_value_counts', 'map(integer, bigint)', '', '', null, null, null)," +
+                        "('nan_value_counts', 'map(integer, bigint)', '', '', null, null, null)," +
+                        "('lower_bounds', 'map(integer, varchar)', '', '', null, null, null)," +
+                        "('upper_bounds', 'map(integer, varchar)', '', '', null, null, null)," +
+                        "('key_metadata', 'varbinary', '', '', null, null, null)," +
+                        "('split_offsets', 'array(bigint)', '', '', null, null, null)," +
+                        "('equality_ids', 'array(integer)', '', '', null, null, null)");
         assertQuerySucceeds("SELECT * FROM test_schema.\"test_table$files\"");
     }
 
@@ -210,12 +211,12 @@ public class TestIcebergSystemTables
     public void testRefsTable()
     {
         assertQuery("SHOW COLUMNS FROM test_schema.\"test_table$refs\"",
-                "VALUES ('name', 'varchar', '', '')," +
-                        "('type', 'varchar', '', '')," +
-                        "('snapshot_id', 'bigint', '', '')," +
-                        "('max_reference_age_in_ms', 'bigint', '', '')," +
-                        "('min_snapshots_to_keep', 'bigint', '', '')," +
-                        "('max_snapshot_age_in_ms', 'bigint', '', '')");
+                "VALUES ('name', 'varchar', '', '', null, null, 2147483647L)," +
+                        "('type', 'varchar', '', '', null, null, 2147483647L)," +
+                        "('snapshot_id', 'bigint', '', '', 19L, null, null)," +
+                        "('max_reference_age_in_ms', 'bigint', '', '', 19L, null, null)," +
+                        "('min_snapshots_to_keep', 'bigint', '', '', 19L, null, null)," +
+                        "('max_snapshot_age_in_ms', 'bigint', '', '', 19L, null, null)");
         assertQuerySucceeds("SELECT * FROM test_schema.\"test_table$refs\"");
 
         // Check main branch entry
@@ -248,24 +249,40 @@ public class TestIcebergSystemTables
 
             // Query should fail because of the conflicts between session property and table property in table mode validation
             assertQueryFails(txnSession, "select * from test_schema.test_session_properties_table", "merge-on-read table mode not supported yet");
+            transactionManager.asyncAbort(txnId);
         }
         finally {
             assertUpdate("drop table if exists test_schema.test_session_properties_table");
         }
     }
 
+    protected void checkTableProperties(String schemaName, String tableName, String deleteMode, String dataWriteLocation)
+    {
+        checkTableProperties(schemaName, tableName, deleteMode, 10, ImmutableMap.of("write.data.path", dataWriteLocation));
+    }
+
     protected void checkTableProperties(String tableName, String deleteMode)
     {
-        assertQuery(String.format("SHOW COLUMNS FROM test_schema.\"%s$properties\"", tableName),
-                "VALUES ('key', 'varchar', '', '')," + "('value', 'varchar', '', '')");
-        assertQuery(String.format("SELECT COUNT(*) FROM test_schema.\"%s$properties\"", tableName), "VALUES 7");
-        List<MaterializedRow> materializedRows = computeActual(getSession(),
-                String.format("SELECT * FROM test_schema.\"%s$properties\"", tableName)).getMaterializedRows();
+        checkTableProperties("test_schema", tableName, deleteMode, 9, ImmutableMap.of());
+    }
 
-        assertThat(materializedRows).hasSize(7);
+    protected void checkTableProperties(String schemaName, String tableName, String deleteMode, int propertiesCount, Map<String, String> additionalValidateProperties)
+    {
+        assertQuery(
+                String.format("SHOW COLUMNS FROM %s.\"%s$properties\"", schemaName, tableName),
+                "VALUES " +
+                        "('key', 'varchar', '', '', null, null, 2147483647)," +
+                        "('value', 'varchar', '', '', null, null, 2147483647)");
+        assertQuery(String.format("SELECT COUNT(*) FROM %s.\"%s$properties\"", schemaName, tableName), "VALUES " + propertiesCount);
+        List<MaterializedRow> materializedRows = computeActual(getSession(),
+                String.format("SELECT * FROM %s.\"%s$properties\"", schemaName, tableName)).getMaterializedRows();
+
+        assertThat(materializedRows).hasSize(propertiesCount);
         assertThat(materializedRows)
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.delete.mode", deleteMode)))
+                .anySatisfy(row -> assertThat(row)
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.update.mode", deleteMode)))
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.format.default", "PARQUET")))
                 .anySatisfy(row -> assertThat(row)
@@ -277,21 +294,30 @@ public class TestIcebergSystemTables
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.delete-after-commit.enabled", "false")))
                 .anySatisfy(row -> assertThat(row)
-                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.metrics.max-inferred-column-defaults", "100")));
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.metrics.max-inferred-column-defaults", "100")))
+                .anySatisfy(row -> assertThat(row)
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, IcebergTableProperties.TARGET_SPLIT_SIZE, Long.toString(DataSize.valueOf("128MB").toBytes()))));
+
+        additionalValidateProperties.entrySet().stream()
+                .forEach(entry -> assertThat(materializedRows)
+                        .anySatisfy(row -> assertThat(row)
+                                .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, entry.getKey(), entry.getValue()))));
     }
 
     protected void checkORCFormatTableProperties(String tableName, String deleteMode)
     {
         assertQuery(String.format("SHOW COLUMNS FROM test_schema.\"%s$properties\"", tableName),
-                "VALUES ('key', 'varchar', '', '')," + "('value', 'varchar', '', '')");
-        assertQuery(String.format("SELECT COUNT(*) FROM test_schema.\"%s$properties\"", tableName), "VALUES 8");
+                "VALUES ('key', 'varchar', '', '', null, null, 2147483647L)," + "('value', 'varchar', '', '', null, null, 2147483647L)");
+        assertQuery(String.format("SELECT COUNT(*) FROM test_schema.\"%s$properties\"", tableName), "VALUES 10");
         List<MaterializedRow> materializedRows = computeActual(getSession(),
                 String.format("SELECT * FROM test_schema.\"%s$properties\"", tableName)).getMaterializedRows();
 
-        assertThat(materializedRows).hasSize(8);
+        assertThat(materializedRows).hasSize(10);
         assertThat(materializedRows)
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.delete.mode", deleteMode)))
+                .anySatisfy(row -> assertThat(row)
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.update.mode", deleteMode)))
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.format.default", "ORC")))
                 .anySatisfy(row -> assertThat(row)
@@ -305,7 +331,9 @@ public class TestIcebergSystemTables
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.delete-after-commit.enabled", "false")))
                 .anySatisfy(row -> assertThat(row)
-                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.metrics.max-inferred-column-defaults", "100")));
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.metrics.max-inferred-column-defaults", "100")))
+                .anySatisfy(row -> assertThat(row)
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, IcebergTableProperties.TARGET_SPLIT_SIZE, Long.toString(DataSize.valueOf("128MB").toBytes()))));
     }
 
     @Test

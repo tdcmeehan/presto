@@ -36,8 +36,7 @@ import com.facebook.presto.tracing.QueryStateTracingListener;
 import com.facebook.presto.transaction.TransactionManager;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -167,7 +166,7 @@ public class LocalDispatchQueryFactory
                 throw new PrestoException(NOT_SUPPORTED, "Unsupported statement type: " + preparedQuery.getStatementClass().getSimpleName());
             }
 
-            return queryExecutionFactory.createQueryExecution(analyzerProviderManager.getAnalyzerProvider(getAnalyzerType(session)), preparedQuery, stateMachine, slug, retryCount, warningCollector, queryType);
+            return queryExecutionFactory.createQueryExecution(analyzerProviderManager.getAnalyzerProvider(getAnalyzerType(session)), preparedQuery, stateMachine, slug, retryCount, warningCollector, queryType, accessControl, query);
         });
 
         return new LocalDispatchQuery(

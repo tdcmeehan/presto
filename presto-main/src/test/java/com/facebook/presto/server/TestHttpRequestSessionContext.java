@@ -20,6 +20,7 @@ import com.facebook.presto.spi.function.Parameter;
 import com.facebook.presto.spi.function.RoutineCharacteristics;
 import com.facebook.presto.spi.function.SqlFunctionId;
 import com.facebook.presto.spi.function.SqlInvokedFunction;
+import com.facebook.presto.spi.security.AuthorizedIdentity;
 import com.facebook.presto.spi.security.Identity;
 import com.facebook.presto.spi.security.SelectedRole;
 import com.facebook.presto.sql.parser.IdentifierSymbol;
@@ -27,10 +28,9 @@ import com.facebook.presto.sql.parser.SqlParserOptions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.ws.rs.WebApplicationException;
 import org.testng.annotations.Test;
-
-import javax.servlet.http.HttpServletRequest;
-import javax.ws.rs.WebApplicationException;
 
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
@@ -55,6 +55,7 @@ import static com.facebook.presto.client.PrestoHeaders.PRESTO_TIME_ZONE;
 import static com.facebook.presto.client.PrestoHeaders.PRESTO_USER;
 import static com.facebook.presto.common.type.StandardTypes.INTEGER;
 import static com.facebook.presto.common.type.TypeSignature.parseTypeSignature;
+import static com.facebook.presto.server.security.ServletSecurityUtils.AUTHORIZED_IDENTITY_ATTRIBUTE;
 import static com.facebook.presto.spi.function.FunctionVersion.notVersioned;
 import static com.facebook.presto.spi.function.RoutineCharacteristics.Determinism.DETERMINISTIC;
 import static com.facebook.presto.spi.function.RoutineCharacteristics.NullCallClause.RETURNS_NULL_ON_NULL_INPUT;
@@ -209,6 +210,24 @@ public class TestHttpRequestSessionContext
                         .put("test.json", "{\"a\" : \"b\", \"c\" : \"d=\"}")
                         .put("test.token.abc", "xyz")
                         .build());
+    }
+
+    @Test
+    public void testAuthorizedIdentity()
+    {
+        AuthorizedIdentity authorizedIdentity = new AuthorizedIdentity("username", "reasonForSelect", false);
+        HttpServletRequest request = new MockHttpServletRequest(
+                ImmutableListMultimap.<String, String>builder()
+                        .put(PRESTO_USER, "testUser")
+                        .put(PRESTO_SOURCE, "testSource")
+                        .put(PRESTO_CATALOG, "testCatalog")
+                        .put(PRESTO_SCHEMA, "testSchema")
+                        .build(),
+                "testRemote",
+                ImmutableMap.of(AUTHORIZED_IDENTITY_ATTRIBUTE, authorizedIdentity));
+
+        HttpRequestSessionContext context = new HttpRequestSessionContext(request, new SqlParserOptions());
+        assertEquals(context.getAuthorizedIdentity(), Optional.of(authorizedIdentity));
     }
 
     protected static String urlEncode(String value)

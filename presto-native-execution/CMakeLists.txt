@@ -24,7 +24,7 @@ execute_process(
   OUTPUT_VARIABLE SCRIPT_CXX_FLAGS
   RESULT_VARIABLE COMMAND_STATUS)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 message("Appending CMAKE_CXX_FLAGS with ${SCRIPT_CXX_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SCRIPT_CXX_FLAGS}")
@@ -32,6 +32,12 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SCRIPT_CXX_FLAGS}")
 # Known warnings that are benign can be disabled.
 set(DISABLED_WARNINGS
     "-Wno-nullability-completeness -Wno-deprecated-declarations")
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "14.0.0")
+    string(APPEND DISABLED_WARNINGS " -Wno-error=template-id-cdtor")
+  endif()
+endif()
 
 # Important warnings that must be explicitly enabled.
 set(ENABLE_WARNINGS "-Wreorder")
@@ -54,54 +60,69 @@ option(PRESTO_ENABLE_GCS "Build GCS support" OFF)
 option(PRESTO_ENABLE_ABFS "Build ABFS support" OFF)
 
 # Forwards user input to VELOX_ENABLE_PARQUET.
-option(PRESTO_ENABLE_PARQUET "Enable Parquet support" OFF)
+option(PRESTO_ENABLE_PARQUET "Enable Parquet support" ON)
+
+# Forwards user input to VELOX_ENABLE_CUDF.
+option(PRESTO_ENABLE_CUDF "Enable cuDF support" OFF)
 
 # Forwards user input to VELOX_ENABLE_REMOTE_FUNCTIONS.
 option(PRESTO_ENABLE_REMOTE_FUNCTIONS "Enable remote function support" OFF)
+
+option(PRESTO_ENABLE_EXAMPLES "Enable Presto examples" OFF)
 
 option(PRESTO_ENABLE_TESTING "Enable tests" ON)
 
 option(PRESTO_ENABLE_JWT "Enable JWT (JSON Web Token) authentication" OFF)
 
-# Set all Velox options below
-add_compile_definitions(FOLLY_HAVE_INT128_T=1)
+option(PRESTO_ENABLE_ARROW_FLIGHT_CONNECTOR "Enable Arrow Flight connector" OFF)
 
-if(PRESTO_ENABLE_S3)
-  set(VELOX_ENABLE_S3
-      ON
-      CACHE BOOL "Build S3 support")
-endif()
+option(PRESTO_ENABLE_SPATIAL "Enable spatial support" ON)
 
-if(PRESTO_ENABLE_HDFS)
-  set(VELOX_ENABLE_HDFS
-      ON
-      CACHE BOOL "Build HDFS support")
-endif()
+# Set all Velox options below and make sure that if we include folly headers or
+# other dependency headers that include folly headers we turn off the coroutines
+# and turn on int128.
+add_compile_definitions(FOLLY_HAVE_INT128_T=1 FOLLY_CFG_NO_COROUTINES)
 
-if(PRESTO_ENABLE_GCS)
-  set(VELOX_ENABLE_GCS
-      ON
-      CACHE BOOL "Build GCS support")
-endif()
+set(VELOX_ENABLE_S3
+    ${PRESTO_ENABLE_S3}
+    CACHE BOOL "Build S3 support")
 
-if(PRESTO_ENABLE_ABFS)
-  set(VELOX_ENABLE_ABFS
-      ON
-      CACHE BOOL "Build ABFS support")
-endif()
+set(VELOX_ENABLE_HDFS
+    ${PRESTO_ENABLE_HDFS}
+    CACHE BOOL "Build HDFS support")
 
-if(PRESTO_ENABLE_PARQUET)
-  set(VELOX_ENABLE_PARQUET
-      ON
-      CACHE BOOL "Enable Parquet support")
-endif()
+set(VELOX_ENABLE_GCS
+    ${PRESTO_ENABLE_GCS}
+    CACHE BOOL "Build GCS support")
 
+set(VELOX_ENABLE_ABFS
+    ${PRESTO_ENABLE_ABFS}
+    CACHE BOOL "Build ABFS support")
+
+set(VELOX_ENABLE_PARQUET
+    ${PRESTO_ENABLE_PARQUET}
+    CACHE BOOL "Enable Parquet support")
+
+set(VELOX_ENABLE_REMOTE_FUNCTIONS
+    ${PRESTO_ENABLE_REMOTE_FUNCTIONS}
+    CACHE BOOL "Enable remote function support in Velox")
 if(PRESTO_ENABLE_REMOTE_FUNCTIONS)
-  set(VELOX_ENABLE_REMOTE_FUNCTIONS
-      ON
-      CACHE BOOL "Enable remote function support in Velox")
   add_compile_definitions(PRESTO_ENABLE_REMOTE_FUNCTIONS)
 endif()
+
+set(VELOX_ENABLE_CUDF
+    ${PRESTO_ENABLE_CUDF}
+    CACHE BOOL "Enable cuDF support")
+if(PRESTO_ENABLE_CUDF)
+  add_compile_definitions(PRESTO_ENABLE_CUDF)
+  enable_language(CUDA)
+  # Determine CUDA_ARCHITECTURES automatically.
+  cmake_policy(SET CMP0104 NEW)
+endif()
+
+set(VELOX_ENABLE_GEO
+    ${PRESTO_ENABLE_SPATIAL}
+    CACHE BOOL "Enable Velox Geometry (aka spatial) support")
 
 set(VELOX_BUILD_TESTING
     OFF
@@ -120,6 +141,11 @@ set(VELOX_BUILD_TEST_UTILS
     CACHE BOOL "Enable Velox test utils")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(DEFINED ENV{INSTALL_PREFIX})
+  message(STATUS "Dependency install directory set to: $ENV{INSTALL_PREFIX}")
+  list(APPEND CMAKE_PREFIX_PATH "$ENV{INSTALL_PREFIX}")
+endif()
 
 set(Boost_USE_MULTITHREADED TRUE)
 find_package(
@@ -177,6 +203,7 @@ find_library(PROXYGEN proxygen)
 find_library(PROXYGEN_HTTP_SERVER proxygenhttpserver)
 find_library(FIZZ fizz)
 find_library(WANGLE wangle)
+find_library(MVFST_EXCEPTION mvfst_exception)
 
 find_library(RE2 re2)
 
@@ -185,9 +212,10 @@ find_package(wangle CONFIG)
 find_package(FBThrift)
 include_directories(SYSTEM ${FBTHRIFT_INCLUDE_DIR})
 
-set(PROXYGEN_LIBRARIES ${PROXYGEN_HTTP_SERVER} ${PROXYGEN} ${WANGLE} ${FIZZ})
+set(PROXYGEN_LIBRARIES ${PROXYGEN_HTTP_SERVER} ${PROXYGEN} ${WANGLE} ${FIZZ}
+                       ${MVFST_EXCEPTION})
 find_path(PROXYGEN_DIR NAMES include/proxygen)
-set(PROXYGEN_INCLUDE_DIR "${PROXYGEN_DIR}/include/proxygen")
+set(PROXYGEN_INCLUDE_DIR "${PROXYGEN_DIR}/include/")
 
 include_directories(SYSTEM ${OPENSSL_INCLUDE_DIR} ${PROXYGEN_INCLUDE_DIR})
 include_directories(.)
@@ -198,6 +226,11 @@ include_directories(${CMAKE_BINARY_DIR})
 
 # set this for backwards compatibility, will be overwritten in velox/
 set(VELOX_GTEST_INCUDE_DIR "velox/third_party/googletest/googletest/include")
+
+# Do not use the Mono library because it causes link errors.
+set(VELOX_MONO_LIBRARY
+    OFF
+    CACHE BOOL "Build Velox mono library")
 
 add_subdirectory(velox)
 
@@ -226,6 +259,13 @@ set(CMAKE_JOB_POOL_LINK presto_link_job_pool)
 # build
 if("${TREAT_WARNINGS_AS_ERRORS}")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+endif()
+
+if(DEFINED ENV{INSTALL_PREFIX})
+  # Allow installed package headers to be picked up before brew/system package
+  # headers. We set this after Velox since Velox handles INSTALL_PREFIX its own
+  # way.
+  include_directories(BEFORE "$ENV{INSTALL_PREFIX}/include")
 endif()
 
 add_subdirectory(presto_cpp)

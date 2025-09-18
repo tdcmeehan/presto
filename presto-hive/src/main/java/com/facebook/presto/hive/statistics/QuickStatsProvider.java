@@ -28,12 +28,14 @@ import com.facebook.presto.hive.HiveFileInfo;
 import com.facebook.presto.hive.NamenodeStats;
 import com.facebook.presto.hive.PartitionNameWithVersion;
 import com.facebook.presto.hive.filesystem.ExtendedFileSystem;
+import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.MetastoreContext;
 import com.facebook.presto.hive.metastore.Partition;
 import com.facebook.presto.hive.metastore.PartitionStatistics;
-import com.facebook.presto.hive.metastore.SemiTransactionalHiveMetastore;
+import com.facebook.presto.hive.metastore.StorageFormat;
 import com.facebook.presto.hive.metastore.Table;
 import com.facebook.presto.spi.ConnectorSession;
+import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.google.common.base.Stopwatch;
 import com.google.common.cache.Cache;
@@ -41,6 +43,8 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat;
+import org.apache.hadoop.mapred.InputFormat;
 import org.weakref.jmx.Managed;
 import org.weakref.jmx.Nested;
 
@@ -61,8 +65,10 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static com.facebook.airlift.concurrent.Threads.daemonThreadsNamed;
+import static com.facebook.presto.hive.HiveErrorCode.HIVE_BAD_DATA;
 import static com.facebook.presto.hive.HivePartition.UNPARTITIONED_ID;
 import static com.facebook.presto.hive.HiveSessionProperties.getQuickStatsBackgroundBuildTimeout;
 import static com.facebook.presto.hive.HiveSessionProperties.getQuickStatsInlineBuildTimeout;
@@ -70,6 +76,9 @@ import static com.facebook.presto.hive.HiveSessionProperties.isQuickStatsEnabled
 import static com.facebook.presto.hive.HiveSessionProperties.isSkipEmptyFilesEnabled;
 import static com.facebook.presto.hive.HiveSessionProperties.isUseListDirectoryCache;
 import static com.facebook.presto.hive.HiveUtil.buildDirectoryContextProperties;
+import static com.facebook.presto.hive.HiveUtil.getInputFormat;
+import static com.facebook.presto.hive.HiveUtil.getTargetPathsHiveFileInfos;
+import static com.facebook.presto.hive.HiveUtil.readSymlinkPaths;
 import static com.facebook.presto.hive.NestedDirectoryPolicy.IGNORED;
 import static com.facebook.presto.hive.NestedDirectoryPolicy.RECURSE;
 import static com.facebook.presto.hive.metastore.PartitionStatistics.empty;
@@ -101,10 +110,16 @@ public class QuickStatsProvider
     private final Cache<String, PartitionStatistics> partitionToStatsCache;
     private final NamenodeStats nameNodeStats;
     private final TimeStat buildDuration = new TimeStat(MILLISECONDS);
+    private final ExtendedHiveMetastore metastore;
 
-    public QuickStatsProvider(HdfsEnvironment hdfsEnvironment, DirectoryLister directoryLister, HiveClientConfig hiveClientConfig, NamenodeStats nameNodeStats,
+    public QuickStatsProvider(ExtendedHiveMetastore metastore,
+            HdfsEnvironment hdfsEnvironment,
+            DirectoryLister directoryLister,
+            HiveClientConfig hiveClientConfig,
+            NamenodeStats nameNodeStats,
             List<QuickStatsBuilder> statsBuilderStrategies)
     {
+        this.metastore = metastore;
         this.hdfsEnvironment = hdfsEnvironment;
         this.directoryLister = directoryLister;
         this.recursiveDirWalkerEnabled = hiveClientConfig.getRecursiveDirWalkerEnabled();
@@ -151,7 +166,7 @@ public class QuickStatsProvider
         return inProgressBuilds.entrySet().stream().collect(toImmutableMap(Map.Entry::getKey, v -> v.getValue().getBuildStart()));
     }
 
-    public Map<String, PartitionStatistics> getQuickStats(ConnectorSession session, SemiTransactionalHiveMetastore metastore, SchemaTableName table,
+    public Map<String, PartitionStatistics> getQuickStats(ConnectorSession session, SchemaTableName table,
             MetastoreContext metastoreContext, List<String> partitionIds)
     {
         if (!isQuickStatsEnabled(session)) {
@@ -161,7 +176,7 @@ public class QuickStatsProvider
         CompletableFuture<PartitionStatistics>[] partitionQuickStatCompletableFutures = new CompletableFuture[partitionIds.size()];
         for (int counter = 0; counter < partitionIds.size(); counter++) {
             String partitionId = partitionIds.get(counter);
-            partitionQuickStatCompletableFutures[counter] = supplyAsync(() -> getQuickStats(session, metastore, table, metastoreContext, partitionId), backgroundFetchExecutor);
+            partitionQuickStatCompletableFutures[counter] = supplyAsync(() -> getQuickStats(session, table, metastoreContext, partitionId), backgroundFetchExecutor);
         }
 
         try {
@@ -203,7 +218,7 @@ public class QuickStatsProvider
         return result.build();
     }
 
-    public PartitionStatistics getQuickStats(ConnectorSession session, SemiTransactionalHiveMetastore metastore, SchemaTableName table,
+    public PartitionStatistics getQuickStats(ConnectorSession session, SchemaTableName table,
             MetastoreContext metastoreContext, String partitionId)
     {
         if (!isQuickStatsEnabled(session)) {
@@ -236,7 +251,7 @@ public class QuickStatsProvider
         // If not, atomically initiate a call to build quick stats in a background thread
         AtomicReference<CompletableFuture<PartitionStatistics>> partitionStatisticsCompletableFuture = new AtomicReference<>();
         inProgressBuilds.computeIfAbsent(partitionKey, (key) -> {
-            CompletableFuture<PartitionStatistics> fetchFuture = supplyAsync(() -> buildQuickStats(partitionKey, partitionId, session, metastore, table, metastoreContext), backgroundFetchExecutor);
+            CompletableFuture<PartitionStatistics> fetchFuture = supplyAsync(() -> buildQuickStats(partitionKey, partitionId, session, table, metastoreContext), backgroundFetchExecutor);
             partitionStatisticsCompletableFuture.set(fetchFuture);
 
             return new InProgressBuildInfo(fetchFuture, Instant.now());
@@ -282,7 +297,7 @@ public class QuickStatsProvider
         else {
             // The quick stats inline fetch was pre-empted by another thread
             // We get the up-to-date value by calling getQuickStats again
-            return getQuickStats(session, metastore, table, metastoreContext, partitionId);
+            return getQuickStats(session, table, metastoreContext, partitionId);
         }
     }
 
@@ -311,21 +326,24 @@ public class QuickStatsProvider
         return getQuickStatsInlineBuildTimeout(session).toMillis();
     }
 
-    private PartitionStatistics buildQuickStats(String partitionKey, String partitionId, ConnectorSession session, SemiTransactionalHiveMetastore metastore, SchemaTableName table,
+    private PartitionStatistics buildQuickStats(String partitionKey, String partitionId, ConnectorSession session, SchemaTableName table,
             MetastoreContext metastoreContext)
     {
         Table resolvedTable = metastore.getTable(metastoreContext, table.getSchemaName(), table.getTableName()).get();
         Optional<Partition> partition;
         Path path;
+        StorageFormat storageFormat;
         if (UNPARTITIONED_ID.getPartitionName().equals(partitionId)) {
             partition = Optional.empty();
             path = new Path(resolvedTable.getStorage().getLocation());
+            storageFormat = resolvedTable.getStorage().getStorageFormat();
         }
         else {
             partition = metastore.getPartitionsByNames(metastoreContext, table.getSchemaName(), table.getTableName(),
                     ImmutableList.of(new PartitionNameWithVersion(partitionId, Optional.empty()))).get(partitionId);
             checkState(partition.isPresent(), "getPartitionsByNames returned no partitions for partition with name [%s]", partitionId);
             path = new Path(partition.get().getStorage().getLocation());
+            storageFormat = partition.get().getStorage().getStorageFormat();
         }
 
         HdfsContext hdfsContext = new HdfsContext(session, table.getSchemaName(), table.getTableName(), partitionId, false);
@@ -340,6 +358,37 @@ public class QuickStatsProvider
         }
 
         Iterator<HiveFileInfo> fileList = directoryLister.list(fs, resolvedTable, path, partition, nameNodeStats, hiveDirectoryContext);
+
+        InputFormat<?, ?> inputFormat = getInputFormat(hdfsEnvironment.getConfiguration(hdfsContext, path), storageFormat.getInputFormat(), storageFormat.getSerDe(), false);
+        if (inputFormat instanceof SymlinkTextInputFormat) {
+            // For symlinks, follow the paths in the manifest file and create a new iterator of the target files
+            try {
+                List<Path> targetPaths = readSymlinkPaths(fs, fileList);
+
+                Map<Path, List<Path>> parentToTargets = targetPaths.stream().collect(Collectors.groupingBy(Path::getParent));
+
+                ImmutableList.Builder<HiveFileInfo> targetFileInfoList = ImmutableList.builder();
+
+                for (Map.Entry<Path, List<Path>> entry : parentToTargets.entrySet()) {
+                    targetFileInfoList.addAll(getTargetPathsHiveFileInfos(
+                            path,
+                            partition,
+                            entry.getKey(),
+                            entry.getValue(),
+                            hiveDirectoryContext,
+                            fs,
+                            directoryLister,
+                            resolvedTable,
+                            nameNodeStats,
+                            session));
+                }
+
+                fileList = targetFileInfoList.build().iterator();
+            }
+            catch (IOException e) {
+                throw new PrestoException(HIVE_BAD_DATA, "Error parsing symlinks", e);
+            }
+        }
 
         PartitionQuickStats partitionQuickStats = PartitionQuickStats.EMPTY;
         Stopwatch buildStopwatch = Stopwatch.createStarted();

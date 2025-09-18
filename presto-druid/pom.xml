@@ -4,16 +4,19 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.290-SNAPSHOT</version>
+        <version>0.295-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-druid</artifactId>
+    <name>presto-druid</name>
     <description>Presto - Druid Connector</description>
     <packaging>presto-plugin</packaging>
 
     <properties>
         <air.main.basedir>${project.parent.basedir}</air.main.basedir>
-        <dep.log4j.version>2.17.1</dep.log4j.version>
+        <dep.log4j.version>2.24.3</dep.log4j.version>
+        <project.build.targetJdk>17</project.build.targetJdk>
+        <air.check.skip-modernizer>true</air.check.skip-modernizer>
     </properties>
 
     <repositories>
@@ -25,6 +28,21 @@
             </snapshots>
         </repository>
     </repositories>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.hibernate</groupId>
+                <artifactId>hibernate-validator</artifactId>
+                <version>7.0.5.Final</version>
+            </dependency>
+            <dependency>
+                <groupId>org.glassfish</groupId>
+                <artifactId>jakarta.el</artifactId>
+                <version>4.0.1</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <dependency>
@@ -99,80 +117,41 @@
                     <groupId>commons-lang</groupId>
                     <artifactId>commons-lang</artifactId>
                 </exclusion>
-            </exclusions>
-        </dependency>
-
-        <dependency>
-            <groupId>org.apache.druid</groupId>
-            <artifactId>druid-core</artifactId>
-            <exclusions>
                 <exclusion>
-                    <groupId>io.netty</groupId>
-                    <artifactId>*</artifactId>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-api</artifactId>
                 </exclusion>
                 <exclusion>
-                    <groupId>com.fasterxml.jackson.core</groupId>
-                    <artifactId>jackson-annotations</artifactId>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-core</artifactId>
                 </exclusion>
                 <exclusion>
-                    <groupId>com.fasterxml.jackson.core</groupId>
-                    <artifactId>jackson-core</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>com.fasterxml.jackson.core</groupId>
-                    <artifactId>jackson-databind</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>com.fasterxml.jackson.datatype</groupId>
-                    <artifactId>jackson-datatype-guava</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>com.fasterxml.jackson.datatype</groupId>
-                    <artifactId>jackson-datatype-joda</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>com.fasterxml.jackson.dataformat</groupId>
-                    <artifactId>jackson-dataformat-smile</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>javax.activation</groupId>
-                    <artifactId>javax.activation-api</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>joda-time</groupId>
-                    <artifactId>joda-time</artifactId>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-jul</artifactId>
                 </exclusion>
                 <exclusion>
                     <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-api</artifactId>
+                    <artifactId>jcl-over-slf4j</artifactId>
                 </exclusion>
                 <exclusion>
-                    <groupId>org.glassfish</groupId>
-                    <artifactId>javax.el</artifactId>
+                    <groupId>jakarta.inject</groupId>
+                    <artifactId>jakarta.inject-api</artifactId>
                 </exclusion>
                 <exclusion>
-                    <groupId>org.jruby.jcodings</groupId>
-                    <artifactId>jcodings</artifactId>
+                    <groupId>jakarta.validation</groupId>
+                    <artifactId>jakarta.validation-api</artifactId>
                 </exclusion>
                 <exclusion>
-                    <groupId>com.google.errorprone</groupId>
-                    <artifactId>error_prone_annotations</artifactId>
+                    <groupId>javax.el</groupId>
+                    <artifactId>javax.el-api</artifactId>
                 </exclusion>
                 <exclusion>
-                    <groupId>org.ow2.asm</groupId>
-                    <artifactId>asm</artifactId>
+                    <groupId>it.unimi.dsi</groupId>
+                    <artifactId>fastutil-core</artifactId>
                 </exclusion>
                 <exclusion>
-                    <groupId>org.apache.maven</groupId>
-                    <artifactId>maven-artifact</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>commons-io</groupId>
-                    <artifactId>commons-io</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>commons-lang</groupId>
-                    <artifactId>commons-lang</artifactId>
+                    <groupId>com.google.inject.extensions</groupId>
+                    <artifactId>guice-multibindings</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>
@@ -213,8 +192,8 @@
         </dependency>
 
         <dependency>
-            <groupId>com.google.code.findbugs</groupId>
-            <artifactId>jsr305</artifactId>
+            <groupId>jakarta.annotation</groupId>
+            <artifactId>jakarta.annotation-api</artifactId>
             <optional>true</optional>
         </dependency>
 
@@ -251,8 +230,13 @@
         </dependency>
 
         <dependency>
-            <groupId>javax.validation</groupId>
-            <artifactId>validation-api</artifactId>
+            <groupId>jakarta.inject</groupId>
+            <artifactId>jakarta.inject-api</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>jakarta.validation</groupId>
+            <artifactId>jakarta.validation-api</artifactId>
         </dependency>
 
         <dependency>
@@ -262,7 +246,7 @@
 
         <dependency>
             <groupId>com.facebook.presto.hadoop</groupId>
-            <artifactId>hadoop-apache2</artifactId>
+            <artifactId>hadoop-apache</artifactId>
         </dependency>
 
         <dependency>
@@ -289,7 +273,7 @@
         </dependency>
 
         <dependency>
-            <groupId>com.facebook.drift</groupId>
+            <groupId>com.facebook.airlift.drift</groupId>
             <artifactId>drift-api</artifactId>
             <scope>provided</scope>
         </dependency>
@@ -306,7 +290,7 @@
         </dependency>
 
         <dependency>
-            <groupId>io.airlift</groupId>
+            <groupId>com.facebook.airlift</groupId>
             <artifactId>units</artifactId>
             <scope>provided</scope>
         </dependency>
@@ -350,13 +334,19 @@
 
         <dependency>
             <groupId>com.facebook.presto</groupId>
-            <artifactId>presto-main</artifactId>
+            <artifactId>presto-main-base</artifactId>
             <scope>test</scope>
         </dependency>
 
         <dependency>
             <groupId>com.facebook.presto</groupId>
             <artifactId>presto-main</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.presto</groupId>
+            <artifactId>presto-main-base</artifactId>
             <type>test-jar</type>
             <scope>test</scope>
         </dependency>
@@ -373,4 +363,19 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <configuration>
+                    <ignoredNonTestScopedDependencies>
+                        <ignoredNonTestScopedDependency>com.fasterxml.jackson.core:jackson-databind</ignoredNonTestScopedDependency>
+                        <ignoredNonTestScopedDependency>javax.inject:javax.inject</ignoredNonTestScopedDependency>
+                    </ignoredNonTestScopedDependencies>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

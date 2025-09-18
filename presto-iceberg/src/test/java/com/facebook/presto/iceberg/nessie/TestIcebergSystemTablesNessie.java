@@ -13,9 +13,11 @@
  */
 package com.facebook.presto.iceberg.nessie;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.Session;
 import com.facebook.presto.iceberg.IcebergConfig;
 import com.facebook.presto.iceberg.IcebergPlugin;
+import com.facebook.presto.iceberg.IcebergTableProperties;
 import com.facebook.presto.iceberg.TestIcebergSystemTables;
 import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.testing.MaterializedRow;
@@ -30,6 +32,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
+import static com.facebook.presto.iceberg.CatalogType.NESSIE;
 import static com.facebook.presto.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
 import static com.facebook.presto.iceberg.IcebergQueryRunner.getIcebergDataDirectoryPath;
 import static com.facebook.presto.iceberg.nessie.NessieTestUtil.nessieConnectorProperties;
@@ -68,6 +71,7 @@ public class TestIcebergSystemTablesNessie
         Session session = testSessionBuilder()
                 .setCatalog(ICEBERG_CATALOG)
                 .build();
+
         DistributedQueryRunner queryRunner = DistributedQueryRunner.builder(session).build();
 
         Path dataDirectory = queryRunner.getCoordinator().getDataDirectory();
@@ -75,6 +79,7 @@ public class TestIcebergSystemTablesNessie
 
         queryRunner.installPlugin(new IcebergPlugin());
         Map<String, String> icebergProperties = ImmutableMap.<String, String>builder()
+                .put("iceberg.catalog.type", String.valueOf(NESSIE))
                 .putAll(nessieConnectorProperties(nessieContainer.getRestApiUri()))
                 .put("iceberg.catalog.warehouse", catalogDirectory.getParent().toFile().toURI().toString())
                 .build();
@@ -88,12 +93,14 @@ public class TestIcebergSystemTablesNessie
     protected void checkTableProperties(String tableName, String deleteMode)
     {
         assertQuery(String.format("SHOW COLUMNS FROM test_schema.\"%s$properties\"", tableName),
-                "VALUES ('key', 'varchar', '', '')," + "('value', 'varchar', '', '')");
-        assertQuery(String.format("SELECT COUNT(*) FROM test_schema.\"%s$properties\"", tableName), "VALUES 9");
+                "VALUES " +
+                        "('key', 'varchar', '', '', null, null, 2147483647)," +
+                        "('value', 'varchar', '', '', null, null, 2147483647)");
+        assertQuery(String.format("SELECT COUNT(*) FROM test_schema.\"%s$properties\"", tableName), "VALUES 11");
         List<MaterializedRow> materializedRows = computeActual(getSession(),
                 String.format("SELECT * FROM test_schema.\"%s$properties\"", tableName)).getMaterializedRows();
 
-        assertThat(materializedRows).hasSize(9);
+        assertThat(materializedRows).hasSize(11);
         assertThat(materializedRows)
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.delete.mode", deleteMode)))
@@ -110,19 +117,24 @@ public class TestIcebergSystemTablesNessie
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.previous-versions-max", "100")))
                 .anySatisfy(row -> assertThat(row)
-                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.metrics.max-inferred-column-defaults", "100")));
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.metadata.metrics.max-inferred-column-defaults", "100")))
+                .anySatisfy(row -> assertThat(row)
+                        .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, IcebergTableProperties.TARGET_SPLIT_SIZE, Long.toString(DataSize.valueOf("128MB").toBytes()))));
     }
 
     @Override
     protected void checkORCFormatTableProperties(String tableName, String deleteMode)
     {
         assertQuery(String.format("SHOW COLUMNS FROM test_schema.\"%s$properties\"", tableName),
-                "VALUES ('key', 'varchar', '', '')," + "('value', 'varchar', '', '')");
-        assertQuery(String.format("SELECT COUNT(*) FROM test_schema.\"%s$properties\"", tableName), "VALUES 10");
+                "VALUES " +
+                        "('key', 'varchar', '', '', null, null, 2147483647)," +
+                        "('value', 'varchar', '', '', null, null, 2147483647)");
+
+        assertQuery(String.format("SELECT COUNT(*) FROM test_schema.\"%s$properties\"", tableName), "VALUES 12");
         List<MaterializedRow> materializedRows = computeActual(getSession(),
                 String.format("SELECT * FROM test_schema.\"%s$properties\"", tableName)).getMaterializedRows();
 
-        assertThat(materializedRows).hasSize(10);
+        assertThat(materializedRows).hasSize(12);
         assertThat(materializedRows)
                 .anySatisfy(row -> assertThat(row)
                         .isEqualTo(new MaterializedRow(MaterializedResult.DEFAULT_PRECISION, "write.delete.mode", deleteMode)))

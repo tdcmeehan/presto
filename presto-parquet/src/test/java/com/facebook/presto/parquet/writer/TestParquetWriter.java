@@ -13,18 +13,23 @@
  */
 package com.facebook.presto.parquet.writer;
 
+import com.facebook.airlift.units.DataSize;
 import com.facebook.presto.common.PageBuilder;
+import com.facebook.presto.common.block.Block;
 import com.facebook.presto.common.type.DecimalType;
 import com.facebook.presto.common.type.MapType;
 import com.facebook.presto.common.type.RowType;
 import com.facebook.presto.common.type.TimestampType;
 import com.facebook.presto.common.type.Type;
+import com.facebook.presto.parquet.Field;
 import com.facebook.presto.parquet.FileParquetDataSource;
 import com.facebook.presto.parquet.cache.MetadataReader;
+import com.facebook.presto.parquet.reader.ParquetReader;
 import com.google.common.collect.ImmutableList;
-import io.airlift.units.DataSize;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.io.ColumnIOConverter;
+import org.apache.parquet.io.MessageColumnIO;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
@@ -39,6 +44,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Random;
 
+import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.common.block.MethodHandleUtil.nativeValueGetter;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
@@ -48,7 +54,10 @@ import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.common.type.SmallintType.SMALLINT;
 import static com.facebook.presto.common.type.TimestampType.TIMESTAMP;
 import static com.facebook.presto.common.type.TinyintType.TINYINT;
+import static com.facebook.presto.common.type.UuidType.UUID;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
+import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
+import static com.facebook.presto.parquet.ParquetTypeUtils.getColumnIO;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.io.Files.createTempDir;
 import static com.google.common.io.MoreFiles.deleteRecursively;
@@ -76,6 +85,65 @@ public class TestParquetWriter
             nativeValueGetter(VARCHAR),
             nativeValueGetter(VARCHAR));
     private static final Type ROW = RowType.from(ImmutableList.of(RowType.field("varchar", VARCHAR)));
+
+    @Test
+    public void testWriteAllNullDataPageAfterRowGroupFlush()
+    {
+        temporaryDirectory = createTempDir();
+        parquetFile = new File(temporaryDirectory, randomUUID().toString());
+        List<Type> types = ImmutableList.of(INTEGER, INTEGER);
+        List<String> names = ImmutableList.of("col_1", "col_2");
+        ParquetWriterOptions parquetWriterOptions = ParquetWriterOptions.builder()
+                .setMaxPageSize(DataSize.succinctBytes(64))
+                .setMaxBlockSize(DataSize.succinctBytes(150))
+                .setMaxDictionaryPageSize(DataSize.succinctBytes(100))
+                .build();
+        int rowCount = 20;
+        int newRowCount = 10;
+        try (ParquetWriter parquetWriter = createParquetWriter(parquetFile, types, names, parquetWriterOptions, CompressionCodecName.UNCOMPRESSED)) {
+            for (int i = 0; i < 2; i++) {
+                PageBuilder pageBuilder = new PageBuilder(rowCount, types);
+                for (int rowIdx = 0; rowIdx < rowCount; rowIdx++) {
+                    // maintain col_1's dictionary size approximately half of raw data
+                    INTEGER.writeLong(pageBuilder.getBlockBuilder(0), rowIdx / 2);
+                    INTEGER.writeLong(pageBuilder.getBlockBuilder(1), rowIdx);
+                    pageBuilder.declarePosition();
+                }
+                parquetWriter.write(pageBuilder.build());
+            }
+
+            PageBuilder pageBuilder = new PageBuilder(newRowCount, types);
+            for (int rowIdx = 0; rowIdx < newRowCount; rowIdx++) {
+                pageBuilder.getBlockBuilder(0).appendNull();
+                INTEGER.writeLong(pageBuilder.getBlockBuilder(1), rowIdx);
+                pageBuilder.declarePosition();
+            }
+            parquetWriter.write(pageBuilder.build());
+            parquetWriter.close();
+
+            FileParquetDataSource dataSource = new FileParquetDataSource(parquetFile);
+            ParquetMetadata parquetMetadata = MetadataReader.readFooter(dataSource, parquetFile.length(), Optional.empty(), false).getParquetMetadata();
+            MessageType schema = parquetMetadata.getFileMetaData().getSchema();
+            MessageColumnIO messageColumnIO = getColumnIO(schema, schema);
+
+            Field field = ColumnIOConverter.constructField(INTEGER, messageColumnIO.getChild(0)).get();
+            ParquetReader parquetReader = new ParquetReader(messageColumnIO, parquetMetadata.getBlocks(), Optional.empty(), dataSource, newSimpleAggregatedMemoryContext(), new DataSize(16, MEGABYTE), false, false, null, null, false, Optional.empty());
+
+            int batchCount = Integer.MAX_VALUE;
+            int totalCount = 0;
+            while (batchCount > 0) {
+                batchCount = parquetReader.nextBatch();
+                if (batchCount > 0) {
+                    Block block = parquetReader.readBlock(field);
+                    totalCount += block.getPositionCount();
+                }
+            }
+            assertEquals(totalCount, 2 * rowCount + newRowCount);
+        }
+        catch (Exception e) {
+            fail("Should not fail, but throw an exception as follows:", e);
+        }
+    }
 
     @Test
     public void testRowGroupFlushInterleavedColumnWriterFallbacks()
@@ -127,6 +195,7 @@ public class TestParquetWriter
                 {DATE, LogicalTypeAnnotation.DateLogicalTypeAnnotation.class, "INT32"},
                 {TIMESTAMP, LogicalTypeAnnotation.TimestampLogicalTypeAnnotation.class, "INT64"},
                 {MAP, LogicalTypeAnnotation.MapLogicalTypeAnnotation.class, null},
+                {UUID, LogicalTypeAnnotation.UUIDLogicalTypeAnnotation.class, "FIXED_LEN_BYTE_ARRAY"},
                 {ROW, null, null}
         };
     }

@@ -29,8 +29,7 @@ import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.Statement;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
@@ -164,6 +163,11 @@ public class BuiltInQueryPreparer
         public boolean isTransactionControlStatement()
         {
             return StatementUtils.isTransactionControlStatement(getStatement());
+        }
+
+        public boolean isRollbackStatement()
+        {
+            return StatementUtils.isRollbackStatement(getStatement());
         }
 
         @Override

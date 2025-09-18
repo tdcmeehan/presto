@@ -38,8 +38,7 @@ import com.facebook.presto.spi.statistics.ComputedStatistics;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.slice.Slice;
-
-import javax.inject.Inject;
+import jakarta.inject.Inject;
 
 import java.util.Collection;
 import java.util.List;
@@ -86,11 +85,15 @@ public class DruidMetadata
     }
 
     @Override
-    public List<ConnectorTableLayoutResult> getTableLayouts(ConnectorSession session, ConnectorTableHandle table, Constraint<ColumnHandle> constraint, Optional<Set<ColumnHandle>> desiredColumns)
+    public ConnectorTableLayoutResult getTableLayoutForConstraint(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            Constraint<ColumnHandle> constraint,
+            Optional<Set<ColumnHandle>> desiredColumns)
     {
         DruidTableHandle handle = (DruidTableHandle) table;
         ConnectorTableLayout layout = new ConnectorTableLayout(new DruidTableLayoutHandle(handle, constraint.getSummary()));
-        return ImmutableList.of(new ConnectorTableLayoutResult(layout, constraint.getSummary()));
+        return new ConnectorTableLayoutResult(layout, constraint.getSummary());
     }
 
     @Override
@@ -104,7 +107,7 @@ public class DruidMetadata
     {
         DruidTableHandle druidTable = (DruidTableHandle) tableHandle;
         List<ColumnMetadata> columns = druidClient.getColumnDataType(druidTable.getTableName()).stream()
-                .map(column -> toColumnMetadata(column))
+                .map(column -> toColumnMetadata(session, column))
                 .collect(toImmutableList());
 
         return new ConnectorTableMetadata(druidTable.toSchemaTableName(), columns);
@@ -193,14 +196,17 @@ public class DruidMetadata
     private List<SchemaTableName> listTables(ConnectorSession session, SchemaTablePrefix prefix)
     {
         if (prefix.getTableName() == null) {
-            return listTables(session, Optional.of(prefix.getSchemaName()));
+            return listTables(session, Optional.ofNullable(prefix.getSchemaName()));
         }
         return ImmutableList.of(prefix.toSchemaTableName());
     }
 
-    private static ColumnMetadata toColumnMetadata(DruidColumnInfo column)
+    private ColumnMetadata toColumnMetadata(ConnectorSession session, DruidColumnInfo column)
     {
-        return new ColumnMetadata(column.getColumnName(), column.getDataType().getPrestoType());
+        return ColumnMetadata.builder()
+                .setName(normalizeIdentifier(session, column.getColumnName()))
+                .setType(column.getDataType().getPrestoType())
+                .build();
     }
 
     private static ColumnHandle toColumnHandle(DruidColumnInfo column)

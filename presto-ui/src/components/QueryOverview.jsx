@@ -58,6 +58,14 @@ type TaskStats = {
     blockedDrivers: number;
     totalDrivers: number;
     completedDrivers: number;
+    queuedNewDrivers: number;
+    runningNewDrivers: number;
+    totalNewDrivers: number;
+    completedNewDrivers: number;
+    queuedSplits: number;
+    runningSplits: number;
+    totalSplits: number;
+    completedSplits: number;
     rawInputPositions: number;
     rawInputDataSizeInBytes: number;
     totalScheduledTimeInNanos: number;
@@ -153,6 +161,7 @@ type ResourceEstimates = {
     cpuTime?: string;
     peakMemory?: string;
     peakTaskMemory?: string;
+    [key: string]: string;
 }
 
 type SessionRepresentation = {
@@ -267,7 +276,7 @@ function TaskList({ tasks }: { tasks: Task[] }) : React.Node {
     if (tasks === undefined || tasks.length === 0) {
         return (
             <div className="row error-message">
-                <div className="col-xs-12"><h4>No threads in the selected group</h4></div>
+                <div className="col-12"><h4>No threads in the selected group</h4></div>
             </div>);
     }
 
@@ -285,15 +294,19 @@ function TaskList({ tasks }: { tasks: Task[] }) : React.Node {
             style: {
                 padding: '2px', // override the cell padding for head cells
                 fontSize: '15px',
+                overflowX: 'auto', // Enables horizontal scrolling
             },
         },
         cells: {
             style: {
                 padding: '2px', // override the cell padding for data cells
                 fontSize: '15px',
+                overflowX: 'auto', // Enables horizontal scrolling
             },
         },
     };
+
+    const hasSplitStats = tasks.some(task => task.stats.completedSplits !== undefined);
 
     const columns = [
         {
@@ -322,43 +335,110 @@ function TaskList({ tasks }: { tasks: Task[] }) : React.Node {
             sortable: true,
             minWidth: '80px',
         },
-        {
-            name: (<span className="glyphicon glyphicon-pause" style={GLYPHICON_HIGHLIGHT}
-                data-toggle="tooltip" data-placement="top"
-                title="Pending splits" />),
-            selector: (row: Task) => row.stats.queuedDrivers,
-            sortable: true,
-            maxWidth: '50px',
-            minWidth: '40px',
-        },
-        {
-            name: (<span className="glyphicon glyphicon-play" style={GLYPHICON_HIGHLIGHT}
-                data-toggle="tooltip" data-placement="top"
-                title="Running splits" />),
-            selector: (row: Task) => row.stats.runningDrivers,
-            sortable: true,
-            maxWidth: '50px',
-            minWidth: '40px',
-        },
-        {
-            name: (<span className="glyphicon glyphicon-bookmark"
-                style={GLYPHICON_HIGHLIGHT} data-toggle="tooltip"
-                data-placement="top"
-                title="Blocked splits" />),
-            selector: (row: Task) => row.stats.blockedDrivers,
-            sortable: true,
-            maxWidth: '50px',
-            minWidth: '40px',
-        },
-        {
-            name: (<span className="glyphicon glyphicon-ok" style={GLYPHICON_HIGHLIGHT}
-                data-toggle="tooltip" data-placement="top"
-                title="Completed splits" />),
-            selector: (row: Task) => row.stats.completedDrivers,
-            sortable: true,
-            maxWidth: '50px',
-            minWidth: '40px',
-        },
+        ...(hasSplitStats ? [
+            {
+                name: (<span className="bi bi-pause-circle-fill" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-bs-placement="top"
+                             title="Pending drivers" />),
+                selector: (row: Task) => row.stats.queuedNewDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-play-circle-fill" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-bs-placement="top"
+                             title="Running drivers" />),
+                selector: (row: Task) => row.stats.runningNewDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-stop-circle-fill"
+                             style={GLYPHICON_HIGHLIGHT} data-bs-toggle="tooltip"
+                             data-bs-placement="top"
+                             title="Blocked drivers" />),
+                selector: (row: Task) => row.stats.blockedDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-check-circle-fill" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-bs-placement="top"
+                             title="Completed drivers" />),
+                selector: (row: Task) => row.stats.completedNewDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-pause-circle" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-bs-placement="top"
+                             title="Pending splits"/>),
+                selector: (row: Task) => row.stats.queuedSplits,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-play-circle" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-bs-placement="top"
+                             title="Running splits"/>),
+                selector: (row: Task) => row.stats.runningSplits,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-check-circle" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-bs-placement="top"
+                             title="Completed splits"/>),
+                selector: (row: Task) => row.stats.completedSplits,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            }
+        ] : [
+            {
+                name: (<span className="bi bi-pause-circle-fill" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-placement="top"
+                             title="Pending splits" />),
+                selector: (row: Task) => row.stats.queuedDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-play-circle-fill" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-placement="top"
+                             title="Running splits" />),
+                selector: (row: Task) => row.stats.runningDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-bookmark-check-fill"
+                             style={GLYPHICON_HIGHLIGHT} data-bs-toggle="tooltip"
+                             data-placement="top"
+                             title="Blocked splits" />),
+                selector: (row: Task) => row.stats.blockedDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            },
+            {
+                name: (<span className="bi bi-check-lg" style={GLYPHICON_HIGHLIGHT}
+                             data-bs-toggle="tooltip" data-placement="top"
+                             title="Completed splits" />),
+                selector: (row: Task) => row.stats.completedDrivers,
+                sortable: true,
+                maxWidth: '50px',
+                minWidth: '40px',
+            }
+        ]),
         {
             name: 'Rows',
             selector: (row: Task) => row.stats.rawInputPositions,
@@ -449,7 +529,7 @@ function RuntimeStatsList({ stats }: { stats: RuntimeStats }): React.Node {
 
 
     const getExpandedIcon = () => {
-        return state.expanded ? "glyphicon-chevron-up" : "glyphicon-chevron-down";
+        return state.expanded ? "bi bi-chevron-up" : "bi bi-chevron-down";
     };
 
     const getExpandedStyle = () => {
@@ -483,7 +563,7 @@ function RuntimeStatsList({ stats }: { stats: RuntimeStats }): React.Node {
                     <th className="info-text">Max</th>
                     <th className="expand-charts-container">
                         <a onClick={toggleExpanded} className="expand-stats-button">
-                            <span className={"glyphicon " + getExpandedIcon()} style={GLYPHICON_HIGHLIGHT} data-toggle="tooltip" data-placement="top" title="Show metrics" />
+                            <span className={"bi " + getExpandedIcon()} style={GLYPHICON_HIGHLIGHT} data-bs-toggle="tooltip" data-placement="top" title="Show metrics" />
                         </a>
                     </th>
                 </tr>
@@ -511,7 +591,7 @@ function StageSummary({ index, prestoStage }: { index: number, prestoStage: Outp
     const [state, setState] = useState({ expanded: false, taskFilter: TASK_FILTER.ALL });
 
     const getExpandedIcon = () => {
-        return state.expanded ? "glyphicon-chevron-up" : "glyphicon-chevron-down";
+        return state.expanded ? "bi bi-chevron-up" : "bi bi-chevron-down";
     };
 
     const getExpandedStyle = () => {
@@ -553,7 +633,7 @@ function StageSummary({ index, prestoStage }: { index: number, prestoStage: Outp
 
     const renderTaskFilterListItem = (taskFilter: TaskFilter) => {
         return (
-            <li><a href="#" className={state.taskFilter === taskFilter ? "selected" : ""}
+            <li><a href="#" className={`dropdown-item text-dark ${state.taskFilter === taskFilter ? "selected" : ""}`}
                 onClick={(event) => handleTaskFilterClick(taskFilter, event)}>{taskFilter.text}</a></li>
         );
     }
@@ -561,21 +641,21 @@ function StageSummary({ index, prestoStage }: { index: number, prestoStage: Outp
     const renderTaskFilter = () => {
         return (
             <div className="row" key={index}>
-                <div className="col-xs-6">
+                <div className="col-6">
                     <h3>Tasks</h3>
                 </div>
-                <div className="col-xs-6">
+                <div className="col-6">
                     <table className="header-inline-links">
                         <tbody>
                             <tr>
                                 <td>
-                                    <div className="input-group-btn text-right">
-                                        <button type="button" className="btn btn-default dropdown-toggle pull-right text-right"
-                                            data-toggle="dropdown" aria-haspopup="true"
+                                    <div className="btn-group text-right">
+                                        <button type="button" className="btn dropdown-toggle bg-white text-dark float-end text-right rounded-0"
+                                            data-bs-toggle="dropdown" aria-haspopup="true"
                                             aria-expanded="false">
                                             Show: {state.taskFilter.text} <span className="caret" />
                                         </button>
-                                        <ul className="dropdown-menu">
+                                        <ul className="dropdown-menu bg-white text-dark rounded-0">
                                             {renderTaskFilterListItem(TASK_FILTER.ALL)}
                                             {renderTaskFilterListItem(TASK_FILTER.PLANNED)}
                                             {renderTaskFilterListItem(TASK_FILTER.RUNNING)}
@@ -728,7 +808,7 @@ function StageSummary({ index, prestoStage }: { index: number, prestoStage: Outp
                                                 Cumulative
                                             </td>
                                             <td className="stage-table-stat-text">
-                                                {formatDataSizeBytes(prestoStage.latestAttemptExecutionInfo.stats.cumulativeUserMemory / 1000)}
+                                                {formatDataSize(prestoStage.latestAttemptExecutionInfo.stats.cumulativeUserMemory / 1000)}
                                             </td>
                                         </tr>
                                         <tr>
@@ -736,7 +816,7 @@ function StageSummary({ index, prestoStage }: { index: number, prestoStage: Outp
                                                 Cumulative Total
                                             </td>
                                             <td className="stage-table-stat-text">
-                                                {formatDataSizeBytes(prestoStage.latestAttemptExecutionInfo.stats.cumulativeTotalMemory / 1000)}
+                                                {formatDataSize(prestoStage.latestAttemptExecutionInfo.stats.cumulativeTotalMemory / 1000)}
                                             </td>
                                         </tr>
                                         <tr>
@@ -778,8 +858,9 @@ function StageSummary({ index, prestoStage }: { index: number, prestoStage: Outp
                                     </thead>
                                     <tbody>
                                         <tr>
+                                            // Planned is the first state of a task. There is no "Pending" state. Also see line 787.
                                             <td className="stage-table-stat-title">
-                                                Pending
+                                                Planned
                                             </td>
                                             <td className="stage-table-stat-text">
                                                 {prestoStage.latestAttemptExecutionInfo.tasks.filter(task => task.taskStatus.state === "PLANNED").length}
@@ -850,7 +931,7 @@ function StageSummary({ index, prestoStage }: { index: number, prestoStage: Outp
                             </td>
                             <td className="expand-charts-container">
                                 <a onClick={toggleExpanded} className="expand-charts-button">
-                                    <span className={"glyphicon " + getExpandedIcon()} style={GLYPHICON_HIGHLIGHT} data-toggle="tooltip" data-placement="top" title="More" />
+                                    <span className={"bi " + getExpandedIcon()} style={GLYPHICON_HIGHLIGHT} data-bs-toggle="tooltip" data-placement="top" title="More" />
                                 </a>
                             </td>
                         </tr>
@@ -915,7 +996,7 @@ function StageList({ outputStage }: { outputStage: OutputStage }): React.Node {
     if (stages === undefined || stages.length === 0) {
         return (
             <div className="row">
-                <div className="col-xs-12">
+                <div className="col-12">
                     No stage information available.
                 </div>
             </div>
@@ -926,7 +1007,7 @@ function StageList({ outputStage }: { outputStage: OutputStage }): React.Node {
 
     return (
         <div className="row">
-            <div className="col-xs-12">
+            <div className="col-12">
                 <table className="table" id="stage-list">
                     <tbody>
                         {renderedStages}
@@ -1027,10 +1108,10 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
         return (
             <div>
                 <div className="row">
-                    <div className="col-xs-9">
+                    <div className="col-9">
                         <h3>Stages</h3>
                     </div>
-                    <div className="col-xs-3">
+                    <div className="col-3">
                         <table className="header-inline-links">
                             <tbody>
                                 <tr>
@@ -1042,7 +1123,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                     </div>
                 </div>
                 <div className="row">
-                    <div className="col-xs-12">
+                    <div className="col-12">
                         <StageList key={data.queryId} outputStage={data.outputStage} />
                     </div>
                 </div>
@@ -1057,11 +1138,11 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
         }
 
         return (
-            <div className="col-xs-12">
+            <div className="col-12">
                 <h3>
                     Prepared Query
-                    <a className="btn copy-button" data-clipboard-target="#prepared-query-text" data-toggle="tooltip" data-placement="right" title="Copy to clipboard">
-                        <span className="glyphicon glyphicon-copy" aria-hidden="true" alt="Copy to clipboard" />
+                    <a className="btn copy-button" data-clipboard-target="#prepared-query-text" data-bs-toggle="tooltip" data-placement="right" title="Copy to clipboard">
+                        <span className="bi bi-copy" aria-hidden="true" alt="Copy to clipboard" />
                     </a>
                 </h3>
                 <pre id="prepared-query">
@@ -1111,7 +1192,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                 }
 
                 renderedEstimates.push(
-                    <span>- {snakeCased + "=" + data.session.resourceEstimates[resource]} <br /></span>
+                    <span>- {snakeCased + "=" + estimates[resource]} <br /></span>
                 )
             }
         }
@@ -1123,7 +1204,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
         if (data.warnings.length > 0) {
             return (
                 <div className="row">
-                    <div className="col-xs-12">
+                    <div className="col-12">
                         <h3>Warnings</h3>
                         <hr className="h3-hr" />
                         <table className="table" id="warnings-table">
@@ -1152,7 +1233,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
         if (Object.values(data.queryStats.runtimeStats).length == 0) return null;
         return (
             <div className="row">
-                <div className="col-xs-6">
+                <div className="col-6">
                     <h3>Runtime Statistics</h3>
                     <hr className="h3-hr" />
                     <RuntimeStatsList stats={data.queryStats.runtimeStats} />
@@ -1165,7 +1246,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
         if (data.failureInfo) {
             return (
                 <div className="row">
-                    <div className="col-xs-12">
+                    <div className="col-12">
                         <h3>Error Information</h3>
                         <hr className="h3-hr" />
                         <table className="table">
@@ -1189,8 +1270,8 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                 <tr>
                                     <td className="info-title">
                                         Stack Trace
-                                        <a className="btn copy-button" data-clipboard-target="#stack-trace" data-toggle="tooltip" data-placement="right" title="Copy to clipboard">
-                                            <span className="glyphicon glyphicon-copy" aria-hidden="true" alt="Copy to clipboard" />
+                                        <a className="btn copy-button" data-clipboard-target="#stack-trace" data-bs-toggle="tooltip" data-placement="right" title="Copy to clipboard">
+                                            <span className="bi bi-copy" aria-hidden="true" alt="Copy to clipboard" />
                                         </a>
                                     </td>
                                     <td className="info-text">
@@ -1214,12 +1295,20 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
         return;
     }
 
+    useEffect(() => {
+        /* $FlowIgnore[cannot-resolve-name] */
+        $('#query').each((i, block) => {
+            /* $FlowIgnore[cannot-resolve-name] */
+            hljs.highlightBlock(block);
+        });
+    }, [data]);
+
     const elapsedTime = (parseDuration(data.queryStats.elapsedTime) || 0) / 1000.0;
 
     return (
-        <div className={clsx(!show && 'hide')}>
+        <div className={clsx(!show && 'visually-hidden')}>
             <div className="row">
-                <div className="col-xs-6">
+                <div className="col-6">
                     <h3>Session</h3>
                     <hr className="h3-hr" />
                     <table className="table">
@@ -1231,8 +1320,8 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                 <td className="info-text wrap-text">
                                     <span id="query-user">{data.session.user}</span>
                                     &nbsp;&nbsp;
-                                    <a href="#" className="copy-button" data-clipboard-target="#query-user" data-toggle="tooltip" data-placement="right" title="Copy to clipboard">
-                                        <span className="glyphicon glyphicon-copy" aria-hidden="true" alt="Copy to clipboard" />
+                                    <a href="#" className="copy-button" data-clipboard-target="#query-user" data-bs-toggle="tooltip" data-placement="right" title="Copy to clipboard">
+                                        <span className="bi bi-copy" aria-hidden="true" alt="Copy to clipboard" />
                                     </a>
                                 </td>
                             </tr>
@@ -1303,7 +1392,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                         </tbody>
                     </table>
                 </div>
-                <div className="col-xs-6">
+                <div className="col-6">
                     <h3>Execution</h3>
                     <hr className="h3-hr" />
                     <table className="table">
@@ -1329,7 +1418,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                     Completion Time
                                 </td>
                                 <td className="info-text">
-                                    {data.queryStats.endTime ? formatShortDateTime(new Date(data.queryStats.endTime)) : ""}
+                                    {new Date(data.queryStats.endTime).getTime() !== 0 ? formatShortDateTime(new Date(data.queryStats.endTime)) : ""}
                                 </td>
                             </tr>
                             <tr>
@@ -1385,9 +1474,9 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                 </div>
             </div>
             <div className="row">
-                <div className="col-xs-12">
+                <div className="col-12">
                     <div className="row">
-                        <div className="col-xs-6">
+                        <div className="col-6">
                             <h3>Resource Utilization Summary</h3>
                             <hr className="h3-hr" />
                             <table className="table">
@@ -1450,7 +1539,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                     </tr>
                                     <tr>
                                         <td className="info-title">
-                                            <span className="text" data-toggle="tooltip" data-placement="right" title="The total number of rows shuffled across all query stages">
+                                            <span className="text" data-bs-toggle="tooltip" data-placement="right" title="The total number of rows shuffled across all query stages">
                                                 Shuffled Rows
                                             </span>
                                         </td>
@@ -1460,7 +1549,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                     </tr>
                                     <tr>
                                         <td className="info-title">
-                                            <span className="text" data-toggle="tooltip" data-placement="right" title="The total number of bytes shuffled across all query stages">
+                                            <span className="text" data-bs-toggle="tooltip" data-placement="right" title="The total number of bytes shuffled across all query stages">
                                                 Shuffled Data
                                             </span>
                                         </td>
@@ -1497,7 +1586,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                             Cumulative User Memory
                                         </td>
                                         <td className="info-text">
-                                            {formatDataSizeBytes(data.queryStats.cumulativeUserMemory / 1000.0) + " seconds"}
+                                            {formatDataSize(data.queryStats.cumulativeUserMemory / 1000.0)}
                                         </td>
                                     </tr>
                                     <tr>
@@ -1505,7 +1594,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                             Cumulative Total
                                         </td>
                                         <td className="info-text">
-                                            {formatDataSizeBytes(data.queryStats.cumulativeTotalMemory / 1000.0) + " seconds"}
+                                            {formatDataSize(data.queryStats.cumulativeTotalMemory / 1000.0)}
                                         </td>
                                     </tr>
                                     <tr>
@@ -1561,7 +1650,7 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
                                 </tbody>
                             </table>
                         </div>
-                        <div className="col-xs-6">
+                        <div className="col-6">
                             <h3>Timeline</h3>
                             <hr className="h3-hr" />
                             <table className="table">
@@ -1626,11 +1715,11 @@ export default function QueryOverview({ data, show }: { data: QueryData, show: b
             {renderWarningInfo()}
             {renderFailureInfo()}
             <div className="row">
-                <div className="col-xs-12">
+                <div className="col-12">
                     <h3>
                         Query
-                        <a className="btn copy-button" data-clipboard-target="#query-text" data-toggle="tooltip" data-placement="right" title="Copy to clipboard">
-                            <span className="glyphicon glyphicon-copy" aria-hidden="true" alt="Copy to clipboard" />
+                        <a className="btn copy-button" data-clipboard-target="#query-text" data-bs-toggle="tooltip" data-placement="right" title="Copy to clipboard">
+                            <span className="bi bi-copy" aria-hidden="true" alt="Copy to clipboard" />
                         </a>
                     </h3>
                     <pre id="query">

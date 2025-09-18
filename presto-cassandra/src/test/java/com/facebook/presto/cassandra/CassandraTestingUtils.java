@@ -13,6 +13,9 @@
  */
 package com.facebook.presto.cassandra;
 
+import com.datastax.driver.core.DataType;
+import com.datastax.driver.core.Metadata;
+import com.datastax.driver.core.TupleType;
 import com.datastax.driver.core.querybuilder.Insert;
 import com.datastax.driver.core.querybuilder.QueryBuilder;
 import com.facebook.presto.spi.SchemaTableName;
@@ -42,12 +45,12 @@ public class CassandraTestingUtils
 
     private CassandraTestingUtils() {}
 
-    public static void createTestTables(CassandraSession cassandraSession, String keyspace, Date date)
+    public static void createTestTables(CassandraSession cassandraSession, Metadata metadata, String keyspace, Date date)
     {
         createKeyspace(cassandraSession, keyspace);
-        createTableAllTypes(cassandraSession, new SchemaTableName(keyspace, TABLE_ALL_TYPES), date, 9);
-        createTableAllTypes(cassandraSession, new SchemaTableName(keyspace, TABLE_ALL_TYPES_INSERT), date, 0);
-        createTableAllTypesPartitionKey(cassandraSession, new SchemaTableName(keyspace, TABLE_ALL_TYPES_PARTITION_KEY), date);
+        createTableAllTypes(cassandraSession, metadata, new SchemaTableName(keyspace, TABLE_ALL_TYPES), date, 9);
+        createTableAllTypes(cassandraSession, metadata, new SchemaTableName(keyspace, TABLE_ALL_TYPES_INSERT), date, 0);
+        createTableAllTypesPartitionKey(cassandraSession, metadata, new SchemaTableName(keyspace, TABLE_ALL_TYPES_PARTITION_KEY), date);
         createTableClusteringKeys(cassandraSession, new SchemaTableName(keyspace, TABLE_CLUSTERING_KEYS), 9);
         createTableClusteringKeys(cassandraSession, new SchemaTableName(keyspace, TABLE_CLUSTERING_KEYS_LARGE), 1000);
         createTableMultiPartitionClusteringKeys(cassandraSession, new SchemaTableName(keyspace, TABLE_MULTI_PARTITION_CLUSTERING_KEYS));
@@ -75,12 +78,12 @@ public class CassandraTestingUtils
 
     public static void insertIntoTableClusteringKeys(CassandraSession session, SchemaTableName table, int rowsCount)
     {
-        for (Integer rowNumber = 1; rowNumber <= rowsCount; rowNumber++) {
+        for (int rowNumber = 1; rowNumber <= rowsCount; rowNumber++) {
             Insert insert = QueryBuilder.insertInto(table.getSchemaName(), table.getTableName())
-                    .value("key", "key_" + rowNumber.toString())
+                    .value("key", "key_" + rowNumber)
                     .value("clust_one", "clust_one")
-                    .value("clust_two", "clust_two_" + rowNumber.toString())
-                    .value("clust_three", "clust_three_" + rowNumber.toString());
+                    .value("clust_two", "clust_two_" + rowNumber)
+                    .value("clust_three", "clust_three_" + rowNumber);
             session.execute(insert);
         }
         assertEquals(session.execute("SELECT COUNT(*) FROM " + table).all().get(0).getLong(0), rowsCount);
@@ -103,13 +106,13 @@ public class CassandraTestingUtils
 
     public static void insertIntoTableMultiPartitionClusteringKeys(CassandraSession session, SchemaTableName table)
     {
-        for (Integer rowNumber = 1; rowNumber < 10; rowNumber++) {
+        for (int rowNumber = 1; rowNumber < 10; rowNumber++) {
             Insert insert = QueryBuilder.insertInto(table.getSchemaName(), table.getTableName())
-                    .value("partition_one", "partition_one_" + rowNumber.toString())
-                    .value("partition_two", "partition_two_" + rowNumber.toString())
+                    .value("partition_one", "partition_one_" + rowNumber)
+                    .value("partition_two", "partition_two_" + rowNumber)
                     .value("clust_one", "clust_one")
-                    .value("clust_two", "clust_two_" + rowNumber.toString())
-                    .value("clust_three", "clust_three_" + rowNumber.toString());
+                    .value("clust_two", "clust_two_" + rowNumber)
+                    .value("clust_three", "clust_three_" + rowNumber);
             session.execute(insert);
         }
         assertEquals(session.execute("SELECT COUNT(*) FROM " + table).all().get(0).getLong(0), 9);
@@ -131,7 +134,7 @@ public class CassandraTestingUtils
 
     public static void insertIntoTableClusteringKeysInequality(CassandraSession session, SchemaTableName table, Date date, int rowsCount)
     {
-        for (Integer rowNumber = 1; rowNumber <= rowsCount; rowNumber++) {
+        for (int rowNumber = 1; rowNumber <= rowsCount; rowNumber++) {
             Insert insert = QueryBuilder.insertInto(table.getSchemaName(), table.getTableName())
                     .value("key", "key_1")
                     .value("clust_one", "clust_one")
@@ -142,7 +145,7 @@ public class CassandraTestingUtils
         assertEquals(session.execute("SELECT COUNT(*) FROM " + table).all().get(0).getLong(0), rowsCount);
     }
 
-    public static void createTableAllTypes(CassandraSession session, SchemaTableName table, Date date, int rowsCount)
+    public static void createTableAllTypes(CassandraSession session, Metadata metadata, SchemaTableName table, Date date, int rowsCount)
     {
         session.execute("DROP TABLE IF EXISTS " + table);
         session.execute("CREATE TABLE " + table + " (" +
@@ -164,11 +167,12 @@ public class CassandraTestingUtils
                 " typelist list<text>, " +
                 " typemap map<int, bigint>, " +
                 " typeset set<boolean>, " +
+                " typetuple tuple<bigint, varchar>, " +
                 ")");
-        insertTestData(session, table, date, rowsCount);
+        insertTestData(session, metadata, table, date, rowsCount);
     }
 
-    public static void createTableAllTypesPartitionKey(CassandraSession session, SchemaTableName table, Date date)
+    public static void createTableAllTypesPartitionKey(CassandraSession session, Metadata metadata, SchemaTableName table, Date date)
     {
         session.execute("DROP TABLE IF EXISTS " + table);
 
@@ -191,6 +195,7 @@ public class CassandraTestingUtils
                 " typelist frozen <list<text>>, " +
                 " typemap frozen <map<int, bigint>>, " +
                 " typeset frozen <set<boolean>>, " +
+                " typetuple frozen <tuple<bigint, varchar>>, " +
                 " PRIMARY KEY ((" +
                 "   key, " +
                 "   typeuuid, " +
@@ -213,21 +218,24 @@ public class CassandraTestingUtils
                 // TODO: NOT YET SUPPORTED AS A PARTITION KEY
                 "   typelist, " +
                 "   typemap, " +
-                "   typeset" +
+                "   typeset," +
+                "   typetuple" +
                 " ))" +
                 ")");
 
-        insertTestData(session, table, date, 9);
+        insertTestData(session, metadata, table, date, 9);
     }
 
-    private static void insertTestData(CassandraSession session, SchemaTableName table, Date date, int rowsCount)
+    private static void insertTestData(CassandraSession session, Metadata metadata, SchemaTableName table, Date date, int rowsCount)
     {
-        for (Integer rowNumber = 1; rowNumber <= rowsCount; rowNumber++) {
+        TupleType tupleType = metadata.newTupleType(DataType.bigint(), DataType.varchar());
+
+        for (int rowNumber = 1; rowNumber <= rowsCount; rowNumber++) {
             Insert insert = QueryBuilder.insertInto(table.getSchemaName(), table.getTableName())
-                    .value("key", "key " + rowNumber.toString())
+                    .value("key", "key " + rowNumber)
                     .value("typeuuid", UUID.fromString(String.format("00000000-0000-0000-0000-%012d", rowNumber)))
                     .value("typeinteger", rowNumber)
-                    .value("typelong", rowNumber.longValue() + 1000)
+                    .value("typelong", rowNumber + 1000)
                     .value("typebytes", ByteBuffer.wrap(Ints.toByteArray(rowNumber)).asReadOnlyBuffer())
                     .value("typetimestamp", date)
                     .value("typeansi", "ansi " + rowNumber)
@@ -241,7 +249,8 @@ public class CassandraTestingUtils
                     .value("typetimeuuid", UUID.fromString(String.format("d2177dd0-eaa2-11de-a572-001b779c76e%d", rowNumber)))
                     .value("typelist", ImmutableList.of("list-value-1" + rowNumber, "list-value-2" + rowNumber))
                     .value("typemap", ImmutableMap.of(rowNumber, rowNumber + 1L, rowNumber + 2, rowNumber + 3L))
-                    .value("typeset", ImmutableSet.of(false, true));
+                    .value("typeset", ImmutableSet.of(false, true))
+                    .value("typetuple", tupleType.newValue((long) rowNumber, "row=" + rowNumber));
 
             session.execute(insert);
         }
