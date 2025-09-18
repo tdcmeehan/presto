@@ -18,8 +18,8 @@ jobs:
           # Fail on any vulnerability severity (low, moderate, high, critical)
           fail-on-severity: low
 
-          # Only fail on vulnerabilities in runtime/compile scopes (not dev dependencies)
-          fail-on-scopes: runtime, compile
+          # Only fail on vulnerabilities in runtime scopes (not dev dependencies)
+          fail-on-scopes: runtime
 
           # Comment on the PR with vulnerability details
           comment-summary-in-pr: always
