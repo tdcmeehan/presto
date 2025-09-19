@@ -31,15 +31,18 @@ jobs:
           restore-keys: |
             maven-${{ runner.os }}-
 
+      - name: Get date for cache key
+        id: get-date
+        run: echo "date=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
       - name: Cache OWASP database
         uses: actions/cache@v4
         id: cache-owasp
         with:
           path: ~/.owasp
-          key: owasp-cache-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}
           restore-keys: |
             owasp-cache-${{ runner.os }}-
-            owasp-cache-
 
       - name: Run OWASP check on base branch
         working-directory: base
