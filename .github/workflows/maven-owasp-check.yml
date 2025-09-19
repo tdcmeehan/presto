@@ -33,7 +33,7 @@ jobs:
 
       - name: Get date for cache key
         id: get-date
-        run: echo "date=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
       - name: Restore OWASP database cache
         uses: actions/cache/restore@v4
@@ -43,32 +43,6 @@ jobs:
           key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}
           restore-keys: |
             owasp-cache-${{ runner.os }}-
-
-      - name: Debug cache status
-        run: |
-          echo "=== Cache debugging ==="
-          echo "Cache hit: ${{ steps.cache-owasp-restore.outputs.cache-hit }}"
-          echo "Cache primary key: ${{ steps.cache-owasp-restore.outputs.cache-primary-key }}"
-          echo "Cache matched key: ${{ steps.cache-owasp-restore.outputs.cache-matched-key }}"
-          echo "Cache key requested: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}"
-          echo "Home directory: $HOME"
-          echo "Current directory: $(pwd)"
-          echo ""
-          echo "=== OWASP data directory status ==="
-          if [ -d "$HOME/.owasp/dependency-check-data" ]; then
-            echo "OWASP data directory exists"
-            echo "Directory size: $(du -sh $HOME/.owasp/dependency-check-data | cut -f1)"
-            echo "Number of files: $(find $HOME/.owasp/dependency-check-data -type f | wc -l)"
-            echo ""
-            echo "=== H2 database files ==="
-            ls -la $HOME/.owasp/dependency-check-data/*.db 2>/dev/null || echo "No .db files found"
-            ls -la $HOME/.owasp/dependency-check-data/odc.* 2>/dev/null || echo "No odc.* files found"
-          else
-            echo "OWASP data directory does NOT exist"
-            mkdir -p $HOME/.owasp/dependency-check-data
-            echo "Created empty OWASP data directory"
-          fi
-          echo ""
 
       - name: Run OWASP check on base branch
         working-directory: base
@@ -84,22 +58,16 @@ jobs:
             -DassemblyAnalyzerEnabled=false \
             -DcentralAnalyzerEnabled=false \
             -DnuspecAnalyzerEnabled=false \
-            -DnvdValidForHours=8760 \
+            -DnvdValidForHours=168 \
             -DdataDirectory=$HOME/.owasp/dependency-check-data \
             || true  # Don't fail, we just want the report
 
-      - name: Debug cache after base branch scan
-        run: |
-          echo "=== OWASP data directory after BASE scan ==="
-          if [ -d "$HOME/.owasp/dependency-check-data" ]; then
-            echo "Directory size: $(du -sh $HOME/.owasp/dependency-check-data | cut -f1)"
-            echo "Number of files: $(find $HOME/.owasp/dependency-check-data -type f | wc -l)"
-            echo "Recently modified files (last 5):"
-            find $HOME/.owasp/dependency-check-data -type f -printf '%T@ %p\n' | sort -rn | head -5 | cut -d' ' -f2- | xargs ls -la
-          else
-            echo "ERROR: OWASP data directory missing after base scan!"
-          fi
-          echo ""
+      - name: Save OWASP cache after base scan
+        if: steps.cache-owasp-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.owasp/dependency-check-data
+          key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}-partial
 
       - name: Run OWASP check on PR branch
         working-directory: pr
@@ -115,27 +83,9 @@ jobs:
             -DassemblyAnalyzerEnabled=false \
             -DcentralAnalyzerEnabled=false \
             -DnuspecAnalyzerEnabled=false \
-            -DnvdValidForHours=8760 \
+            -DnvdValidForHours=168 \
             -DdataDirectory=$HOME/.owasp/dependency-check-data \
             || true  # Don't fail, we just want the report
-
-      - name: Debug cache after PR branch scan
-        run: |
-          echo "=== OWASP data directory after PR scan ==="
-          if [ -d "$HOME/.owasp/dependency-check-data" ]; then
-            echo "Directory size: $(du -sh $HOME/.owasp/dependency-check-data | cut -f1)"
-            echo "Number of files: $(find $HOME/.owasp/dependency-check-data -type f | wc -l)"
-            echo ""
-            echo "=== Checking for database files ==="
-            ls -la $HOME/.owasp/dependency-check-data/*.mv.db 2>/dev/null || echo "No *.mv.db files found"
-            ls -la $HOME/.owasp/dependency-check-data/*.trace.db 2>/dev/null || echo "No *.trace.db files found"
-          else
-            echo "ERROR: OWASP data directory missing after PR scan!"
-          fi
-          echo ""
-          echo "=== Report files check ==="
-          ls -la base/target/dependency-check-report.json 2>/dev/null || echo "Base report not found"
-          ls -la pr/target/dependency-check-report.json 2>/dev/null || echo "PR report not found"
 
       - name: Compare and fail on new CVEs
         run: |
@@ -166,28 +116,6 @@ jobs:
             exit 1
           else
             echo "✅ No new vulnerabilities introduced"
-          fi
-
-      - name: Final cache check before save
-        if: always()
-        run: |
-          echo "=== Final check before GitHub saves cache ==="
-          echo "Checking what will be cached:"
-          if [ -d "$HOME/.owasp/dependency-check-data" ]; then
-            echo "✅ $HOME/.owasp/dependency-check-data EXISTS"
-            echo "Size: $(du -sh $HOME/.owasp/dependency-check-data | cut -f1)"
-            echo "Files: $(find $HOME/.owasp/dependency-check-data -type f | wc -l)"
-            ls -la $HOME/.owasp/dependency-check-data/
-          else
-            echo "❌ $HOME/.owasp/dependency-check-data does NOT exist!"
-          fi
-          echo ""
-          echo "Checking tilde path (what cache action uses):"
-          if [ -d ~/.owasp/dependency-check-data ]; then
-            echo "✅ ~/.owasp/dependency-check-data EXISTS"
-            echo "Size: $(du -sh ~/.owasp/dependency-check-data | cut -f1)"
-          else
-            echo "❌ ~/.owasp/dependency-check-data does NOT exist!"
           fi
 
       - name: Save OWASP database cache
