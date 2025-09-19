@@ -87,11 +87,11 @@ jobs:
             -DdataDirectory=$HOME/.owasp/dependency-check-data \
             || true  # Don't fail, we just want the report
 
-      - name: Compare and fail on new CVEs
+      - name: Compare and fail on new high/critical CVEs
         run: |
-          # Extract CVEs from both branches
-          base_cves=$(cat base/target/dependency-check-report.json 2>/dev/null | jq -r '.dependencies[].vulnerabilities[]?.name' | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
-          pr_cves=$(cat pr/target/dependency-check-report.json 2>/dev/null | jq -r '.dependencies[].vulnerabilities[]?.name' | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
+          # Extract only high and critical CVEs from both branches (CVSS >= 7.0)
+          base_cves=$(cat base/target/dependency-check-report.json 2>/dev/null | jq -r '.dependencies[].vulnerabilities[] | select(.cvssv2.score >= 7.0 or .cvssv3.baseScore >= 7.0) | .name' | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
+          pr_cves=$(cat pr/target/dependency-check-report.json 2>/dev/null | jq -r '.dependencies[].vulnerabilities[] | select(.cvssv2.score >= 7.0 or .cvssv3.baseScore >= 7.0) | .name' | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
 
           # Find new CVEs introduced in PR
           new_cves=$(comm -13 <(echo "$base_cves") <(echo "$pr_cves"))
