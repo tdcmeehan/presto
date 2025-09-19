@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache@v4
         id: cache-owasp
         with:
-          path: ~/.owasp
+          path: ~/.owasp/dependency-check-data
           key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}
           restore-keys: |
             owasp-cache-${{ runner.os }}-
