@@ -44,6 +44,15 @@ jobs:
           restore-keys: |
             owasp-cache-${{ runner.os }}-
 
+      - name: Debug - Check cache contents
+        run: |
+          echo "Cache hit: ${{ steps.cache-owasp.outputs.cache-hit }}"
+          echo "Checking OWASP data directory:"
+          ls -la ~/.owasp/ 2>/dev/null || echo "~/.owasp/ does not exist"
+          ls -la ~/.owasp/dependency-check-data/ 2>/dev/null || echo "~/.owasp/dependency-check-data/ does not exist"
+          echo "Checking home directory:"
+          ls -la ~/ | grep -E "owasp|dependency" || echo "No OWASP directories in home"
+
       - name: Run OWASP check on base branch
         working-directory: base
         run: |
@@ -78,7 +87,7 @@ jobs:
             -DnuspecAnalyzerEnabled=false \
             -DnvdValidForHours=8760 \
             -DdataDirectory=~/.owasp/dependency-check-data \
-            || true  # Don't fail, we just want the report
+            || true  # Don't fail, we just want the repor
 
       - name: Compare and fail on new CVEs
         run: |
