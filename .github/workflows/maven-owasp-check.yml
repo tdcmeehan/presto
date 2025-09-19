@@ -35,9 +35,9 @@ jobs:
         id: get-date
         run: echo "date=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
 
-      - name: Cache OWASP database
-        uses: actions/cache@v4
-        id: cache-owasp
+      - name: Restore OWASP database cache
+        uses: actions/cache/restore@v4
+        id: cache-owasp-restore
         with:
           path: ~/.owasp/dependency-check-data
           key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}
@@ -47,8 +47,10 @@ jobs:
       - name: Debug cache status
         run: |
           echo "=== Cache debugging ==="
-          echo "Cache hit: ${{ steps.cache-owasp.outputs.cache-hit }}"
-          echo "Cache key used: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}"
+          echo "Cache hit: ${{ steps.cache-owasp-restore.outputs.cache-hit }}"
+          echo "Cache primary key: ${{ steps.cache-owasp-restore.outputs.cache-primary-key }}"
+          echo "Cache matched key: ${{ steps.cache-owasp-restore.outputs.cache-matched-key }}"
+          echo "Cache key requested: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}"
           echo "Home directory: $HOME"
           echo "Current directory: $(pwd)"
           echo ""
@@ -187,6 +189,13 @@ jobs:
           else
             echo "❌ ~/.owasp/dependency-check-data does NOT exist!"
           fi
+
+      - name: Save OWASP database cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.owasp/dependency-check-data
+          key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}
 
       - name: Upload reports
         if: always()
