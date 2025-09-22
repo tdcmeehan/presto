@@ -15,23 +15,9 @@ jobs:
       - name: 'Dependency Review'
         uses: actions/dependency-review-action@v4
         with:
-          # Fail on any vulnerability severity (low, moderate, high, critical)
-          fail-on-severity: low
-
-          # Check all scopes including unknown (catches more edge cases)
+          fail-on-severity: high
           fail-on-scopes: runtime, unknown, development
-
-          # Comment on the PR with vulnerability details
           comment-summary-in-pr: always
-
-          # Show vulnerabilities even if they don't meet fail criteria
           show-openssf-scorecard: true
-
-          # Warn about incompatible licenses (optional)
-          # deny-licenses: GPL-3.0, LGPL-2.0, LGPL-2.1
-
-          # Enable retry with exponential backoff for API calls
           retry-on-snapshot-warnings: true
-
-          # Allow specific known vulnerabilities if needed (by GHSA ID)
-          # allow-ghsas: GHSA-xxxx-xxxx-xxxx
+          warn-only: false
