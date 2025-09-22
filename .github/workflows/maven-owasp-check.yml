@@ -1,9 +1,20 @@
 name: Maven OWASP Dependency Check
-on: [pull_request]
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      cvss-threshold:
+        description: 'CVSS score threshold for failing (7.0 = high/critical)'
+        required: false
+        default: '7.0'
+        type: string
 
 jobs:
   dependency-check:
     runs-on: ubuntu-latest
+    env:
+      CVSS_THRESHOLD: ${{ github.event.inputs.cvss-threshold || '7.0' }}
+      OWASP_VERSION: '12.1.3'
     steps:
       - name: Checkout PR branch
         uses: actions/checkout@v4
@@ -33,18 +44,19 @@ jobs:
         id: cache-owasp-restore
         with:
           path: ~/.owasp/dependency-check-data
-          key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}
+          key: owasp-cache-${{ runner.os }}-${{ env.OWASP_VERSION }}-${{ steps.get-date.outputs.date }}
           restore-keys: |
+            owasp-cache-${{ runner.os }}-${{ env.OWASP_VERSION }}-
             owasp-cache-${{ runner.os }}-
 
       - name: Run OWASP check on base branch
         working-directory: base
         run: |
-          mvn org.owasp:dependency-check-maven:12.1.3:aggregate \
+          mvn org.owasp:dependency-check-maven:${{ env.OWASP_VERSION }}:aggregate \
             -DskipTests \
             -Dformat=JSON \
             -DprettyPrint=true \
-            -DfailBuildOnCVSS=11 \
+            -DfailOnError=false \
             -DossindexAnalyzerEnabled=true \
             -DnvdApiAnalyzerEnabled=false \
             -DnodeAnalyzerEnabled=false \
@@ -52,24 +64,23 @@ jobs:
             -DcentralAnalyzerEnabled=false \
             -DnuspecAnalyzerEnabled=false \
             -DnvdValidForHours=168 \
-            -DdataDirectory=$HOME/.owasp/dependency-check-data \
-            || true  # Don't fail, we just want the report
+            -DdataDirectory=$HOME/.owasp/dependency-check-data
 
       - name: Save OWASP cache after base scan
         if: steps.cache-owasp-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.owasp/dependency-check-data
-          key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}-partial
+          key: owasp-cache-${{ runner.os }}-${{ env.OWASP_VERSION }}-${{ steps.get-date.outputs.date }}-partial
 
       - name: Run OWASP check on PR branch
         working-directory: pr
         run: |
-          mvn org.owasp:dependency-check-maven:12.1.3:aggregate \
+          mvn org.owasp:dependency-check-maven:${{ env.OWASP_VERSION }}:aggregate \
             -DskipTests \
             -Dformat=JSON \
             -DprettyPrint=true \
-            -DfailBuildOnCVSS=11 \
+            -DfailOnError=false \
             -DossindexAnalyzerEnabled=true \
             -DnvdApiAnalyzerEnabled=false \
             -DnodeAnalyzerEnabled=false \
@@ -77,14 +88,14 @@ jobs:
             -DcentralAnalyzerEnabled=false \
             -DnuspecAnalyzerEnabled=false \
             -DnvdValidForHours=168 \
-            -DdataDirectory=$HOME/.owasp/dependency-check-data \
-            || true  # Don't fail, we just want the report
+            -DdataDirectory=$HOME/.owasp/dependency-check-data
 
-      - name: Compare and fail on new high/critical CVEs
+      - name: Compare and fail on new CVEs above threshold
         run: |
-          # Extract only high and critical CVEs from both branches (CVSS >= 7.0)
-          base_cves=$(cat base/target/dependency-check-report.json 2>/dev/null | jq -r '.dependencies[].vulnerabilities[]? | select((.cvssv2.score // 0) >= 7.0 or (.cvssv3.baseScore // 0) >= 7.0) | .name' | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
-          pr_cves=$(cat pr/target/dependency-check-report.json 2>/dev/null | jq -r '.dependencies[].vulnerabilities[]? | select((.cvssv2.score // 0) >= 7.0 or (.cvssv3.baseScore // 0) >= 7.0) | .name' | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
+          # Extract CVEs above threshold from both branches (CVSS >= $CVSS_THRESHOLD)
+          threshold="${{ env.CVSS_THRESHOLD }}"
+          base_cves=$(cat base/target/dependency-check-report.json 2>/dev/null | jq -r ".dependencies[].vulnerabilities[]? | select((.cvssv2.score // 0) >= $threshold or (.cvssv3.baseScore // 0) >= $threshold) | .name" | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
+          pr_cves=$(cat pr/target/dependency-check-report.json 2>/dev/null | jq -r ".dependencies[].vulnerabilities[]? | select((.cvssv2.score // 0) >= $threshold or (.cvssv3.baseScore // 0) >= $threshold) | .name" | grep -E '^CVE-[0-9]{4}-[0-9]+$' | sort -u)
 
           # Find new CVEs introduced in PR
           new_cves=$(comm -13 <(echo "$base_cves") <(echo "$pr_cves"))
@@ -94,14 +105,13 @@ jobs:
             echo "$new_cves"
             echo ""
 
-            # Show details for each new CVE
             for cve in $new_cves; do
               echo "=================================================="
               echo "CVE: $cve"
               echo "=================================================="
 
-              # Find which dependencies have this CVE
-              cat pr/target/dependency-check-report.json | jq -r ".dependencies[] | select(.vulnerabilities[]?.name == \"$cve\") | \"Module: \" + (.projectReferences // [\"root\"])[0] + \"\nDependency: \" + .fileName + \"\nPackage: \" + .packages[0].id + \"\nDescription: \" + (.vulnerabilities[] | select(.name == \"$cve\") | .description)"
+              # Find which dependencies have this CVE (with safe access to packages)
+              cat pr/target/dependency-check-report.json | jq -r ".dependencies[] | select(.vulnerabilities[]?.name == \"$cve\") | \"Module: \" + (.projectReferences // [\"root\"])[0] + \"\nDependency: \" + .fileName + \"\nPackage: \" + (if .packages and .packages[0] then .packages[0].id else \"N/A\" end) + \"\nDescription: \" + (.vulnerabilities[] | select(.name == \"$cve\") | .description)"
 
               echo ""
             done
@@ -116,7 +126,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.owasp/dependency-check-data
-          key: owasp-cache-${{ runner.os }}-${{ steps.get-date.outputs.date }}
+          key: owasp-cache-${{ runner.os }}-${{ env.OWASP_VERSION }}-${{ steps.get-date.outputs.date }}
 
       - name: Upload reports
         if: always()
