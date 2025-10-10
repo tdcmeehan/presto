@@ -31,6 +31,7 @@
         <connection>scm:git:git://github.com/prestodb/presto.git</connection>
         <url>https://github.com/prestodb/presto</url>
         <tag>HEAD</tag>
+        
     </scm>
 
     <properties>
