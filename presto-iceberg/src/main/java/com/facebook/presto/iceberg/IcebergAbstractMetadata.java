@@ -1014,7 +1014,6 @@ public abstract class IcebergAbstractMetadata
         Optional<Schema> tableSchema = tryGetSchema(table);
         Optional<String> tableSchemaJson = tableSchema.map(SchemaParser::toJson);
 
-        // For MVs, use the storage table name in the handle so other methods can find it
         String schemaName = mvDefinition.isPresent() ? actualTableName.getSchemaName() : tableName.getSchemaName();
         String handleTableName = mvDefinition.isPresent() ? actualTableName.getTableName() : name.getTableName();
 
