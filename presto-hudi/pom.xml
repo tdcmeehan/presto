@@ -40,6 +40,18 @@
             <scope>compile</scope>
         </dependency>
 
+   <dependency>
+        <groupId>junit</groupId>
+        <artifactId>junit</artifactId>
+        <version>4.11</version>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-core</artifactId>
+        <version>2.14.1</version>
+    </dependency>
+
         <dependency>
             <groupId>com.google.inject</groupId>
             <artifactId>guice</artifactId>
@@ -149,7 +161,7 @@
             <groupId>org.apache.hudi</groupId>
             <artifactId>hudi-presto-bundle</artifactId>
             <!--  This version upgrade should apply only to the Hudi connector, so the Hudi dependency is updated here (and not in root pom). -->
-            <version>1.0.2</version>
+            <version>0.14.0</version>
         </dependency>
 
         <!-- Tests -->
