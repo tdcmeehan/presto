@@ -41,7 +41,7 @@ WHERE c.region = 'US';  -- Only 10K customers match
 
 Presto's current dynamic filtering has significant limitations:
 
-1. **Broadcast joins only**: Only works for broadcast joins (build side colocated with coordinator), not partitioned joins where build side is distributed across workers
+1. **Broadcast joins only**: Only works for broadcast joins (entire build side replicated to all probe-side workers), not partitioned joins where build side is distributed/partitioned across workers
 2. **No partition pruning**: Filter is built on worker, not available to coordinator's split scheduler, so it can't skip partitions during split scheduling - only prunes at file/row group/row levels after splits are already scheduled
 
 ### User Impact
