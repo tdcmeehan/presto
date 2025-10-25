@@ -75,17 +75,23 @@ By extracting filter predicates during hash join execution and applying them to 
 - **Unified encoding**: Consistent JSON format throughout
 - **Consistent behavior**: Simplified for C++-only deployment
 
-### 3.2 C++-Only Design
+### 3.2 Unified Broadcast and Partitioned Join Handling
+- **Both join types benefit**: Broadcast and partitioned joins use same optimizer rule and scheduler waiting
+- **Broadcast joins**: All workers produce identical filter, coordinator uses any one (no merge needed)
+- **Partitioned joins**: Coordinator collects and merges partial filters using UNION semantics
+- **Consistent mechanism**: Single protocol and code path for both, simplifying implementation
+
+### 3.3 C++-Only Design
 - **Velox-native**: Design exclusively for C++ execution
 - **No Java workers**: Simplified architecture without Java compatibility concerns
 - **Performance focus**: Optimized for C++ performance characteristics
 
-### 3.3 Leverage Existing Infrastructure
+### 3.4 Leverage Existing Infrastructure
 - **Use Thrift**: Both Java and C++ already have Thrift dependencies
 - **Reuse patterns**: Follow existing Presto architectural patterns
 - **Minimal changes**: Integrate with existing components where possible
 
-### 3.4 Adaptive Behavior
+### 3.5 Adaptive Behavior
 - **Progressive application**: Apply filters as they become available
 - **Automatic degradation**: Fall back gracefully under memory pressure
 - **Cost-based decisions**: Enable/disable based on expected benefit
@@ -1922,17 +1928,19 @@ But for V1: **"If optimizer says wait, we wait"** - one boolean check.
 [^optimizer-rule-impl]: Full optimizer rule implementation:
     ```java
     // In optimizer rule (e.g., AddDynamicFiltersRule)
+    // Works for both broadcast and partitioned joins
     public class AddDynamicFiltersRule implements Rule<JoinNode> {
         @Override
         public Result apply(JoinNode join, Captures captures, Context context) {
-            // Cost-based decision
-            if (!shouldAddDynamicFilter(join, context)) {
-                return Result.empty();
+            // Find probe-side table scan (traverses through any intermediate nodes)
+            TableScanNode probeScan = findTableScanRecursive(join.getProbe());
+            if (probeScan == null) {
+                return Result.empty();  // No table scan in probe side
             }
 
-            // Find probe-side table scan
-            TableScanNode probeScan = findProbeTableScan(join.getProbe());
-            if (probeScan == null) {
+            // Check if filter can prune at storage level
+            // This is the ONLY check - applies to both broadcast and partitioned
+            if (!canPrunePartitionsOrFiles(join, probeScan, context)) {
                 return Result.empty();
             }
 
@@ -1949,41 +1957,33 @@ But for V1: **"If optimizer says wait, we wait"** - one boolean check.
 
             return Result.ofPlanNode(replaceInTree(newJoin, probeScan, newScan));
         }
+
+        /**
+         * Find TableScanNode, traversing through any single-source nodes.
+         * Handles ProjectNode, FilterNode, AggregationNode, WindowNode, etc.
+         */
+        private TableScanNode findTableScanRecursive(PlanNode node) {
+            if (node instanceof TableScanNode) {
+                return (TableScanNode) node;
+            }
+            if (node.getSources().size() == 1) {
+                return findTableScanRecursive(node.getSources().get(0));
+            }
+            return null;  // Multi-source or leaf node
+        }
     }
     ```
 
-[^check-storage-pruning]: Storage-level pruning check:
-    ```java
-    private boolean shouldAddDynamicFilter(JoinNode join, Context context) {
-        TableScanNode probeScan = findTableScan(join.getLeft());
-        if (probeScan == null) {
-            return false;  // No table scan in probe side
-        }
+[^simplified-decision]: Simplified decision rule - no selectivity check needed:
 
-        // Check 1: Can filter prune at storage level?
-        if (!filterCanPrunePartitions(join, probeScan, context)) {
-            return false;  // Only row-level filtering, not worth waiting
-        }
+    **Why no selectivity check?**
+    - Statistics are often stale or inaccurate
+    - Worst case is bounded by timeout (500ms)
+    - Filter is built anyway (no extra work)
+    - If it doesn't help, we only waited 500ms
+    - If it does help, we save 1-2 seconds of I/O
 
-        // Proceed to selectivity check...
-        return true;
-    }
-    ```
-
-[^check-selectivity]: Selectivity check implementation:
-    ```java
-    // Inside shouldAddDynamicFilter():
-
-    // Check 2: Is selectivity high enough?
-    PlanNodeStatsEstimate buildStats = context.getStatsProvider().getStats(join.getRight());
-    PlanNodeStatsEstimate probeStats = context.getStatsProvider().getStats(probeScan);
-
-    double selectivity = buildStats.getOutputRowCount() /
-                        probeStats.getOutputRowCount();
-
-    // Only add filter if selectivity < 50%
-    return selectivity < 0.5;
-    ```
+    **The rule**: If filter can prune at storage level, apply it. Let timeout prevent unbounded waiting.
 
 [^extract-filter-columns]: Column extraction and tracing implementation:
     ```java

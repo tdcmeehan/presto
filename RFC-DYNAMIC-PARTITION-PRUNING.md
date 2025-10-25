@@ -39,10 +39,13 @@ WHERE c.region = 'US';  -- Only 10K customers match
 
 ### Existing Limitations
 
-Presto's current dynamic filtering has significant limitations:
+Presto's current dynamic filtering has a critical limitation:
 
-1. **Broadcast joins only**: Only works for broadcast joins (entire build side replicated to all probe-side workers), not partitioned joins where build side is distributed/partitioned across workers
-2. **No partition pruning**: Filter is built on worker, not available to coordinator's split scheduler, so it can't skip partitions during split scheduling - only prunes at file/row group/row levels after splits are already scheduled
+**No partition-level pruning**: Filters are built on workers but not available to the coordinator's split scheduler. The coordinator generates all probe-side splits immediately without waiting for filters. This means:
+- For **broadcast joins**: Workers apply filters locally at file/row group/row level, but all partitions are still scheduled and opened
+- For **partitioned joins**: Each worker has only a partial build side, can't build a complete filter, so filtering is limited or ineffective
+
+**Result**: Queries scan unnecessary partitions and waste I/O, even when filters could have eliminated 90%+ of partitions at scheduling time.
 
 ### User Impact
 
@@ -90,16 +93,16 @@ WHERE c.region = 'US';
 **Component**: `AddDynamicFilterRule` (PlanOptimizer in presto-main)
 
 **What happens**:
-1. Optimizer identifies broadcast hash join with selective build side
-2. Performs cost-based check: Can filter prune at storage level?
+1. Optimizer identifies hash join (broadcast or partitioned)
+2. Finds `TableScanNode` in probe side (traversing through any intermediate nodes)
+3. Performs storage-level pruning check: Can filter prune partitions/files?
    - Checks if join column (`customer_id`) matches partition/bucket columns in table layout
    - For Hive partitioned by `customer_id`: YES
    - For Hive partitioned by `order_date`: NO (skip dynamic filtering)
-3. If beneficial, adds `DynamicFilterSource` node above hash build
-4. Marks probe-side `TableScanNode` with dynamic filter ID
+4. If beneficial, marks join for dynamic filtering
 5. Assigns unique filter ID linking build and probe sides
 
-**Output**: Query plan with filter markers
+**Output**: Query plan with filter markers on both `JoinNode` and `TableScanNode`
 
 #### Step 2: Build-Side Construction (Workers)
 
@@ -168,26 +171,32 @@ The version-based protocol lets coordinator incrementally fetch new filters with
 **Component**: `LocalDynamicFilter` (existing, presto-main)
 
 **What happens**:
-1. Coordinator adds filter to `LocalDynamicFilter` for merging
-2. If join is partitioned (multiple build workers):
-   - Wait for filters from all partitions
-   - Merge by INTERSECTION (value must be in ALL filters)
-3. If join is broadcast (single build worker):
-   - Filter is immediately complete
-4. Mark filter as complete in `DynamicFilterService`
 
-**Merge logic** (INTERSECTION semantics):
+**Broadcast join:**
+- All workers process identical build data (entire build side replicated)
+- All workers produce identical filter: `customer_id IN (1, 5, 7, ...)`
+- Coordinator can use filter from any single worker (no merge needed)
+- Filter immediately complete
 
-`LocalDynamicFilter` already handles `TupleDomain` merging:
-- **Discrete values**: Set intersection
-  - Worker 1: {1, 2, 5, 7} + Worker 2: {2, 5, 8, 9} → Merged: {2, 5}
-- **Ranges**: Intersection of ranges (max of mins, min of maxes)
-  - Worker 1: [10, 100] + Worker 2: [20, 90] → Merged: [20, 90]
-- **Mixed**: If one worker has discrete values and another has range, result is discrete values filtered by range
+**Partitioned join:**
+- Each worker processes different build data (build side distributed)
+- Worker 1: `customer_id IN (1, 2, 5)`
+- Worker 2: `customer_id IN (5, 7, 8)`
+- Coordinator must collect and merge using UNION: `customer_id IN (1, 2, 5, 7, 8)`
+- Wait for all partitions before marking complete
 
-`LocalDynamicFilter` tracks how many partitions are expected and signals completion when all partitions report.
+**Merge logic for partitioned joins** (UNION semantics):
 
-**Output**: Merged TupleDomain filter ready for distribution
+For partitioned joins, each worker processes different rows, so we need UNION of all filters:
+- **Discrete values**: Set union
+  - Worker 1: {1, 2, 5} + Worker 2: {5, 7, 8} → Merged: {1, 2, 5, 7, 8}
+- **Ranges**: Union of ranges (min of mins, max of maxes)
+  - Worker 1: [10, 50] + Worker 2: [40, 90] → Merged: [10, 90]
+- **Exceeds limit**: If merged discrete values exceed 10K limit, fall back to range
+
+Implementation: `TupleDomain` already supports this via `Domain.union()` method.
+
+**Output**: Complete filter ready for distribution (broadcast) or merged filter (partitioned)
 
 #### Step 5: Scheduler Waiting (Coordinator) ← **CRITICAL MISSING PIECE**
 
@@ -309,44 +318,234 @@ Now we describe each component in detail, organized by the flow steps above.
 - New optimizer rule added to optimization sequence
 - Runs after join reordering but before fragment creation
 - Modifies `JoinNode` and `TableScanNode` in query plan
+- **Applies to both broadcast and partitioned joins**
 
-**Algorithm** (cost-based analysis):
+**Key Design Decision: Unified Approach**
+
+Both broadcast and partitioned joins benefit from partition-level pruning:
+- **Broadcast**: Build side replicated to all workers → all produce identical filter → coordinator uses any one
+- **Partitioned**: Build side distributed across workers → coordinator merges partial filters
+
+In both cases, coordinator waits for filter before scheduling probe-side splits, enabling partition pruning.
+
+**Algorithm**:
 
 ```java
-// Simplified logic
-private boolean shouldAddDynamicFilter(JoinNode join, TableScanNode probeScan) {
-    // Check 1: Is build side selective? (< 50% of probe rows)
-    double selectivity = estimateBuildSelectivity(join);
-    if (selectivity > 0.5) return false;
+private boolean shouldAddDynamicFilter(JoinNode join, Context context) {
+    // Step 1: Find TableScanNode in probe side
+    // Traverses through ProjectNode, FilterNode, AggregationNode, WindowNode, etc.
+    TableScanNode scan = findTableScanRecursive(join.getProbe());
+    if (scan == null) {
+        return false;  // No table scan found in probe side
+    }
 
-    // Check 2: Can filter prune at storage level?
-    return canPrunePartitionsOrFiles(join, probeScan);
+    // Step 2: Can filter prune at storage level?
+    // This is the ONLY check needed - applies to both broadcast and partitioned
+    return canPrunePartitionsOrFiles(join, scan, context);
 }
 
-private boolean canPrunePartitionsOrFiles(JoinNode join, TableScanNode scan) {
-    // Extract join columns
-    Set<ColumnHandle> filterColumns = extractFilterColumns(join, scan);
+/**
+ * Recursively find TableScanNode, traversing any single-source nodes.
+ *
+ * KEY INSIGHT: Intermediate nodes (Aggregation, Window, etc.) don't prevent
+ * dynamic filtering from being beneficial. We prune at the SCAN level,
+ * reducing I/O and processing cost for all downstream operators.
+ */
+private TableScanNode findTableScanRecursive(PlanNode node) {
+    // Base case: found the scan
+    if (node instanceof TableScanNode) {
+        return (TableScanNode) node;
+    }
 
-    // Get table layout (already selected)
+    // Recursive case: traverse through single-source nodes
+    // Handles: ProjectNode, FilterNode, AggregationNode, WindowNode,
+    //          SortNode, LimitNode, TopNNode, etc.
+    if (node.getSources().size() == 1) {
+        return findTableScanRecursive(node.getSources().get(0));
+    }
+
+    // Multi-source (UnionNode, JoinNode) or leaf node - can't trace
+    return null;
+}
+
+/**
+ * Check if dynamic filter can prune partitions or files at storage level.
+ *
+ * Returns true if join column maps to a partition or bucket column.
+ */
+private boolean canPrunePartitionsOrFiles(JoinNode join, TableScanNode scan, Context context) {
+    // Step 1: Extract join columns from equijoin clauses
+    Set<ColumnHandle> filterColumns = extractFilterColumns(join, scan);
+    if (filterColumns.isEmpty()) {
+        return false;  // Couldn't trace join columns to scan
+    }
+
+    // Step 2: Get table layout (already selected by connector)
     ConnectorTableLayout layout = getTableLayout(scan);
 
-    // Check if filter columns match storage organization
+    // Step 3: Collect partition and bucket columns from layout
     Set<ColumnHandle> storageColumns = new HashSet<>();
+
+    // Partition columns (Hive: PARTITIONED BY, Iceberg: partition spec)
     layout.getDiscretePredicates()
         .map(DiscretePredicates::getColumns)
-        .ifPresent(storageColumns::addAll);  // Partition columns
+        .ifPresent(storageColumns::addAll);
+
+    // Bucket columns (Hive: CLUSTERED BY, Iceberg: bucket transforms)
     layout.getTablePartitioning()
         .map(ConnectorTablePartitioning::getPartitioningColumns)
-        .ifPresent(storageColumns::addAll);  // Bucket columns
+        .ifPresent(storageColumns::addAll);
 
-    // If overlap, pruning is possible
+    // Step 4: Check for overlap
     return filterColumns.stream().anyMatch(storageColumns::contains);
+}
+
+/**
+ * Extract ColumnHandles from join condition, tracing through intermediate nodes.
+ *
+ * For: SELECT ... FROM orders o JOIN customers c ON o.customer_id = c.id
+ * Returns: {customer_id ColumnHandle from orders table}
+ */
+private Set<ColumnHandle> extractFilterColumns(JoinNode join, TableScanNode targetScan) {
+    Set<ColumnHandle> filterColumns = new HashSet<>();
+
+    for (JoinNode.EquiJoinClause clause : join.getCriteria()) {
+        // Probe side variable (left side of join condition)
+        VariableReferenceExpression probeVar = clause.getLeft();
+
+        // Trace back through ProjectNode, FilterNode, etc. to find source column
+        Optional<ColumnHandle> column = findSourceColumn(probeVar, targetScan, join.getLeft());
+
+        column.ifPresent(filterColumns::add);
+    }
+
+    return filterColumns;
+}
+
+/**
+ * Trace a variable back through plan nodes to its source ColumnHandle.
+ *
+ * Handles:
+ * - ProjectNode: Follows simple column references (SELECT customer_id AS cust_id)
+ * - FilterNode: Passes through (WHERE clauses don't change columns)
+ * - Other single-source nodes: Continues tracing
+ *
+ * Stops tracing on:
+ * - Complex expressions: SELECT customer_id * 2 (can't match to partition column)
+ * - Multi-source nodes: UnionNode, JoinNode (ambiguous source)
+ */
+private Optional<ColumnHandle> findSourceColumn(
+        VariableReferenceExpression variable,
+        TableScanNode targetScan,
+        PlanNode currentNode) {
+
+    // Base case: reached the target table scan
+    if (currentNode instanceof TableScanNode) {
+        TableScanNode scan = (TableScanNode) currentNode;
+        if (scan.getId().equals(targetScan.getId())) {
+            return Optional.ofNullable(scan.getAssignments().get(variable));
+        }
+        return Optional.empty();
+    }
+
+    // ProjectNode: Check if it's a simple column reference
+    if (currentNode instanceof ProjectNode) {
+        ProjectNode project = (ProjectNode) currentNode;
+        RowExpression expression = project.getAssignments().get(variable);
+
+        // Simple reference: SELECT customer_id AS cust_id
+        if (expression instanceof VariableReferenceExpression) {
+            return findSourceColumn(
+                (VariableReferenceExpression) expression,
+                targetScan,
+                project.getSource());
+        }
+
+        // Complex expression: SELECT customer_id * 2
+        // Can't match to partition column, stop tracing
+        return Optional.empty();
+    }
+
+    // FilterNode and other single-source nodes: pass through
+    if (currentNode.getSources().size() == 1) {
+        return findSourceColumn(variable, targetScan, currentNode.getSources().get(0));
+    }
+
+    // Can't trace through multi-source nodes
+    return Optional.empty();
 }
 ```
 
+**Why Intermediate Nodes Don't Matter**
+
+Dynamic filtering prunes at the **scan level**, saving I/O and CPU for ALL downstream operators:
+
+**Example: Aggregation between scan and join**
+```sql
+SELECT customer_id, SUM(amount)
+FROM orders  -- 100M rows, partitioned by customer_id
+GROUP BY customer_id  -- outputs 1M groups
+JOIN customers ON orders.customer_id = customers.id
+WHERE customers.region = 'US';  -- filter: customer_id IN (500 values)
+```
+
+**Without dynamic filter:**
+- Scan: Read 100M rows from storage (~1.5s I/O)
+- Aggregate: Process 100M rows (~500ms CPU)
+- Join: Probe 1M groups with 500 customers (~1ms)
+
+**With dynamic filter (customer_id IN (...)):**
+- Scan: Read 5M rows (95% partitions pruned, ~75ms I/O)
+- Aggregate: Process 5M rows (~25ms CPU)
+- Join: Probe 50K groups with 500 customers (~0.1ms)
+
+**Savings: 1.4s I/O + 475ms CPU = 1.875s total**
+
+The aggregation doesn't prevent dynamic filtering from being worthwhile - we still save massive I/O and aggregation cost by pruning at the scan!
+
+**Examples of When It Works**
+
+```sql
+-- ✅ Broadcast join with aggregation
+SELECT c.region, SUM(o.amount)
+FROM orders o  -- 100M rows, partitioned by customer_id
+GROUP BY o.customer_id
+JOIN customers c ON o.customer_id = c.id  -- Broadcast: 10K customers
+WHERE c.active = true;  -- Filters to 500 customers
+-- Filter prunes 99.5% of partitions before scan
+
+-- ✅ Partitioned join with window function
+SELECT o.*, ROW_NUMBER() OVER (PARTITION BY o.customer_id)
+FROM orders o  -- 100M rows, partitioned by customer_id
+JOIN customers c ON o.customer_id = c.id  -- Partitioned join
+WHERE c.region = 'US';
+-- Filter prunes 95% of partitions before scan
+
+-- ✅ Broadcast join with filters and projects
+SELECT o.order_id, o.amount * 1.1 as amount_with_tax
+FROM orders o  -- 100M rows
+WHERE o.status = 'shipped'
+JOIN customers c ON o.customer_id = c.id  -- Broadcast
+WHERE c.vip = true;
+-- Can trace customer_id through ProjectNode and FilterNode
+
+-- ❌ Complex expression in join condition
+SELECT o.*
+FROM orders o
+JOIN customers c ON o.customer_id * 2 = c.id
+-- Can't match "customer_id * 2" to partition column
+
+-- ❌ No table scan in probe side
+SELECT *
+FROM (VALUES (1), (2), (3)) AS t(id)
+JOIN customers c ON t.id = c.id
+-- No TableScanNode to prune
+```
+
 **Output**:
-- `JoinNode` gets `DynamicFilterSource` child
+- `JoinNode` marked with dynamic filter metadata
 - `TableScanNode` marked with dynamic filter IDs: `dynamicFilterIds = ["df_customer_id"]`
+- Works for both broadcast and partitioned joins
 
 #### 2.2 Runtime Filter Structure
 
