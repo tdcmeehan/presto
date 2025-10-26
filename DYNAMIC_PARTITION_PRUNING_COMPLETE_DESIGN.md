@@ -1711,7 +1711,75 @@ The algorithm extracts filter columns from join conditions and traces them back 
 
 Example scenarios demonstrating when dynamic filtering is beneficial are provided in the footnotes[^pruning-examples].
 
-#### 8.7.3 Scheduler Implementation
+#### 8.7.3 Why Split-Level Waiting (Not Stage-Level)?
+
+Presto has existing stage-level scheduling (`PhasedExecutionSchedule`) that sequences stages based on dependencies. For joins, build stages run before probe stages. A natural question: **why implement waiting at the split scheduler level instead of the stage level?**
+
+**Answer: Bucketed execution requires split-level waiting.**
+
+Dynamic partition pruning supports three execution modes, and only split-level waiting handles all three:
+
+**Execution Mode 1: Broadcast Joins (Separate Stages)**
+```
+Stage 1 (build): Scan customers WHERE region='US' → HashBuild
+Stage 2 (probe): Scan orders → Join
+```
+- Build and probe in **different stages**
+- Stage-level waiting would work: Stage 2 waits for Stage 1 to produce filter
+
+**Execution Mode 2: Partitioned Joins (Separate Stages)**
+```
+Stage 1 (build): Scan customers (partitioned) → HashBuild
+Stage 2 (probe): Scan orders (partitioned) → Join
+```
+- Build and probe in **different stages**
+- Stage-level waiting would work: Stage 2 waits for Stage 1 to produce merged filter
+
+**Execution Mode 3: Bucketed Joins (Same Stage, Grouped Execution)**
+```
+Single Stage, Bucket 0: Scan customers (bucket 0) → HashBuild → Scan orders (bucket 0) → Join
+Single Stage, Bucket 1: Scan customers (bucket 1) → HashBuild → Scan orders (bucket 1) → Join
+...
+Single Stage, Bucket N: Scan customers (bucket N) → HashBuild → Scan orders (bucket N) → Join
+```
+- Build and probe in **same stage**, executed bucket-by-bucket (lifespan-by-lifespan)
+- **Stage-level waiting would deadlock** (stage waiting for itself to produce filters)
+- **Split-level waiting is required** (wait per-lifespan before scheduling probe splits)
+
+**Critical Benefit for Bucketed Execution: Bucket-Level + Partition-Level Pruning**
+
+Bucketed joins benefit from dynamic filtering at TWO levels:
+
+```sql
+-- orders: 256 buckets on customer_id, 365 date partitions → 93,440 potential splits
+-- customers: 256 buckets on customer_id, region filter produces only 10 buckets with data
+
+SELECT * FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+WHERE c.region = 'US';
+```
+
+**Without dynamic filtering:**
+- Schedule all 256 buckets (lifespans)
+- Each bucket scans all 365 date partitions
+- Total: 256 × 365 = 93,440 splits
+
+**With dynamic filtering (split-level waiting):**
+1. Build side completes for buckets 0-255, producing filters showing which buckets contain region='US' customers
+2. Filters reveal only buckets {5, 12, 23, 45, 67, 89, 123, 156, 189, 234} have matching data
+3. **Bucket-level pruning**: Skip 246 buckets entirely (never schedule those lifespans)
+4. **Partition-level pruning**: Within 10 active buckets, prune to specific date ranges where customers exist
+5. Total: 10 buckets × ~50 partitions = 500 splits
+6. **99.5% reduction**: 93,440 → 500 splits
+
+**Architectural Advantage: Unified Implementation**
+
+Split-level waiting provides a single code path for all execution modes:
+- **Bucketed joins**: Wait per-lifespan before generating splits for each bucket
+- **Broadcast/Partitioned joins**: Wait before generating probe-side splits (same mechanism, just across stages)
+- **No special-casing**: `SourcePartitionedScheduler` doesn't need to know which execution mode is active
+
+#### 8.7.4 Scheduler Implementation
 
 The scheduler in `SourcePartitionedScheduler` makes a trivial decision:
 
@@ -1769,7 +1837,7 @@ private CompletableFuture<SplitBatch> scheduleWithDynamicFilterWait(
 }
 ```
 
-#### 8.7.4 Queue-Depth Awareness
+#### 8.7.5 Queue-Depth Awareness
 
 To prevent over-scheduling, the scheduler tracks queue depth across all tasks:
 
@@ -1801,7 +1869,7 @@ private CompletableFuture<?> createQueueDrainFuture() {
 - Better to wait for EITHER filter (reduces future work) OR queue drain (space for work)
 - Self-regulating: adapts to actual execution speed
 
-#### 8.7.5 Connector Usage
+#### 8.7.6 Connector Usage
 
 Connectors receive the dynamic filter and decide how to use it:
 

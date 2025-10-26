@@ -246,6 +246,70 @@ set session dynamic_filter_max_wait_time='500ms';
 
 **Output**: Scheduler delays split scheduling until filter arrives
 
+##### Why Split-Level Waiting (Not Stage-Level)?
+
+**Presto has existing stage-level scheduling** (`PhasedExecutionSchedule`) that sequences stages based on dependencies. For joins, build stages run before probe stages. One might ask: why not wait at the stage level?
+
+**Answer: Bucketed execution requires split-level waiting.**
+
+Dynamic partition pruning supports three execution modes:
+
+**1. Broadcast Joins (Separate Stages)**
+```
+Stage 1 (build): Scan customers WHERE region='US' → HashBuild
+Stage 2 (probe): Scan orders → Join
+```
+- Build and probe in **different stages**
+- Stage-level waiting would work here
+
+**2. Partitioned Joins (Separate Stages)**
+```
+Stage 1 (build): Scan customers (partitioned) → HashBuild
+Stage 2 (probe): Scan orders (partitioned) → Join
+```
+- Build and probe in **different stages**
+- Stage-level waiting would work here
+
+**3. Bucketed Joins (Same Stage, Grouped Execution)**
+```
+Single Stage, Bucket 0: Scan customers (bucket 0) → HashBuild → Scan orders (bucket 0) → Join
+Single Stage, Bucket 1: Scan customers (bucket 1) → HashBuild → Scan orders (bucket 1) → Join
+...
+Single Stage, Bucket 255: Scan customers (bucket 255) → HashBuild → Scan orders (bucket 255) → Join
+```
+- Build and probe in **same stage**, executed bucket-by-bucket (lifespan-by-lifespan)
+- **Stage-level waiting would create deadlock** (stage waiting for itself)
+- **Split-level waiting is required**
+
+**Bucketed execution example showing massive pruning:**
+
+```sql
+-- orders: 256 buckets on customer_id, 365 date partitions → 93,440 potential splits
+-- customers: 256 buckets on customer_id, region filter leaves only 10 buckets with data
+
+SELECT * FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+WHERE c.region = 'US';
+```
+
+**Without dynamic filtering:**
+- Schedule all 256 buckets
+- Each bucket scans all 365 date partitions
+- Total: 256 × 365 = 93,440 splits
+
+**With dynamic filtering (split-level waiting):**
+1. Build completes for buckets 0-255
+2. Filters reveal only buckets {5, 12, 23, 45, 67, 89, 123, 156, 189, 234} contain region='US'
+3. **Bucket-level pruning**: Skip 246 buckets entirely (never schedule their lifespans)
+4. **Partition-level pruning**: Within 10 active buckets, prune to date ranges where customers exist
+5. Total: 10 buckets × ~50 partitions = 500 splits
+6. **99.5% reduction** (93,440 → 500 splits)
+
+**Split-level waiting handles all three execution modes:**
+- **Bucketed**: Wait per-lifespan before generating splits for each bucket
+- **Broadcast/Partitioned**: Wait before generating probe-side splits (same mechanism, across stages)
+- **Unified implementation**: Single code path in `SourcePartitionedScheduler`
+
 #### Step 6: Filter Distribution (Coordinator → Workers)
 
 **Component**: `DynamicFilterService` (presto-main)
