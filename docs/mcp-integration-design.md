@@ -445,30 +445,48 @@ public class CoordinatorModule extends AbstractConfigurationAwareModule {
 
 ### 4.2 Core Enhancements Required
 
-#### Enhancement 1: Pluggable Endpoint Registry
+#### Enhancement 1: Plugin Gateway Resource (Instead of Dynamic Endpoint Registration)
 
-**File:** `presto-spi/src/main/java/com/facebook/presto/spi/EndpointFactory.java` (NEW)
+**Problem:** Presto loads plugins AFTER the Guice injector is created, so plugins cannot register JAX-RS resources dynamically during module configuration.
+
+**Solution:** Register a single gateway resource in core that delegates to plugin-provided handlers.
+
+**File:** `presto-spi/src/main/java/com/facebook/presto/spi/ProtocolHandlerFactory.java` (NEW)
 
 ```java
 package com.facebook.presto.spi;
 
 /**
- * Factory for creating custom JAX-RS endpoints.
- * Plugins can implement this to register protocol handlers.
+ * Factory for creating protocol handlers that can process custom protocol requests.
+ * Plugins can implement this to add support for protocols like MCP, GraphQL, etc.
  */
-public interface EndpointFactory {
+public interface ProtocolHandlerFactory {
     /**
-     * Returns the JAX-RS resource class to register.
+     * Returns the protocol name (e.g., "mcp", "graphql")
      */
-    Class<?> getResourceClass();
+    String getProtocolName();
 
     /**
-     * Returns the base path for this endpoint (optional).
-     * If not provided, uses @Path annotation on resource class.
+     * Creates a protocol handler instance.
      */
-    default Optional<String> getBasePath() {
-        return Optional.empty();
-    }
+    ProtocolHandler create();
+}
+
+/**
+ * Handles requests for a specific protocol.
+ */
+public interface ProtocolHandler {
+    /**
+     * Handles a protocol request.
+     * @param requestBody The raw request body
+     * @param headers Request headers
+     * @param sessionContext User session context
+     * @return Response object (will be serialized to JSON)
+     */
+    Object handleRequest(
+        String requestBody,
+        Map<String, String> headers,
+        SessionContext sessionContext);
 }
 ```
 
@@ -479,11 +497,128 @@ public interface Plugin {
     // Existing methods...
 
     /**
-     * Returns custom endpoint factories for registering protocol handlers.
+     * Returns protocol handler factories for custom protocols.
      * Added in version X.Y for MCP and other protocol support.
      */
-    default Iterable<EndpointFactory> getEndpointFactories() {
+    default Iterable<ProtocolHandlerFactory> getProtocolHandlerFactories() {
         return ImmutableList.of();
+    }
+}
+```
+
+**File:** `presto-main/src/main/java/com/facebook/presto/server/protocol/PluginProtocolManager.java` (NEW)
+
+```java
+package com.facebook.presto.server.protocol;
+
+/**
+ * Manages protocol handlers from plugins.
+ * Instantiated during Guice setup, updated when plugins are loaded.
+ */
+public class PluginProtocolManager {
+    private final Map<String, ProtocolHandler> handlers = new ConcurrentHashMap<>();
+
+    /**
+     * Registers a protocol handler.
+     * Called by PluginManager after plugins are loaded.
+     */
+    public void registerHandler(String protocolName, ProtocolHandler handler) {
+        handlers.put(protocolName.toLowerCase(), handler);
+    }
+
+    /**
+     * Gets a protocol handler by name.
+     */
+    public Optional<ProtocolHandler> getHandler(String protocolName) {
+        return Optional.ofNullable(handlers.get(protocolName.toLowerCase()));
+    }
+
+    /**
+     * Returns all registered protocol names.
+     */
+    public Set<String> getProtocolNames() {
+        return ImmutableSet.copyOf(handlers.keySet());
+    }
+}
+```
+
+**File:** `presto-main/src/main/java/com/facebook/presto/server/protocol/PluginProtocolResource.java` (NEW)
+
+```java
+package com.facebook.presto.server.protocol;
+
+import jakarta.inject.Inject;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.*;
+
+/**
+ * Gateway JAX-RS resource that delegates to plugin-provided protocol handlers.
+ * Registered during module setup, handlers added later when plugins load.
+ */
+@Path("/v1/protocol/{protocolName}")
+public class PluginProtocolResource {
+    private final PluginProtocolManager protocolManager;
+
+    @Inject
+    public PluginProtocolResource(PluginProtocolManager protocolManager) {
+        this.protocolManager = protocolManager;
+    }
+
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response handleRequest(
+            @PathParam("protocolName") String protocolName,
+            @Context HttpHeaders headers,
+            @Context SecurityContext securityContext,
+            String requestBody) {
+
+        // Get protocol handler
+        ProtocolHandler handler = protocolManager.getHandler(protocolName)
+            .orElseThrow(() -> new WebApplicationException(
+                "Unknown protocol: " + protocolName,
+                Response.Status.NOT_FOUND));
+
+        // Extract session context
+        SessionContext sessionContext = extractSessionContext(headers, securityContext);
+
+        // Delegate to handler
+        try {
+            Object result = handler.handleRequest(
+                requestBody,
+                extractHeaders(headers),
+                sessionContext);
+
+            return Response.ok(result).build();
+        }
+        catch (Exception e) {
+            return Response.serverError()
+                .entity(Map.of("error", e.getMessage()))
+                .build();
+        }
+    }
+
+    @GET
+    public Response listProtocols() {
+        return Response.ok(Map.of(
+            "protocols", protocolManager.getProtocolNames()
+        )).build();
+    }
+
+    private SessionContext extractSessionContext(HttpHeaders headers, SecurityContext securityContext) {
+        // Extract session properties from headers (catalog, schema, user, etc.)
+        // Similar to QueuedStatementResource
+        return new SessionContext(...);
+    }
+
+    private Map<String, String> extractHeaders(HttpHeaders headers) {
+        Map<String, String> headerMap = new HashMap<>();
+        headers.getRequestHeaders().forEach((name, values) -> {
+            if (!values.isEmpty()) {
+                headerMap.put(name, values.get(0));
+            }
+        });
+        return headerMap;
     }
 }
 ```
@@ -495,25 +630,50 @@ public class CoordinatorModule extends AbstractConfigurationAwareModule {
     protected void setup(Binder binder) {
         // ... existing bindings ...
 
-        // NEW: Bind endpoint registry
-        binder.bind(PluginEndpointRegistry.class).in(Scopes.SINGLETON);
+        // NEW: Plugin protocol support
+        binder.bind(PluginProtocolManager.class).in(Scopes.SINGLETON);
+        jaxrsBinder(binder).bind(PluginProtocolResource.class);
     }
 }
+```
 
-// NEW class
-public class PluginEndpointRegistry {
+**File:** `presto-main-base/src/main/java/com/facebook/presto/server/PluginManager.java` (MODIFY)
+
+```java
+public class PluginManager {
+    private final PluginProtocolManager protocolManager;
+
     @Inject
-    public PluginEndpointRegistry(
-            PluginManager pluginManager,
-            HttpServerBinder httpServerBinder) {
+    public PluginManager(
+            // ... existing parameters ...
+            PluginProtocolManager protocolManager) {
+        // ... existing initialization ...
+        this.protocolManager = protocolManager;
+    }
 
-        // Register endpoints from plugins
-        for (EndpointFactory factory : pluginManager.getEndpointFactories()) {
-            httpServerBinder.bindResource("/", factory.getResourceClass());
+    public void loadPlugins() {
+        // ... existing plugin loading ...
+
+        for (Plugin plugin : plugins) {
+            // ... existing plugin initialization ...
+
+            // NEW: Register protocol handlers
+            for (ProtocolHandlerFactory factory : plugin.getProtocolHandlerFactories()) {
+                ProtocolHandler handler = factory.create();
+                protocolManager.registerHandler(factory.getProtocolName(), handler);
+                log.info("Registered protocol handler: %s", factory.getProtocolName());
+            }
         }
     }
 }
 ```
+
+**Advantages:**
+- Works with existing plugin loading architecture
+- Single JAX-RS resource registered at module setup time
+- Handlers added dynamically when plugins load
+- Clean delegation pattern
+- Multiple protocols can coexist (MCP, GraphQL, etc.)
 
 #### Enhancement 2: Query Access API for Plugins
 
@@ -579,7 +739,7 @@ presto-mcp-plugin/
 ├── pom.xml
 └── src/main/java/com/facebook/presto/mcp/
     ├── MCPPlugin.java
-    ├── MCPResource.java (JAX-RS endpoint)
+    ├── MCPProtocolHandler.java (implements ProtocolHandler)
     ├── MCPQueryManager.java
     ├── MCPToolRegistry.java
     ├── protocol/
@@ -599,60 +759,83 @@ presto-mcp-plugin/
 ```java
 public class MCPPlugin implements Plugin {
     @Override
-    public Iterable<EndpointFactory> getEndpointFactories() {
-        return ImmutableList.of(new MCPEndpointFactory());
+    public Iterable<ProtocolHandlerFactory> getProtocolHandlerFactories() {
+        return ImmutableList.of(new MCPProtocolHandlerFactory());
     }
 
-    private static class MCPEndpointFactory implements EndpointFactory {
+    private static class MCPProtocolHandlerFactory implements ProtocolHandlerFactory {
         @Override
-        public Class<?> getResourceClass() {
-            return MCPResource.class;
+        public String getProtocolName() {
+            return "mcp";
+        }
+
+        @Override
+        public ProtocolHandler create() {
+            return new MCPProtocolHandler();
         }
     }
 }
 ```
 
-**File:** `presto-mcp-plugin/src/main/java/com/facebook/presto/mcp/MCPResource.java`
+**File:** `presto-mcp-plugin/src/main/java/com/facebook/presto/mcp/MCPProtocolHandler.java`
 
 ```java
-@Path("/v1/mcp")
-public class MCPResource {
-    private final MCPToolRegistry toolRegistry;
-    private final MCPQueryManager queryManager;
+public class MCPProtocolHandler implements ProtocolHandler {
+    private MCPToolRegistry toolRegistry;
+    private MCPQueryManager queryManager;
+    private boolean initialized = false;
 
-    @Inject
-    public MCPResource(
+    /**
+     * Initialize with injected dependencies.
+     * Called by PluginManager after creation.
+     */
+    public void initialize(
             QueryAccessProvider queryAccessProvider,
-            MetadataManager metadataManager) {
+            Metadata metadata) {
         this.queryManager = new MCPQueryManager(queryAccessProvider);
-        this.toolRegistry = new MCPToolRegistry(queryManager, metadataManager);
+        this.toolRegistry = new MCPToolRegistry(queryManager, metadata);
+        this.initialized = true;
     }
 
-    @POST
-    @Consumes(APPLICATION_JSON)
-    @Produces(APPLICATION_JSON)
-    public Response handleJsonRpc(String body) {
+    @Override
+    public Object handleRequest(
+            String requestBody,
+            Map<String, String> headers,
+            SessionContext sessionContext) {
+
+        if (!initialized) {
+            throw new IllegalStateException("MCPProtocolHandler not initialized");
+        }
+
         try {
-            JsonRpcRequest request = JsonRpcRequest.parse(body);
-            JsonRpcResponse response = dispatch(request);
-            return Response.ok(response.toJson()).build();
-        } catch (JsonRpcException e) {
-            return Response.ok(e.toErrorResponse().toJson()).build();
+            JsonRpcRequest request = JsonRpcRequest.parse(requestBody);
+            return dispatch(request, sessionContext);
+        }
+        catch (JsonRpcException e) {
+            return e.toErrorResponse();
+        }
+        catch (Exception e) {
+            return JsonRpcResponse.error(null, -32603, "Internal error: " + e.getMessage());
         }
     }
 
-    private JsonRpcResponse dispatch(JsonRpcRequest request) {
+    private Object dispatch(JsonRpcRequest request, SessionContext sessionContext) {
         switch (request.getMethod()) {
             case "initialize":
                 return handleInitialize(request);
+
             case "tools/list":
                 return handleToolsList(request);
+
             case "tools/call":
-                return handleToolCall(request);
+                return handleToolCall(request, sessionContext);
+
             case "resources/list":
                 return handleResourcesList(request);
+
             case "resources/read":
-                return handleResourceRead(request);
+                return handleResourceRead(request, sessionContext);
+
             default:
                 throw JsonRpcException.methodNotFound(request.getId());
         }
