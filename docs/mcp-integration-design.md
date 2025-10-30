@@ -95,47 +95,102 @@ Server → {"result": {"content": [...]}}  // Complete response expected
 
 ### 2.3 Resolution Strategies
 
-Three approaches to resolve the streaming mismatch:
+**Important Note:** MCP's cursor-based pagination applies **only to list operations** (tools/list, resources/list, prompts/list), NOT to the data returned by tools or resources themselves. This significantly constrains streaming options.
+
+Four approaches to resolve the streaming mismatch:
 
 #### Option A: Buffer and Wait (Simple, Limited)
 - MCP tool blocks until query completes
 - Buffers all results in memory
 - Returns complete dataset in single JSON-RPC response
 
-**Pros:** Simplest implementation, pure MCP compliance
+**Pros:** Simplest implementation, pure MCP compliance, no transport dependencies
 **Cons:**
-- Memory exhaustion on large queries
-- Timeout issues for long queries
+- Memory exhaustion on large queries (GB+ results)
+- Timeout issues for long queries (>30s)
 - Poor user experience (no progress feedback)
 - Defeats Presto's streaming advantage
 
-**Use Case:** Small analytical queries only
+**Use Case:** Small to medium queries (<10MB results, <30s execution)
 
-#### Option B: Pagination via Resources (MCP-Native)
-- Query invocation returns query ID
-- Client uses `resources/read` with cursor to fetch batches
-- Leverages MCP's cursor-based pagination
+#### Option B: SSE Streaming (MCP-Native, Recommended)
+- MCP tool initiates query and begins streaming via Server-Sent Events
+- Server pushes data events progressively as query executes
+- Client receives incremental results in real-time
 
-**Pros:** MCP-native pattern, memory efficient
+**MCP Transport:**
+When using HTTP with SSE transport, responses can be streamed as multiple SSE events:
+```
+POST /v1/mcp (tools/call with query_presto)
+→ Response with Content-Type: text/event-stream
+
+event: data
+data: {"rows": [...]}
+
+event: data
+data: {"rows": [...]}
+
+event: complete
+data: {"status": "finished", "totalRows": 50000}
+```
+
+**Pros:** True streaming, best user experience, memory efficient, MCP-compliant
 **Cons:**
-- Requires multiple round-trips (not truly streaming)
-- Cursor semantics differ from Presto's token model
-- Client must implement pagination logic
-
-**Use Case:** Moderate datasets where batch fetching is acceptable
-
-#### Option C: SSE Streaming (Advanced, Best UX)
-- MCP tool returns initial response with query ID
-- Server uses MCP's SSE transport for progressive updates
-- Client receives data events as query executes
-
-**Pros:** True streaming, best user experience, memory efficient
-**Cons:**
-- Requires SSE transport support
+- Requires SSE transport support (not all MCP clients)
 - More complex implementation
-- Not all MCP clients support SSE
+- Must handle SSE connection management
 
-**Use Case:** Interactive AI applications, large datasets
+**Use Case:** Large datasets, long-running queries, interactive AI applications
+
+#### Option C: Client-Side Pagination via SQL (Pragmatic)
+- AI agent makes multiple tool calls with LIMIT/OFFSET
+- Each call returns a manageable batch
+- No special server-side support needed
+
+**Example:**
+```
+tools/call: SELECT * FROM table ORDER BY id LIMIT 10000 OFFSET 0
+tools/call: SELECT * FROM table ORDER BY id LIMIT 10000 OFFSET 10000
+tools/call: SELECT * FROM table ORDER BY id LIMIT 10000 OFFSET 20000
+```
+
+**Pros:** Simple, no special streaming infrastructure, works with any transport
+**Cons:**
+- Inefficient (re-executes query each time)
+- Expensive for Presto (multiple query plans)
+- Not transparent to AI agent
+- Requires stable sort for correctness
+
+**Use Case:** Fallback when SSE not available, AI agent with pagination awareness
+
+#### Option D: Chunked Resources (Workaround)
+- Tool creates multiple resources representing query pages
+- Each resource URI represents a chunk: `presto://query/{id}/chunk/{n}`
+- Client reads resources sequentially
+
+**Example:**
+```
+tools/call query_presto → {
+  "queryId": "...",
+  "chunks": [
+    "presto://query/123/chunk/0",
+    "presto://query/123/chunk/1",
+    ...
+  ]
+}
+
+resources/read "presto://query/123/chunk/0" → {rows: [...]}
+resources/read "presto://query/123/chunk/1" → {rows: [...]}
+```
+
+**Pros:** Works within MCP resource model, no SSE required
+**Cons:**
+- Awkward semantics (pagination disguised as resources)
+- Must buffer chunks server-side
+- Multiple round-trips
+- Not truly MCP-idiomatic
+
+**Use Case:** Edge cases where SSE unavailable but buffering infeasible
 
 ---
 
@@ -246,40 +301,30 @@ public class MCPResource {
     private Response executePrestoQuery(JsonRpcRequest request) {
         String sql = request.getParams().get("arguments").get("sql");
 
-        // Option B: Return query ID + support pagination via resources
+        // Option A: Buffer and wait (simple implementation)
         QueryId queryId = dispatchManager.createQuery(...);
+
+        // For SSE streaming, would return immediately and stream via SSE
+        // For buffered approach, wait for completion
+        List<List<Object>> allRows = bufferQueryResults(queryId);
 
         return jsonRpcSuccess(request.getId(), Map.of(
             "queryId", queryId.toString(),
-            "status", "submitted",
-            "message", "Use resources/read with cursor to fetch results"
+            "rows", allRows,
+            "status", "completed"
         ));
     }
 
-    @POST
-    @Path("/resources/read")
-    public Response readResource(JsonRpcRequest request) {
-        String uri = request.getParams().get("uri"); // e.g., "presto://query/{queryId}"
-        String cursor = request.getParams().get("cursor");
-
-        // Parse queryId from URI
-        QueryId queryId = extractQueryId(uri);
-
-        // Get query from provider
-        Query query = queryProvider.getQuery(queryId);
-
-        // Fetch next batch (map cursor to token)
-        long token = cursor != null ? parseCursor(cursor) : 0L;
-        QueryResults results = query.waitForResults(token, ...);
-
-        // Convert to MCP resource response
-        String nextCursor = results.getNextUri() != null ?
-            String.valueOf(token + 1) : null;
-
-        return jsonRpcSuccess(request.getId(), Map.of(
-            "contents", convertToMCPContent(results),
-            "cursor", nextCursor
-        ));
+    // SSE streaming would be implemented separately
+    @GET
+    @Path("/stream/{queryId}")
+    @Produces(MediaType.SERVER_SENT_EVENTS)
+    public void streamQuery(
+            @PathParam("queryId") String queryIdStr,
+            @Context SseEventSink eventSink,
+            @Context Sse sse) {
+        // Stream results as SSE events
+        // See section 4.4 for full implementation
     }
 }
 ```
@@ -647,7 +692,7 @@ public class MCPQueryManager {
     private final QueryAccessProvider queryAccessProvider;
     private final ConcurrentMap<String, QueryContext> activeQueries = new ConcurrentHashMap<>();
 
-    public JsonRpcResponse executeQuery(
+    public JsonRpcResponse executeQueryBuffered(
             String sql,
             Map<String, String> sessionProperties,
             String requestId) {
@@ -659,137 +704,167 @@ public class MCPQueryManager {
         // Store query context
         activeQueries.put(queryId.toString(), new QueryContext(queryId, session));
 
-        // Return query handle (Strategy B: Pagination via Resources)
-        return JsonRpcResponse.success(requestId, ImmutableMap.of(
-            "type", "query",
-            "queryId", queryId.toString(),
-            "resourceUri", "presto://query/" + queryId,
-            "status", "submitted",
-            "message", "Use resources/read to fetch results with cursor-based pagination"
-        ));
-    }
+        // Option A: Buffer all results (simple but limited)
+        List<List<Object>> allRows = new ArrayList<>();
+        long token = 0;
 
-    public JsonRpcResponse fetchResults(String queryIdStr, String cursor) {
-        QueryId queryId = QueryId.valueOf(queryIdStr);
-        QueryContext context = activeQueries.get(queryIdStr);
-
-        if (context == null) {
-            throw JsonRpcException.invalidParams("Query not found: " + queryIdStr);
-        }
-
-        // Map cursor to token
-        long token = cursor != null ? Long.parseLong(cursor) : 0L;
-
-        // Fetch results
         try {
-            QueryResultBatch batch = queryAccessProvider.getResults(
-                queryId,
-                token,
-                DataSize.valueOf("16MB"), // Configurable
-                false // JSON format for MCP
-            ).get(30, TimeUnit.SECONDS);
+            while (true) {
+                QueryResultBatch batch = queryAccessProvider.getResults(
+                    queryId, token, DataSize.valueOf("16MB"), false
+                ).get(30, TimeUnit.SECONDS);
 
-            // Convert to MCP resource content
-            List<Map<String, Object>> content = convertToMCPContent(batch);
+                allRows.addAll(batch.getRows());
 
-            // Build response
-            Map<String, Object> result = new HashMap<>();
-            result.put("contents", content);
-
-            if (batch.hasMore()) {
-                result.put("cursor", String.valueOf(batch.getNextToken()));
+                if (!batch.hasMore()) {
+                    break;
+                }
+                token = batch.getNextToken();
             }
 
-            // Add metadata
-            result.put("mimeType", "application/json");
-            result.put("uri", "presto://query/" + queryIdStr);
+            return JsonRpcResponse.success(requestId, ImmutableMap.of(
+                "queryId", queryId.toString(),
+                "rows", allRows,
+                "status", "completed"
+            ));
 
-            return JsonRpcResponse.success(null, result);
-
-        } catch (TimeoutException e) {
-            throw JsonRpcException.internalError("Query timeout");
         } catch (Exception e) {
             throw JsonRpcException.internalError("Query execution failed: " + e.getMessage());
         }
     }
 
-    private List<Map<String, Object>> convertToMCPContent(QueryResultBatch batch) {
-        // Convert Presto rows to MCP content format
-        List<Map<String, Object>> content = new ArrayList<>();
+    public void executeQueryStreaming(
+            String sql,
+            Map<String, String> sessionProperties,
+            SseEventSink eventSink,
+            Sse sse) {
 
-        for (List<Object> row : batch.getRows()) {
-            Map<String, Object> rowMap = new LinkedHashMap<>();
-            for (int i = 0; i < batch.getColumns().size(); i++) {
-                rowMap.put(batch.getColumns().get(i).getName(), row.get(i));
+        // Submit query
+        SessionContext session = createSessionContext(sessionProperties);
+        QueryId queryId = queryAccessProvider.submitQuery(session, sql, ImmutableMap.of());
+
+        // Option B: SSE Streaming (recommended for large results)
+        long token = 0;
+
+        try {
+            while (true) {
+                QueryResultBatch batch = queryAccessProvider.getResults(
+                    queryId, token, DataSize.valueOf("1MB"), false
+                ).get(30, TimeUnit.SECONDS);
+
+                // Stream data event
+                OutboundSseEvent dataEvent = sse.newEventBuilder()
+                    .name("data")
+                    .data(Map.of("rows", batch.getRows()))
+                    .build();
+                eventSink.send(dataEvent);
+
+                if (!batch.hasMore()) {
+                    // Send completion event
+                    OutboundSseEvent completeEvent = sse.newEventBuilder()
+                        .name("complete")
+                        .data(Map.of("status", "finished", "queryId", queryId.toString()))
+                        .build();
+                    eventSink.send(completeEvent);
+                    break;
+                }
+
+                token = batch.getNextToken();
             }
-            content.add(rowMap);
+        } catch (Exception e) {
+            // Send error event
+            OutboundSseEvent errorEvent = sse.newEventBuilder()
+                .name("error")
+                .data(Map.of("error", e.getMessage()))
+                .build();
+            eventSink.send(errorEvent);
+        } finally {
+            eventSink.close();
         }
-
-        return content;
     }
 }
 ```
 
-### 4.4 Streaming Strategy: Option B (Recommended)
+### 4.4 Streaming Strategy: Hybrid Approach (Recommended)
 
-Use **MCP Resources with Cursor-Based Pagination** for result streaming:
+Implement **two modes** to handle different query sizes:
+
+#### Mode 1: Buffered (Default for Small Queries)
+
+For queries with small result sets (<10MB, <30s execution):
 
 **Query Execution Flow:**
-
 ```
-1. AI calls tool: tools/call with name="query_presto", arguments={"sql": "SELECT ..."}
+AI calls tool: tools/call with name="query_presto", arguments={"sql": "SELECT ..."}
 
-   Response: {
-     "result": {
-       "queryId": "20231201_123456_00000_abc12",
-       "resourceUri": "presto://query/20231201_123456_00000_abc12",
-       "status": "submitted"
-     }
-   }
-
-2. AI reads resource: resources/read with uri="presto://query/...", cursor=null
-
-   Response: {
-     "result": {
-       "contents": [
-         {"col1": "value1", "col2": 123},
-         {"col1": "value2", "col2": 456},
-         ...
-       ],
-       "cursor": "1",  // Next token
-       "mimeType": "application/json"
-     }
-   }
-
-3. AI continues: resources/read with cursor="1"
-
-   Response: {
-     "result": {
-       "contents": [...],
-       "cursor": "2"
-     }
-   }
-
-4. Final batch: resources/read with cursor="N"
-
-   Response: {
-     "result": {
-       "contents": [...],
-       // No cursor = query complete
-     }
-   }
+Response (after query completes): {
+  "result": {
+    "queryId": "20231201_123456_00000_abc12",
+    "rows": [
+      {"col1": "value1", "col2": 123},
+      {"col1": "value2", "col2": 456},
+      ...
+    ],
+    "status": "completed"
+  }
+}
 ```
 
 **Advantages:**
-- MCP-native pattern (cursor pagination is specified in MCP)
-- Memory efficient (only buffering current batch)
-- Timeout-safe (incremental progress)
-- Aligns with Presto's token model
+- Simple implementation
+- Single round-trip
+- Works with all MCP transports
 
 **Limitations:**
-- Not truly streaming (requires multiple requests)
-- AI agent must implement pagination loop
-- Higher latency than SSE streaming
+- Memory usage scales with result size
+- Can timeout on long queries
+- Poor for large datasets
+
+#### Mode 2: SSE Streaming (For Large Queries)
+
+For queries with large result sets or long execution times:
+
+**Query Execution Flow:**
+```
+1. AI calls tool: tools/call with name="query_presto_stream", arguments={"sql": "SELECT ..."}
+
+   Response: HTTP 200 with Content-Type: text/event-stream
+
+2. Server streams events as query executes:
+
+   event: data
+   data: {"rows": [{"col1": "value1", "col2": 123}, ...]}
+
+   event: data
+   data: {"rows": [{"col1": "value11", "col2": 234}, ...]}
+
+   event: data
+   data: {"rows": [{"col1": "value21", "col2": 345}, ...]}
+
+   event: complete
+   data: {"status": "finished", "queryId": "20231201_123456_00000_abc12", "totalRows": 50000}
+```
+
+**Advantages:**
+- True streaming (data flows as available)
+- Memory efficient (only buffering current batch)
+- Timeout-safe (incremental progress)
+- Best user experience (real-time feedback)
+- Aligns perfectly with Presto's polling model
+
+**Limitations:**
+- Requires SSE transport support
+- More complex implementation
+- Not all MCP clients may support SSE
+
+#### Tool Selection
+
+Expose both as separate tools:
+
+- **`query_presto`** - Buffered mode (simple queries)
+- **`query_presto_stream`** - SSE streaming mode (large/long queries)
+
+AI agent can choose based on query characteristics.
 
 ### 4.5 Configuration
 
@@ -821,39 +896,55 @@ mcp.binary-results=false
 | Strategy | Memory | Latency | Timeout Risk | MCP Compliance | Implementation |
 |----------|--------|---------|--------------|----------------|----------------|
 | **A: Buffer All** | ❌ High | ⚠️ High | ❌ High | ✅ Perfect | ✅ Simple |
-| **B: Resource Pagination** | ✅ Low | ⚠️ Medium | ✅ Low | ✅ Good | ⚠️ Moderate |
-| **C: SSE Streaming** | ✅ Low | ✅ Low | ✅ Low | ⚠️ Advanced | ❌ Complex |
+| **B: SSE Streaming** | ✅ Low | ✅ Low | ✅ Low | ✅ Good | ⚠️ Moderate |
+| **C: Client SQL Pagination** | ✅ Low | ❌ High | ✅ Low | ✅ Perfect | ✅ Simple |
+| **D: Chunked Resources** | ⚠️ Medium | ⚠️ Medium | ✅ Low | ⚠️ Workaround | ❌ Complex |
 
-### 5.2 Recommended Approach: Hybrid
+**Key Insight:** MCP's cursor pagination is ONLY for list operations (tools/list, resources/list), NOT for data returned by tools/resources.
 
-Implement **Strategy B** (Resource Pagination) as default, with optional **Strategy C** (SSE) for advanced clients:
+### 5.2 Recommended Approach: Dual-Mode
 
-**Default Mode (Resource Pagination):**
+Implement **two separate tools** for different query patterns:
+
+**Mode 1: Buffered (query_presto)** - For small queries
 ```
-tools/call → queryId
-resources/read (cursor=null) → batch 1 + cursor
-resources/read (cursor=1) → batch 2 + cursor
-...
-resources/read (cursor=N) → final batch (no cursor)
-```
-
-**Advanced Mode (SSE Streaming):**
-```
-tools/call → queryId + SSE endpoint URL
-Client connects to SSE: /v1/mcp/stream/{queryId}
-Server pushes events:
-  event: data
-  data: {"rows": [...]}
-
-  event: data
-  data: {"rows": [...]}
-
-  event: complete
-  data: {"status": "finished"}
+tools/call query_presto {"sql": "SELECT * FROM small_table"}
+→ {"result": {"rows": [...all rows...], "status": "completed"}}
 ```
 
-**Implementation Note:**
-SSE mode would require an additional endpoint in `MCPResource`:
+**Advantages:**
+- Simple, single request
+- Works everywhere
+- No special transport needed
+
+**When to use:** Result sets <10MB, queries <30s
+
+**Mode 2: SSE Streaming (query_presto_stream)** - For large queries
+```
+tools/call query_presto_stream {"sql": "SELECT * FROM large_table"}
+→ Response: Content-Type: text/event-stream
+
+event: data
+data: {"rows": [...batch 1...]}
+
+event: data
+data: {"rows": [...batch 2...]}
+
+event: complete
+data: {"status": "finished"}
+```
+
+**Advantages:**
+- True streaming
+- Memory efficient
+- Real-time progress
+- MCP-compliant (SSE is part of MCP spec)
+
+**When to use:** Large result sets, long queries, real-time feedback
+
+### 5.3 SSE Implementation Pattern
+
+SSE streaming aligns perfectly with MCP's transport layer and Presto's polling model:
 
 ```java
 @GET
@@ -912,7 +1003,7 @@ public void streamResults(
 - [ ] Create presto-mcp-plugin module structure
 - [ ] Implement JSON-RPC protocol handling
 - [ ] Implement `tools/list` and `tools/call` for basic query execution
-- [ ] Implement Strategy B (Resource Pagination)
+- [ ] Implement buffered query execution (query_presto tool)
 - [ ] Add integration tests with mock MCP client
 
 ### Phase 3: Enhanced Tools (2-3 weeks)
@@ -1039,12 +1130,12 @@ Use `QueryBlockingRateLimiter` (existing in Presto).
 ### 9.1 Metrics
 
 **Key Metrics to Track:**
-- `mcp.queries.submitted` (counter)
-- `mcp.queries.completed` (counter)
-- `mcp.queries.failed` (counter)
+- `mcp.queries.submitted` (counter by mode: buffered/streaming)
+- `mcp.queries.completed` (counter by mode)
+- `mcp.queries.failed` (counter by mode)
 - `mcp.query.duration` (histogram)
 - `mcp.result.bytes` (histogram)
-- `mcp.pagination.requests` (counter)
+- `mcp.sse.batches.sent` (counter for streaming mode)
 
 **Implementation:**
 ```java
@@ -1066,16 +1157,16 @@ mbeanExporter.export("com.facebook.presto.mcp:name=MCPMetrics", new MCPMetrics()
 ### 9.2 Logging
 
 **Log Key Events:**
-- Query submission (with SQL, user, session properties)
-- Pagination requests (query ID, cursor/token)
+- Query submission (with SQL, user, session properties, mode)
+- SSE streaming events (query ID, batch number, rows sent)
 - Query completion (with stats)
 - Errors (with stack traces)
 
 **Log Format:**
 ```
-[MCP] Query submitted: queryId=20231201_123456_00000_abc12, user=ai-agent, sql="SELECT ..."
-[MCP] Results fetched: queryId=..., token=5, rows=1000, bytes=512KB
-[MCP] Query completed: queryId=..., duration=5.2s, totalRows=50000
+[MCP] Query submitted: queryId=20231201_123456_00000_abc12, user=ai-agent, mode=buffered, sql="SELECT ..."
+[MCP] SSE batch sent: queryId=..., batchNum=5, rows=1000, bytes=512KB
+[MCP] Query completed: queryId=..., duration=5.2s, totalRows=50000, mode=streaming
 ```
 
 ---
@@ -1095,31 +1186,34 @@ mbeanExporter.export("com.facebook.presto.mcp:name=MCPMetrics", new MCPMetrics()
 
 ### 10.2 Streaming Resolution
 
-**Approach:** Resource Pagination (Strategy B) with optional SSE (Strategy C)
+**Approach:** Dual-Mode (Buffered + SSE Streaming)
 
 **Rationale:**
-1. **MCP-Native:** Cursor-based pagination is part of MCP spec
-2. **Memory Efficient:** No full buffering required
-3. **Timeout-Safe:** Incremental progress prevents long-running query timeouts
-4. **Pragmatic:** Balances implementation complexity with functionality
-5. **Extensible:** SSE can be added later for enhanced streaming
+1. **MCP-Compliant:** Cursor pagination only applies to list operations, not data
+2. **Flexible:** Two tools for different query patterns (small vs large)
+3. **Memory Efficient:** Buffered for small queries, SSE streaming for large
+4. **Timeout-Safe:** SSE provides incremental progress for long queries
+5. **Pragmatic:** Simple implementation path (start buffered, add SSE later)
+
+**Important Correction:** Initial design incorrectly assumed MCP resource pagination could be used for query results. MCP's cursor-based pagination is **only for list operations** (tools/list, resources/list), not for the data returned by tools themselves. The correct approach is SSE streaming for large results.
 
 ### 10.3 Next Steps
 
 1. **Validate Approach:** Review design with Presto team and stakeholders
 2. **Prototype Core Extensions:** Implement `EndpointFactory` and `QueryAccessProvider`
-3. **Build PoC:** Create minimal MCP plugin with single query tool
-4. **Evaluate Streaming:** Test pagination performance with real AI agents
+3. **Build PoC:** Create minimal MCP plugin with buffered query tool
+4. **Evaluate Streaming:** Test buffered mode, then add SSE streaming for large queries
 5. **Iterate:** Gather feedback and refine implementation
 
 ### 10.4 Success Criteria
 
-- [ ] AI agents can query Presto via MCP protocol
-- [ ] Large result sets stream incrementally without memory issues
-- [ ] Query timeout behavior is acceptable (<30s per batch)
+- [ ] AI agents can query Presto via MCP protocol (both tools/call methods)
+- [ ] Small queries (<10MB) work with buffered mode without memory issues
+- [ ] Large result sets stream via SSE without memory exhaustion
+- [ ] Query timeout behavior is acceptable (buffered: <30s, streaming: incremental)
 - [ ] Plugin loads without modifying core (beyond agreed extensions)
 - [ ] Performance overhead is <5% vs. native Presto protocol
-- [ ] Authentication and authorization work correctly
+- [ ] Authentication and authorization work correctly for both modes
 
 ---
 
@@ -1130,33 +1224,40 @@ mbeanExporter.export("com.facebook.presto.mcp:name=MCPMetrics", new MCPMetrics()
 Proposed tools for MCP plugin:
 
 1. **query_presto**
-   - Execute arbitrary SQL query
-   - Returns query ID and resource URI
+   - Execute SQL query (buffered mode)
+   - Returns all results in single response
+   - Best for small queries (<10MB, <30s)
    - Supports session properties
 
-2. **list_catalogs**
+2. **query_presto_stream**
+   - Execute SQL query (streaming mode)
+   - Uses SSE to stream results incrementally
+   - Best for large queries or long execution times
+   - Supports session properties
+
+3. **list_catalogs**
    - Returns available catalogs
    - No pagination needed (small result set)
 
-3. **list_schemas**
+4. **list_schemas**
    - Returns schemas in a catalog
    - Input: catalog name
 
-4. **list_tables**
+5. **list_tables**
    - Returns tables in a schema
    - Input: catalog, schema
    - Supports pattern matching
 
-5. **describe_table**
+6. **describe_table**
    - Returns table schema (columns, types)
    - Input: fully-qualified table name
 
-6. **explain_query**
+7. **explain_query**
    - Returns query plan
    - Input: SQL query
    - Output: logical/distributed plan
 
-7. **cancel_query**
+8. **cancel_query**
    - Cancels a running query
    - Input: query ID
 
