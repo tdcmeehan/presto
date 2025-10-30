@@ -785,19 +785,27 @@ public class MCPQueryManager {
 }
 ```
 
-### 4.4 Streaming Strategy: Hybrid Approach (Recommended)
+### 4.4 Streaming Strategy: Adaptive Hybrid (Recommended)
 
-Implement **two modes** to handle different query sizes:
+Implement a **single tool that automatically adapts** based on actual result size:
 
-#### Mode 1: Buffered (Default for Small Queries)
+#### Adaptive Buffering with SSE Fallback
 
-For queries with small result sets (<10MB, <30s execution):
+**Strategy:**
+1. Start buffering results as query executes
+2. If buffered data exceeds threshold (e.g., 10MB), switch to SSE streaming
+3. Send buffered data as first SSE event, continue streaming rest
+4. If query completes under threshold, return normal JSON-RPC response
 
-**Query Execution Flow:**
+**Small Query Flow (Buffered Response):**
 ```
-AI calls tool: tools/call with name="query_presto", arguments={"sql": "SELECT ..."}
+AI calls tool: tools/call with name="query_presto", arguments={"sql": "SELECT * FROM small_table"}
 
-Response (after query completes): {
+Server: Buffers results... query completes at 5MB total
+
+Response (normal JSON-RPC): {
+  "jsonrpc": "2.0",
+  "id": 123,
   "result": {
     "queryId": "20231201_123456_00000_abc12",
     "rows": [
@@ -805,66 +813,160 @@ Response (after query completes): {
       {"col1": "value2", "col2": 456},
       ...
     ],
-    "status": "completed"
+    "status": "completed",
+    "totalRows": 50000
   }
 }
 ```
 
-**Advantages:**
-- Simple implementation
-- Single round-trip
-- Works with all MCP transports
-
-**Limitations:**
-- Memory usage scales with result size
-- Can timeout on long queries
-- Poor for large datasets
-
-#### Mode 2: SSE Streaming (For Large Queries)
-
-For queries with large result sets or long execution times:
-
-**Query Execution Flow:**
+**Large Query Flow (Automatic SSE Switch):**
 ```
-1. AI calls tool: tools/call with name="query_presto_stream", arguments={"sql": "SELECT ..."}
+AI calls tool: tools/call with name="query_presto", arguments={"sql": "SELECT * FROM large_table"}
 
-   Response: HTTP 200 with Content-Type: text/event-stream
+Server: Buffers results... hits 10MB threshold, switches to SSE
 
-2. Server streams events as query executes:
+Response: HTTP 200 with Content-Type: text/event-stream
 
-   event: data
-   data: {"rows": [{"col1": "value1", "col2": 123}, ...]}
+event: data
+data: {"rows": [...buffered data so far...], "queryId": "...", "switchedToStreaming": true}
 
-   event: data
-   data: {"rows": [{"col1": "value11", "col2": 234}, ...]}
+event: data
+data: {"rows": [...next batch...]}
 
-   event: data
-   data: {"rows": [{"col1": "value21", "col2": 345}, ...]}
+event: data
+data: {"rows": [...next batch...]}
 
-   event: complete
-   data: {"status": "finished", "queryId": "20231201_123456_00000_abc12", "totalRows": 50000}
+event: complete
+data: {"status": "finished", "totalRows": 500000}
 ```
 
 **Advantages:**
-- True streaming (data flows as available)
-- Memory efficient (only buffering current batch)
-- Timeout-safe (incremental progress)
-- Best user experience (real-time feedback)
-- Aligns perfectly with Presto's polling model
+- **Single tool interface** - AI agent doesn't need to guess query size
+- **Automatic optimization** - small queries get simple response, large queries stream
+- **No waste** - buffering is useful (sent as first event if we switch to SSE)
+- **Graceful degradation** - clients without SSE support see an error explaining the issue
+- **Transparent** - AI agent gets data either way
 
-**Limitations:**
-- Requires SSE transport support
-- More complex implementation
-- Not all MCP clients may support SSE
+**Implementation Details:**
 
-#### Tool Selection
+```java
+@POST
+@Path("/rpc")
+public Response handleToolCall(JsonRpcRequest request, @Suspended AsyncResponse asyncResponse) {
+    String toolName = request.getParams().getString("name");
 
-Expose both as separate tools:
+    if ("query_presto".equals(toolName)) {
+        String sql = request.getParams().getString("arguments.sql");
 
-- **`query_presto`** - Buffered mode (simple queries)
-- **`query_presto_stream`** - SSE streaming mode (large/long queries)
+        // Submit query
+        QueryId queryId = submitQuery(sql, ...);
 
-AI agent can choose based on query characteristics.
+        // Buffer results with size tracking
+        List<Map<String, Object>> bufferedRows = new ArrayList<>();
+        long bufferedBytes = 0;
+        long token = 0;
+        boolean switched = false;
+
+        while (true) {
+            QueryResultBatch batch = pollResults(queryId, token);
+
+            // Check if we should switch to SSE
+            if (!switched && bufferedBytes + batch.getSizeBytes() > STREAMING_THRESHOLD) {
+                // Switch to SSE streaming
+                return switchToSSE(asyncResponse, queryId, bufferedRows, batch);
+            }
+
+            // Continue buffering
+            bufferedRows.addAll(convertRows(batch));
+            bufferedBytes += batch.getSizeBytes();
+
+            if (!batch.hasMore()) {
+                // Query completed, return buffered response
+                return jsonRpcSuccess(request.getId(), Map.of(
+                    "queryId", queryId.toString(),
+                    "rows", bufferedRows,
+                    "status", "completed"
+                ));
+            }
+
+            token = batch.getNextToken();
+        }
+    }
+}
+
+private Response switchToSSE(
+        AsyncResponse asyncResponse,
+        QueryId queryId,
+        List<Map<String, Object>> bufferedRows,
+        QueryResultBatch nextBatch) {
+
+    // Check if client supports SSE
+    if (!clientSupportsSSE(asyncResponse)) {
+        return jsonRpcError("Query results too large for buffering. " +
+            "Client must support Server-Sent Events for large queries.");
+    }
+
+    // Switch to SSE streaming
+    SseEventSink eventSink = getSseEventSink(asyncResponse);
+    Sse sse = getSse(asyncResponse);
+
+    // Send buffered data as first event
+    OutboundSseEvent firstEvent = sse.newEventBuilder()
+        .name("data")
+        .data(Map.of(
+            "rows", bufferedRows,
+            "queryId", queryId.toString(),
+            "switchedToStreaming", true
+        ))
+        .build();
+    eventSink.send(firstEvent);
+
+    // Send current batch
+    OutboundSseEvent secondEvent = sse.newEventBuilder()
+        .name("data")
+        .data(Map.of("rows", convertRows(nextBatch)))
+        .build();
+    eventSink.send(secondEvent);
+
+    // Continue streaming rest of query
+    streamRemainingResults(eventSink, sse, queryId, nextBatch.getNextToken());
+
+    return Response.ok().build();
+}
+```
+
+**Configuration:**
+
+```properties
+# Size threshold for switching to SSE (default: 10MB)
+mcp.streaming-threshold=10MB
+
+# Whether to allow SSE fallback (default: true)
+mcp.sse-enabled=true
+
+# Initial buffer size (default: 1MB)
+mcp.initial-buffer-size=1MB
+```
+
+**Error Handling:**
+
+If client doesn't support SSE and query exceeds threshold:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 123,
+  "error": {
+    "code": -32000,
+    "message": "Query result size (estimated 150MB) exceeds buffering limit (10MB). Client must support Server-Sent Events (text/event-stream) for large result sets.",
+    "data": {
+      "queryId": "20231201_123456_00000_abc12",
+      "estimatedSize": "150MB",
+      "bufferingLimit": "10MB",
+      "requiresSSE": true
+    }
+  }
+}
+```
 
 ### 4.5 Configuration
 
@@ -893,54 +995,41 @@ mcp.binary-results=false
 
 ### 5.1 Strategy Comparison
 
-| Strategy | Memory | Latency | Timeout Risk | MCP Compliance | Implementation |
-|----------|--------|---------|--------------|----------------|----------------|
-| **A: Buffer All** | ❌ High | ⚠️ High | ❌ High | ✅ Perfect | ✅ Simple |
-| **B: SSE Streaming** | ✅ Low | ✅ Low | ✅ Low | ✅ Good | ⚠️ Moderate |
-| **C: Client SQL Pagination** | ✅ Low | ❌ High | ✅ Low | ✅ Perfect | ✅ Simple |
-| **D: Chunked Resources** | ⚠️ Medium | ⚠️ Medium | ✅ Low | ⚠️ Workaround | ❌ Complex |
+| Strategy | Memory | Latency | Timeout Risk | MCP Compliance | Implementation | UX |
+|----------|--------|---------|--------------|----------------|----------------|-----|
+| **A: Buffer All** | ❌ High | ⚠️ High | ❌ High | ✅ Perfect | ✅ Simple | ⚠️ Fails on large queries |
+| **B: SSE Always** | ✅ Low | ✅ Low | ✅ Low | ✅ Good | ⚠️ Moderate | ⚠️ Overkill for small queries |
+| **C: Adaptive (Buffer→SSE)** | ✅ Low | ✅ Low | ✅ Low | ✅ Good | ⚠️ Moderate | ✅ Best of both |
+| **D: Two Tools** | ✅ Low | ✅ Low | ✅ Low | ✅ Good | ⚠️ Moderate | ❌ Agent must choose |
+| **E: Client SQL Pagination** | ✅ Low | ❌ High | ✅ Low | ✅ Perfect | ✅ Simple | ❌ Inefficient |
+| **F: Chunked Resources** | ⚠️ Medium | ⚠️ Medium | ✅ Low | ⚠️ Workaround | ❌ Complex | ❌ Awkward |
 
 **Key Insight:** MCP's cursor pagination is ONLY for list operations (tools/list, resources/list), NOT for data returned by tools/resources.
 
-### 5.2 Recommended Approach: Dual-Mode
+### 5.2 Recommended Approach: Adaptive Buffering
 
-Implement **two separate tools** for different query patterns:
+Implement **a single tool that automatically switches** based on actual result size:
 
-**Mode 1: Buffered (query_presto)** - For small queries
+**Adaptive Mode (query_presto)** - One tool for all queries
 ```
-tools/call query_presto {"sql": "SELECT * FROM small_table"}
-→ {"result": {"rows": [...all rows...], "status": "completed"}}
-```
+tools/call query_presto {"sql": "..."}
 
-**Advantages:**
-- Simple, single request
-- Works everywhere
-- No special transport needed
-
-**When to use:** Result sets <10MB, queries <30s
-
-**Mode 2: SSE Streaming (query_presto_stream)** - For large queries
-```
-tools/call query_presto_stream {"sql": "SELECT * FROM large_table"}
-→ Response: Content-Type: text/event-stream
-
-event: data
-data: {"rows": [...batch 1...]}
-
-event: data
-data: {"rows": [...batch 2...]}
-
-event: complete
-data: {"status": "finished"}
+Small query → {"result": {"rows": [...]}} (JSON-RPC response)
+Large query → Content-Type: text/event-stream (automatic SSE switch)
 ```
 
 **Advantages:**
-- True streaming
-- Memory efficient
-- Real-time progress
-- MCP-compliant (SSE is part of MCP spec)
+- **Best UX** - AI agent doesn't need to predict query size
+- **Automatic optimization** - small queries stay simple, large queries stream
+- **Efficient** - buffering work is reused (sent as first SSE event)
+- **Graceful** - clear error if client can't handle SSE for large results
+- **Single interface** - simpler API surface
 
-**When to use:** Large result sets, long queries, real-time feedback
+**How it works:**
+1. Start buffering results (threshold: 10MB configurable)
+2. Small queries (<10MB): Return complete JSON-RPC response
+3. Large queries (≥10MB): Switch to SSE mid-flight, send buffered data first
+4. No waste: Buffering effort becomes first SSE event
 
 ### 5.3 SSE Implementation Pattern
 
@@ -1186,16 +1275,24 @@ mbeanExporter.export("com.facebook.presto.mcp:name=MCPMetrics", new MCPMetrics()
 
 ### 10.2 Streaming Resolution
 
-**Approach:** Dual-Mode (Buffered + SSE Streaming)
+**Approach:** Adaptive Buffering with Automatic SSE Streaming
 
 **Rationale:**
-1. **MCP-Compliant:** Cursor pagination only applies to list operations, not data
-2. **Flexible:** Two tools for different query patterns (small vs large)
-3. **Memory Efficient:** Buffered for small queries, SSE streaming for large
+1. **MCP-Compliant:** Uses SSE (part of MCP spec) when needed; cursor pagination only for list operations
+2. **Best UX:** Single tool interface - AI agent doesn't predict query size
+3. **Memory Efficient:** Buffers small queries, streams large queries automatically
 4. **Timeout-Safe:** SSE provides incremental progress for long queries
-5. **Pragmatic:** Simple implementation path (start buffered, add SSE later)
+5. **Pragmatic:** Start buffering, switch to SSE if threshold exceeded
+6. **Efficient:** No wasted work - buffered data becomes first SSE event
 
-**Important Correction:** Initial design incorrectly assumed MCP resource pagination could be used for query results. MCP's cursor-based pagination is **only for list operations** (tools/list, resources/list), not for the data returned by tools themselves. The correct approach is SSE streaming for large results.
+**How It Works:**
+- All queries use the same `query_presto` tool
+- Server buffers results up to configurable threshold (default 10MB)
+- If query completes under threshold: Return normal JSON-RPC response
+- If query exceeds threshold: Switch to SSE, send buffered data as first event
+- Transparent to AI agent which mode is used
+
+**Important Correction:** Initial design incorrectly assumed MCP resource pagination could be used for query results. MCP's cursor-based pagination is **only for list operations** (tools/list, resources/list), not for the data returned by tools themselves. The correct approach is adaptive buffering with automatic SSE streaming for large results.
 
 ### 10.3 Next Steps
 
@@ -1207,13 +1304,15 @@ mbeanExporter.export("com.facebook.presto.mcp:name=MCPMetrics", new MCPMetrics()
 
 ### 10.4 Success Criteria
 
-- [ ] AI agents can query Presto via MCP protocol (both tools/call methods)
-- [ ] Small queries (<10MB) work with buffered mode without memory issues
-- [ ] Large result sets stream via SSE without memory exhaustion
-- [ ] Query timeout behavior is acceptable (buffered: <30s, streaming: incremental)
+- [ ] AI agents can query Presto via MCP protocol using single `query_presto` tool
+- [ ] Small queries (<10MB) return complete results without streaming overhead
+- [ ] Large queries automatically switch to SSE streaming without memory exhaustion
+- [ ] Threshold-based switching is transparent to AI agent
+- [ ] Query timeout behavior is acceptable (buffered <30s, streaming incremental)
 - [ ] Plugin loads without modifying core (beyond agreed extensions)
 - [ ] Performance overhead is <5% vs. native Presto protocol
-- [ ] Authentication and authorization work correctly for both modes
+- [ ] Authentication and authorization work correctly
+- [ ] Graceful error handling when client doesn't support SSE for large queries
 
 ---
 
@@ -1224,42 +1323,42 @@ mbeanExporter.export("com.facebook.presto.mcp:name=MCPMetrics", new MCPMetrics()
 Proposed tools for MCP plugin:
 
 1. **query_presto**
-   - Execute SQL query (buffered mode)
-   - Returns all results in single response
-   - Best for small queries (<10MB, <30s)
-   - Supports session properties
+   - Execute SQL query with adaptive buffering/streaming
+   - Automatically buffers small results (<10MB) or streams large results via SSE
+   - Single tool interface - AI agent doesn't need to choose
+   - Supports session properties (catalog, schema, user, etc.)
+   - Arguments:
+     - `sql` (required): SQL query to execute
+     - `catalog` (optional): Catalog to use
+     - `schema` (optional): Schema to use
+     - `sessionProperties` (optional): Map of session properties
 
-2. **query_presto_stream**
-   - Execute SQL query (streaming mode)
-   - Uses SSE to stream results incrementally
-   - Best for large queries or long execution times
-   - Supports session properties
-
-3. **list_catalogs**
+2. **list_catalogs**
    - Returns available catalogs
    - No pagination needed (small result set)
 
-4. **list_schemas**
+3. **list_schemas**
    - Returns schemas in a catalog
    - Input: catalog name
 
-5. **list_tables**
+4. **list_tables**
    - Returns tables in a schema
    - Input: catalog, schema
    - Supports pattern matching
 
-6. **describe_table**
+5. **describe_table**
    - Returns table schema (columns, types)
    - Input: fully-qualified table name
 
-7. **explain_query**
-   - Returns query plan
+6. **explain_query**
+   - Returns query plan (logical and distributed)
    - Input: SQL query
-   - Output: logical/distributed plan
+   - Does not execute query
 
-8. **cancel_query**
+7. **cancel_query**
    - Cancels a running query
    - Input: query ID
+   - Returns cancellation status
 
 ### Appendix B: Reference Files
 
