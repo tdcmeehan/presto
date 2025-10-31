@@ -2,9 +2,15 @@
 
 ## Executive Summary
 
-This document analyzes the integration of Model Context Protocol (MCP) server capabilities into Presto, evaluating architectural approaches and addressing the fundamental challenge of bridging Presto's streaming polling model with MCP's request-response protocol.
+This document analyzes the integration of Model Context Protocol (MCP) server capabilities into Presto, evaluating architectural approaches and addressing the fundamental challenges of bridging Presto's streaming polling model with MCP's request-response protocol and maintaining proper load balancing for agentic workloads.
 
-**Recommendation:** Implement as a **Coordinator Plugin** with optional core enhancements for streaming support.
+**Recommendation:** Implement as a **Separate Gateway** that translates MCP protocol to Presto's native client protocol.
+
+**Critical Finding:** Load balancing analysis reveals that integrating MCP directly into coordinators bypasses Presto's `nextUri` routing infrastructure, making it difficult to properly distribute high-volume agentic workloads across multiple coordinators. A separate gateway approach leverages Presto's existing routing while keeping gateways stateless and horizontally scalable.
+
+**Alternative:** For low-volume deployments, a coordinator plugin with sticky sessions is acceptable when operational simplicity outweighs optimal load distribution.
+
+**See:** `docs/mcp-load-balancing-analysis.md` for detailed load balancing analysis.
 
 ---
 
@@ -1447,14 +1453,30 @@ mbeanExporter.export("com.facebook.presto.mcp:name=MCPMetrics", new MCPMetrics()
 
 ### 10.1 Recommendation Summary
 
-**Architecture:** Coordinator Plugin with Core Extensions
+**Architecture:** **Separate Gateway** (Revised from Coordinator Plugin)
+
+**Critical Finding:** Load balancing analysis reveals that integrating MCP directly into coordinators bypasses Presto's sophisticated routing infrastructure (`nextUri` chains), making it difficult to properly load balance high-volume agentic workloads.
 
 **Rationale:**
-1. **Modularity:** Plugin keeps MCP code separate from core
-2. **Integration:** Core extensions provide necessary access to query APIs
-3. **Flexibility:** Can evolve independently while leveraging Presto infrastructure
-4. **Performance:** Direct access to internal APIs (no proxy overhead)
-5. **Deployability:** Optional feature that doesn't impact non-MCP users
+1. **Load Balancing:** Gateway can leverage Presto's `nextUri` routing for optimal load distribution
+2. **Stateless Gateways:** Gateways are stateless and can be horizontally scaled independently
+3. **Failover:** Gateway failure doesn't lose query state (nextUri persists on coordinator)
+4. **Presto Unmodified:** No changes to core Presto coordinators
+5. **Operational Flexibility:** Scale gateways independently from coordinators
+6. **Uses Existing Infrastructure:** Leverages Presto's client protocol completely
+
+**See:** `docs/mcp-load-balancing-analysis.md` for detailed analysis
+
+**Tradeoffs:**
+- Additional network hop (gateway → coordinator)
+- Another service to deploy and manage
+- Slight latency increase (~1ms on same network)
+
+**When Coordinator Plugin Acceptable:**
+- Low-medium query volume (<100 queries/hour)
+- Mostly small queries (<10MB results)
+- Few AI agents
+- Operational simplicity more important than optimal load balancing
 
 ### 10.2 Streaming Resolution
 
