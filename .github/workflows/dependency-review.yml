@@ -1,5 +1,5 @@
 name: Dependency Review
-on: pull_request
+on: pull_request_target
 
 permissions:
   contents: read
@@ -12,6 +12,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Dependency Review
