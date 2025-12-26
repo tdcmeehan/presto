@@ -13,13 +13,40 @@
  */
 #pragma once
 
-#include "presto_cpp/main/operators/ShuffleInterface.h"
-#include "velox/buffer/Buffer.h"
-#include "velox/common/file/File.h"
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "velox/common/base/TreeOfLosers.h"
 #include "velox/common/file/FileSystems.h"
-#include "velox/common/memory/Memory.h"
+#include "velox/exec/Operator.h"
+
+#include "presto_cpp/main/operators/ShuffleInterface.h"
 
 namespace facebook::presto::operators {
+
+using TRowSize = uint32_t;
+
+constexpr size_t kUint32Size = sizeof(TRowSize);
+
+// Metadata describing a serialized row's location and sizes in a buffer
+struct RowMetadata {
+  size_t rowStart; // Offset to the start of this row
+  uint32_t keySize; // Size of key (0 for non-sorted)
+  uint32_t dataSize; // Size of data
+};
+
+inline bool compareKeys(std::string_view key1, std::string_view key2) noexcept {
+  const auto minSize = std::min(key1.size(), key2.size());
+  if (minSize > 0) {
+    const int cmp = std::memcmp(key1.data(), key2.data(), minSize);
+    if (cmp != 0) {
+      return cmp < 0;
+    }
+  }
+  return key1.size() < key2.size();
+}
 
 // LocalShuffleWriteInfo is used for containing shuffle write information.
 // This struct is a 1:1 strict API mapping to
@@ -32,12 +59,15 @@ struct LocalShuffleWriteInfo {
   std::string queryId;
   uint32_t numPartitions;
   uint32_t shuffleId;
+  bool sortedShuffle;
+
+  /// Serializes shuffle information to JSON format.
+  std::string serialize() const;
 
   /// Deserializes shuffle information that is used by LocalPersistentShuffle.
   /// Structures are assumed to be encoded in JSON format.
   static LocalShuffleWriteInfo deserialize(const std::string& info);
 };
-
 // LocalShuffleReadInfo is used for containing shuffle read metadata
 // This struct is a 1:1 strict API mapping to
 // presto-spark-base/src/main/java/com/facebook/presto/spark/execution/PrestoSparkLocalShuffleReadInfo.java.
@@ -48,9 +78,11 @@ struct LocalShuffleReadInfo {
   std::string rootPath;
   std::string queryId;
   std::vector<std::string> partitionIds;
+  bool sortedShuffle;
 
-  /// Deserializes shuffle information that is used by LocalPersistentShuffle.
-  /// Structures are assumed to be encoded in JSON format.
+  /// Serializes shuffle information to JSON format.
+  std::string serialize() const;
+
   static LocalShuffleReadInfo deserialize(const std::string& info);
 };
 
@@ -77,12 +109,11 @@ class LocalShuffleWriter : public ShuffleWriter {
       uint32_t shuffleId,
       uint32_t numPartitions,
       uint64_t maxBytesPerPartition,
+      bool sortedShuffle,
       velox::memory::MemoryPool* pool);
 
-  void collect(
-      int32_t partition,
-      std::string_view /* key */,
-      std::string_view data) override;
+  void collect(int32_t partition, std::string_view key, std::string_view data)
+      override;
 
   void noMoreData(bool success) override;
 
@@ -92,12 +123,16 @@ class LocalShuffleWriter : public ShuffleWriter {
   }
 
  private:
+  void appendRow(char* writePos, std::string_view key, std::string_view data);
+
+  size_t rowSize(size_t keySize, size_t dataSize) const;
+
   // Finds and creates the next file for writing the next block of the
   // given 'partition'.
   std::unique_ptr<velox::WriteFile> getNextOutputFile(int32_t partition);
 
   // Writes the in-progress block to the given partition.
-  void storePartitionBlock(int32_t partition);
+  void writeBlock(int32_t partition);
 
   // Deletes all the files in the root directory.
   void cleanup();
@@ -112,6 +147,7 @@ class LocalShuffleWriter : public ShuffleWriter {
   velox::memory::MemoryPool* pool_;
   const uint32_t numPartitions_;
   const uint64_t maxBytesPerPartition_;
+  const bool sortedShuffle_;
   // The top directory of the shuffle files and its file system.
   const std::string rootPath_;
   const std::string queryId_;
@@ -129,9 +165,15 @@ class LocalShuffleReader : public ShuffleReader {
       const std::string& rootPath,
       const std::string& queryId,
       std::vector<std::string> partitionIds,
+      bool sortedShuffle,
       velox::memory::MemoryPool* pool);
 
-  folly::SemiFuture<std::vector<std::unique_ptr<ReadBatch>>> next(
+  /// Initializes the reader by discovering shuffle files and setting up merge
+  /// infrastructure for sorted shuffle. Must be called before next().
+  /// For sorted shuffle, this opens all shuffle files and prepares k-way merge.
+  void initialize();
+
+  folly::SemiFuture<std::vector<std::unique_ptr<ShuffleSerializedPage>>> next(
       uint64_t maxBytes) override;
 
   void noMoreData(bool success) override;
@@ -145,9 +187,22 @@ class LocalShuffleReader : public ShuffleReader {
   // Returns all created shuffle files for 'partition_'.
   std::vector<std::string> getReadPartitionFiles() const;
 
+  // Initializes sorted shuffle read by creating input streams and setting up
+  // k-way merge infrastructure.
+  void initSortedShuffleRead();
+
+  // Reads sorted shuffle data using k-way merge with TreeOfLosers.
+  std::vector<std::unique_ptr<ShuffleSerializedPage>> nextSorted(
+      uint64_t maxBytes);
+
+  // Reads unsorted shuffle data in batch-based file reading.
+  std::vector<std::unique_ptr<ShuffleSerializedPage>> nextUnsorted(
+      uint64_t maxBytes);
+
   const std::string rootPath_;
   const std::string queryId_;
   const std::vector<std::string> partitionIds_;
+  const bool sortedShuffle_;
   velox::memory::MemoryPool* pool_;
 
   // Latest read block (file) index in 'readPartitionFiles_' for 'partition_'.
@@ -158,6 +213,11 @@ class LocalShuffleReader : public ShuffleReader {
 
   // The top directory of the shuffle files and its file system.
   std::shared_ptr<velox::filesystems::FileSystem> fileSystem_;
+
+  // Used to merge sorted streams from multiple shuffle files for k-way merge.
+  std::unique_ptr<velox::TreeOfLosers<velox::MergeStream, uint16_t>> merge_;
+
+  bool initialized_{false};
 };
 
 class LocalPersistentShuffleFactory : public ShuffleInterfaceFactory {

@@ -35,7 +35,7 @@ std::string json_map_key(std::string p) {
 } // namespace nlohmann
 
 namespace facebook::presto::protocol {
-    // Loosly copied this here from NLOHMANN_JSON_SERIALIZE_ENUM()
+    // Loosely copied this here from NLOHMANN_JSON_SERIALIZE_ENUM()
 
     // NOLINTNEXTLINE: cppcoreguidelines-avoid-c-arrays
     static const std::pair<NodeSelectionStrategy, json>
@@ -87,6 +87,7 @@ const char* const PRESTO_PAGE_NEXT_TOKEN_HEADER = "X-Presto-Page-End-Sequence-Id
 const char* const PRESTO_BUFFER_COMPLETE_HEADER = "X-Presto-Buffer-Complete";
 const char* const PRESTO_GET_DATA_SIZE_HEADER = "X-Presto-Get-Data-Size";
 const char* const PRESTO_BUFFER_REMAINING_BYTES_HEADER = "X-Presto-Buffer-Remaining-Bytes";
+const char* const PRESTO_BUFFER_WAIT_TIME_MS_HEADER = "X-Presto-Buffer-Wait-Time-Ms";
 const char* const PRESTO_BUFFER_REMAINING_FROM_SPILL_HEADER = "X-Presto-Buffer-Remaining-From-Spill";
 
 const char* const PRESTO_MAX_WAIT_DEFAULT = "2s";
@@ -134,7 +135,7 @@ namespace facebook::presto::protocol {
 {{/struct}}
 {{#enum}}
 namespace facebook::presto::protocol {
-    //Loosly copied this here from NLOHMANN_JSON_SERIALIZE_ENUM()
+    //Loosely copied this here from NLOHMANN_JSON_SERIALIZE_ENUM()
 
     // NOLINTNEXTLINE: cppcoreguidelines-avoid-c-arrays
     static const std::pair<{{&class_name}}, json>

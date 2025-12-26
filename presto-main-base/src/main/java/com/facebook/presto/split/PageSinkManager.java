@@ -15,12 +15,16 @@ package com.facebook.presto.split;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.common.RuntimeStats;
+import com.facebook.presto.metadata.DistributedProcedureHandle;
 import com.facebook.presto.metadata.InsertTableHandle;
 import com.facebook.presto.metadata.OutputTableHandle;
 import com.facebook.presto.spi.ConnectorId;
+import com.facebook.presto.spi.ConnectorMergeSink;
 import com.facebook.presto.spi.ConnectorPageSink;
 import com.facebook.presto.spi.ConnectorSession;
+import com.facebook.presto.spi.MergeHandle;
 import com.facebook.presto.spi.PageSinkContext;
+import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.connector.ConnectorPageSinkProvider;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -71,6 +75,23 @@ public class PageSinkManager
     public ConnectorPageSink createPageSink(Session session, InsertTableHandle tableHandle, PageSinkContext pageSinkContext)
     {
         return createPageSink(session, tableHandle, pageSinkContext, null);
+    }
+
+    @Override
+    public ConnectorMergeSink createMergeSink(Session session, MergeHandle mergeHandle)
+    {
+        // assumes connectorId and catalog are the same
+        TableHandle tableHandle = mergeHandle.getTableHandle();
+        ConnectorSession connectorSession = session.toConnectorSession(tableHandle.getConnectorId());
+        return providerFor(tableHandle.getConnectorId()).createMergeSink(tableHandle.getTransaction(), connectorSession, mergeHandle.getConnectorMergeTableHandle());
+    }
+
+    @Override
+    public ConnectorPageSink createPageSink(Session session, DistributedProcedureHandle procedureHandle, PageSinkContext pageSinkContext)
+    {
+        // assumes connectorId and catalog are the same
+        ConnectorSession connectorSession = session.toConnectorSession(procedureHandle.getConnectorId());
+        return providerFor(procedureHandle.getConnectorId()).createPageSink(procedureHandle.getTransactionHandle(), connectorSession, procedureHandle.getConnectorHandle(), pageSinkContext);
     }
 
     private ConnectorPageSinkProvider providerFor(ConnectorId connectorId)

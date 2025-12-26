@@ -20,6 +20,7 @@ This chapter describes the SQL syntax used in Presto.
     sql/create-table
     sql/create-table-as
     sql/create-view
+    sql/create-materialized-view
     sql/deallocate-prepare
     sql/delete
     sql/describe
@@ -30,13 +31,16 @@ This chapter describes the SQL syntax used in Presto.
     sql/drop-schema
     sql/drop-table
     sql/drop-view
+    sql/drop-materialized-view
     sql/execute
     sql/explain
     sql/explain-analyze
     sql/grant
     sql/grant-roles
     sql/insert
+    sql/merge
     sql/prepare
+    sql/refresh-materialized-view
     sql/reset-session
     sql/revoke
     sql/revoke-roles
@@ -50,6 +54,7 @@ This chapter describes the SQL syntax used in Presto.
     sql/show-create-schema
     sql/show-create-table
     sql/show-create-view
+    sql/show-create-materialized-view
     sql/show-functions
     sql/show-grants
     sql/show-role-grants

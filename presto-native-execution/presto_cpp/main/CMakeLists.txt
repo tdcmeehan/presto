@@ -16,6 +16,7 @@ add_subdirectory(common)
 add_subdirectory(thrift)
 add_subdirectory(connectors)
 add_subdirectory(functions)
+add_subdirectory(tool)
 
 add_library(presto_session_properties SessionProperties.cpp)
 
@@ -60,6 +61,7 @@ target_link_libraries(
   $<TARGET_OBJECTS:presto_protocol>
   presto_common
   presto_exception
+  presto_expression_optimizer
   presto_function_metadata
   presto_connectors
   presto_http
@@ -78,6 +80,7 @@ target_link_libraries(
   velox_dwio_orc_reader
   velox_dwio_parquet_reader
   velox_dwio_parquet_writer
+  velox_dwio_text_reader_register
   velox_dwio_text_writer_register
   velox_dynamic_library_loader
   velox_encode

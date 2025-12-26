@@ -28,6 +28,8 @@ import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableMetadata;
 import com.facebook.presto.spi.Constraint;
 import com.facebook.presto.spi.MaterializedViewDefinition;
+import com.facebook.presto.spi.MaterializedViewStatus;
+import com.facebook.presto.spi.MergeHandle;
 import com.facebook.presto.spi.NewTableLayout;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SystemTable;
@@ -41,10 +43,12 @@ import com.facebook.presto.spi.connector.ConnectorCapabilities;
 import com.facebook.presto.spi.connector.ConnectorOutputMetadata;
 import com.facebook.presto.spi.connector.ConnectorPartitioningHandle;
 import com.facebook.presto.spi.connector.ConnectorTableVersion;
+import com.facebook.presto.spi.connector.RowChangeParadigm;
 import com.facebook.presto.spi.connector.TableFunctionApplicationResult;
 import com.facebook.presto.spi.constraints.TableConstraint;
 import com.facebook.presto.spi.function.SqlFunction;
 import com.facebook.presto.spi.plan.PartitioningHandle;
+import com.facebook.presto.spi.procedure.ProcedureRegistry;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.spi.security.GrantInfo;
@@ -342,6 +346,17 @@ public interface Metadata
     Optional<ConnectorOutputMetadata> finishDeleteWithOutput(Session session, DeleteTableHandle tableHandle, Collection<Slice> fragments);
 
     /**
+     * Begin call distributed procedure
+     */
+    DistributedProcedureHandle beginCallDistributedProcedure(Session session, QualifiedObjectName procedureName,
+                                                             TableHandle tableHandle, Object[] arguments, boolean sourceTableEliminated);
+
+    /**
+     * Finish call distributed procedure
+     */
+    void finishCallDistributedProcedure(Session session, DistributedProcedureHandle procedureHandle, QualifiedObjectName procedureName, Collection<Slice> fragments);
+
+    /**
      * Begin update query
      */
     TableHandle beginUpdate(Session session, TableHandle tableHandle, List<ColumnHandle> updatedColumns);
@@ -350,6 +365,29 @@ public interface Metadata
      * Finish update query
      */
     void finishUpdate(Session session, TableHandle tableHandle, Collection<Slice> fragments);
+
+    /**
+     * Return the row update paradigm supported by the connector on the table or throw
+     * an exception if row change is not supported.
+     */
+    RowChangeParadigm getRowChangeParadigm(Session session, TableHandle tableHandle);
+
+    /**
+     * Get the column handle that will generate row IDs for the merge operation.
+     * These IDs will be passed to the {@code storeMergedRows()} method of the
+     * {@link com.facebook.presto.spi.ConnectorMergeSink} that created them.
+     */
+    ColumnHandle getMergeTargetTableRowIdColumnHandle(Session session, TableHandle tableHandle);
+
+    /**
+     * Begin merge query
+     */
+    MergeHandle beginMerge(Session session, TableHandle tableHandle);
+
+    /**
+     * Finish merge query
+     */
+    void finishMerge(Session session, MergeHandle tableHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics);
 
     /**
      * Returns a connector id for the specified catalog name.
@@ -404,6 +442,19 @@ public interface Metadata
     void dropMaterializedView(Session session, QualifiedObjectName viewName);
 
     /**
+     * List materialized views in the specified schema prefix.
+     */
+    List<QualifiedObjectName> listMaterializedViews(Session session, QualifiedTablePrefix prefix);
+
+    /**
+     * Get materialized view definitions for all materialized views matching the prefix.
+     * This is used by information_schema to efficiently retrieve view definitions.
+     */
+    Map<QualifiedObjectName, MaterializedViewDefinition> getMaterializedViews(
+            Session session,
+            QualifiedTablePrefix prefix);
+
+    /**
      * Begin refresh materialized view
      */
     InsertTableHandle beginRefreshMaterializedView(Session session, TableHandle tableHandle);
@@ -417,6 +468,11 @@ public interface Metadata
      * Gets the referenced materialized views for a give table
      */
     List<QualifiedObjectName> getReferencedMaterializedViews(Session session, QualifiedObjectName tableName);
+
+    /**
+     * Gets the status of a materialized view (freshness state)
+     */
+    MaterializedViewStatus getMaterializedViewStatus(Session session, QualifiedObjectName viewName, TupleDomain<String> baseQueryDomain);
 
     /**
      * Try to locate a table index that can lookup results by indexableColumns and provide the requested outputColumns.
@@ -515,6 +571,8 @@ public interface Metadata
 
     TablePropertyManager getTablePropertyManager();
 
+    MaterializedViewPropertyManager getMaterializedViewPropertyManager();
+
     ColumnPropertyManager getColumnPropertyManager();
 
     AnalyzePropertyManager getAnalyzePropertyManager();
@@ -532,6 +590,10 @@ public interface Metadata
     {
         return NOT_APPLICABLE;
     }
+
+    void dropBranch(Session session, TableHandle tableHandle, String branchName, boolean branchExists);
+
+    void dropTag(Session session, TableHandle tableHandle, String tagName, boolean tagExists);
 
     void dropConstraint(Session session, TableHandle tableHandle, Optional<String> constraintName, Optional<String> columnName);
 

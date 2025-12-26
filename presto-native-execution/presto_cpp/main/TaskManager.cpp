@@ -182,8 +182,11 @@ void getData(
           }
         }
 
-        VLOG(1) << "Task " << taskId << ", buffer " << bufferId << ", sequence "
-                << sequence << " Results size: " << bytes
+        int64_t waitTimeMs = getCurrentTimeMs() - startMs;
+        VLOG(1) << "Task " << taskId << " waited " << waitTimeMs
+                << "ms for data: "
+                << "buffer " << bufferId << ", sequence " << sequence
+                << " Results size: " << bytes
                 << ", page count: " << pages.size()
                 << ", remaining: " << folly::join(',', remainingBytes)
                 << ", complete: " << std::boolalpha << complete;
@@ -194,6 +197,7 @@ void getData(
         result->complete = complete;
         result->data = std::move(iobuf);
         result->remainingBytes = std::move(remainingBytes);
+        result->waitTimeMs = waitTimeMs;
 
         promiseHolder->promise.setValue(std::move(result));
 
@@ -360,7 +364,8 @@ TaskManager::TaskManager(
               driverExecutor,
               spillerExecutor)),
       bufferManager_(velox::exec::OutputBufferManager::getInstanceRef()),
-      httpSrvCpuExecutor_(httpSrvCpuExecutor) {
+      httpSrvCpuExecutor_(httpSrvCpuExecutor),
+      lastNotOverloadedTimeInSecs_(velox::getCurrentTimeSec()) {
   VELOX_CHECK_NOT_NULL(bufferManager_, "invalid OutputBufferManager");
 }
 
@@ -469,6 +474,13 @@ TaskManager::buildTaskSpillDirectoryPath(
       fmt::format("{}/{}/{}/", dateString, queryId, taskId), &taskSpillDirPath);
   return std::make_tuple(
       std::move(taskSpillDirPath), std::move(dateSpillDirPath));
+}
+
+void TaskManager::setServerOverloaded(bool serverOverloaded) {
+  serverOverloaded_ = serverOverloaded;
+  if (!serverOverloaded) {
+    lastNotOverloadedTimeInSecs_ = velox::getCurrentTimeSec();
+  }
 }
 
 void TaskManager::getDataForResultRequests(

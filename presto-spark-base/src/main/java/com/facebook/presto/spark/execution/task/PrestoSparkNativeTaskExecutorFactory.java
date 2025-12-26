@@ -313,7 +313,7 @@ public class PrestoSparkNativeTaskExecutorFactory
         Duration terminateWithCoreTimeout = getNativeTerminateWithCoreTimeout(session);
         try {
             // 3. Submit the task to cpp process for execution
-            log.info("Submitting native execution task ");
+            log.info(format("Submitting native execution task. taskId %s", taskId.toString()));
             NativeExecutionTask task = nativeExecutionTaskFactory.createNativeExecutionTask(
                     session,
                     nativeExecutionProcess.getLocation(),
@@ -478,7 +478,8 @@ public class PrestoSparkNativeTaskExecutorFactory
                                     shuffleInfoTranslator.createSerializedReadInfo(
                                             shuffleInfoTranslator.createShuffleReadInfo(session, shuffleReadDescriptor)))),
                             DUMMY_TASK_ID)));
-                    TaskSource source = new TaskSource(remoteSource.getId(), ImmutableSet.of(split), ImmutableSet.of(Lifespan.taskWide()), true);
+                    Set<ScheduledSplit> shuffleSplits = shuffleInfoTranslator.postProcessSplits(ImmutableSet.of(split), session);
+                    TaskSource source = new TaskSource(remoteSource.getId(), shuffleSplits, ImmutableSet.of(Lifespan.taskWide()), true);
                     shuffleTaskSources.add(source);
                 }
 

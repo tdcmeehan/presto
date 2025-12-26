@@ -48,6 +48,7 @@ import com.facebook.presto.iceberg.IcebergTableProperties;
 import com.facebook.presto.iceberg.IcebergTableType;
 import com.facebook.presto.iceberg.ManifestFileCache;
 import com.facebook.presto.iceberg.statistics.StatisticsFileCache;
+import com.facebook.presto.metadata.BuiltInProcedureRegistry;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.spi.ConnectorSession;
@@ -76,6 +77,7 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.reflect.TypeToken;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -208,7 +210,8 @@ public class TestRenameTableOnFragileFileSystem
             Optional.empty(),
             Optional.empty(),
             ImmutableList.of(),
-            ImmutableList.of());
+            ImmutableList.of(),
+            Optional.empty());
 
     @Test
     public void testRenameTableSucceed()
@@ -410,9 +413,12 @@ public class TestRenameTableOnFragileFileSystem
                 metastore,
                 hdfsEnvironment,
                 FUNCTION_AND_TYPE_MANAGER,
+                new BuiltInProcedureRegistry(METADATA.getFunctionAndTypeManager()),
                 FUNCTION_RESOLUTION,
                 ROW_EXPRESSION_SERVICE,
                 jsonCodec(CommitTaskData.class),
+                jsonCodec(new TypeToken<>() {}),
+                jsonCodec(new TypeToken<>() {}),
                 new NodeVersion("test_node_v1"),
                 FILTER_STATS_CALCULATOR_SERVICE,
                 new IcebergHiveTableOperationsConfig(),

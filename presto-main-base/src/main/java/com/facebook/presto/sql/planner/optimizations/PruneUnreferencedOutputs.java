@@ -57,10 +57,13 @@ import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.planner.VariablesExtractor;
 import com.facebook.presto.sql.planner.plan.ApplyNode;
 import com.facebook.presto.sql.planner.plan.AssignUniqueId;
+import com.facebook.presto.sql.planner.plan.CallDistributedProcedureNode;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
 import com.facebook.presto.sql.planner.plan.ExplainAnalyzeNode;
 import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.LateralJoinNode;
+import com.facebook.presto.sql.planner.plan.MergeProcessorNode;
+import com.facebook.presto.sql.planner.plan.MergeWriterNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SequenceNode;
 import com.facebook.presto.sql.planner.plan.SimplePlanRewriter;
@@ -525,6 +528,47 @@ public class PruneUnreferencedOutputs
         }
 
         @Override
+        public PlanNode visitMergeWriter(MergeWriterNode node, RewriteContext<Set<VariableReferenceExpression>> context)
+        {
+            Set<VariableReferenceExpression> expectedInputs = ImmutableSet.<VariableReferenceExpression>builder()
+                    .addAll(node.getMergeProcessorProjectedVariables())
+                    .build();
+
+            PlanNode source = context.rewrite(node.getSource(), expectedInputs);
+
+            return new MergeWriterNode(
+                    node.getSourceLocation(),
+                    node.getId(),
+                    node.getStatsEquivalentPlanNode(),
+                    source,
+                    node.getTarget(),
+                    node.getMergeProcessorProjectedVariables(),
+                    node.getOutputVariables());
+        }
+
+        @Override
+        public PlanNode visitMergeProcessor(MergeProcessorNode node, RewriteContext<Set<VariableReferenceExpression>> context)
+        {
+            Set<VariableReferenceExpression> expectedInputs = ImmutableSet.<VariableReferenceExpression>builder()
+                    .add(node.getTargetTableRowIdColumnVariable())
+                    .add(node.getMergeRowVariable())
+                    .build();
+
+            PlanNode source = context.rewrite(node.getSource(), expectedInputs);
+
+            return new MergeProcessorNode(
+                    node.getSourceLocation(),
+                    node.getId(),
+                    node.getStatsEquivalentPlanNode(),
+                    source,
+                    node.getTarget(),
+                    node.getTargetTableRowIdColumnVariable(),
+                    node.getMergeRowVariable(),
+                    node.getTargetColumnVariables(),
+                    node.getOutputVariables());
+        }
+
+        @Override
         public PlanNode visitFilter(FilterNode node, RewriteContext<Set<VariableReferenceExpression>> context)
         {
             Set<VariableReferenceExpression> expectedInputs = ImmutableSet.<VariableReferenceExpression>builder()
@@ -805,6 +849,25 @@ public class PruneUnreferencedOutputs
                     node.getFragmentVariable(),
                     node.getTableCommitContextVariable(),
                     node.getStatisticsAggregation());
+        }
+
+        @Override
+        public PlanNode visitCallDistributedProcedure(CallDistributedProcedureNode node, RewriteContext<Set<VariableReferenceExpression>> context)
+        {
+            PlanNode source = context.rewrite(node.getSource(), ImmutableSet.copyOf(node.getSource().getOutputVariables()));
+            return new CallDistributedProcedureNode(
+                    node.getSourceLocation(),
+                    node.getId(),
+                    node.getStatsEquivalentPlanNode(),
+                    source,
+                    node.getTarget(),
+                    node.getRowCountVariable(),
+                    node.getFragmentVariable(),
+                    node.getTableCommitContextVariable(),
+                    node.getColumns(),
+                    node.getColumnNames(),
+                    node.getNotNullColumnVariables(),
+                    node.getPartitioningScheme());
         }
 
         @Override

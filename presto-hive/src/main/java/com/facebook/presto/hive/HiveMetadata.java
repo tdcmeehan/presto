@@ -2491,10 +2491,9 @@ public class HiveMetadata
 
         for (MaterializedDataPredicates dataPredicates : partitionsFromBaseTables.values()) {
             if (!dataPredicates.getPredicateDisjuncts().isEmpty()) {
-                missingPartitions += dataPredicates.getPredicateDisjuncts().stream()
+                missingPartitions += (int) dataPredicates.getPredicateDisjuncts().stream()
                         .filter(baseQueryDomain::overlaps)
-                        .mapToInt(tupleDomain -> tupleDomain.getDomains().isPresent() ? tupleDomain.getDomains().get().size() : 0)
-                        .sum();
+                        .count();
             }
         }
 
@@ -2525,6 +2524,7 @@ public class HiveMetadata
                 viewDefinition.getTable(),
                 viewDefinition.getBaseTables(),
                 viewDefinition.getOwner(),
+                viewDefinition.getSecurityMode(),
                 viewDefinition.getColumnMappings(),
                 viewDefinition.getBaseTablesOnOuterJoinSide(),
                 Optional.of(getPartitionedBy(viewMetadata.getProperties())));

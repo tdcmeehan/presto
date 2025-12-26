@@ -13,9 +13,13 @@
  */
 package com.facebook.presto.spi.connector;
 
+import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorCodec;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
+import com.facebook.presto.spi.ConnectorDistributedProcedureHandle;
+import com.facebook.presto.spi.ConnectorIndexHandle;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorMergeTableHandle;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
 import com.facebook.presto.spi.ConnectorSplit;
 import com.facebook.presto.spi.ConnectorTableHandle;
@@ -50,12 +54,37 @@ public interface ConnectorCodecProvider
         return Optional.empty();
     }
 
+    default Optional<ConnectorCodec<ConnectorMergeTableHandle>> getConnectorMergeTableHandleCodec()
+    {
+        return Optional.empty();
+    }
+
     default Optional<ConnectorCodec<ConnectorTableLayoutHandle>> getConnectorTableLayoutHandleCodec()
     {
         return Optional.empty();
     }
 
     default Optional<ConnectorCodec<ConnectorTableHandle>> getConnectorTableHandleCodec()
+    {
+        return Optional.empty();
+    }
+
+    default Optional<ConnectorCodec<ColumnHandle>> getColumnHandleCodec()
+    {
+        return Optional.empty();
+    }
+
+    default Optional<ConnectorCodec<ConnectorPartitioningHandle>> getConnectorPartitioningHandleCodec()
+    {
+        return Optional.empty();
+    }
+
+    default Optional<ConnectorCodec<ConnectorIndexHandle>> getConnectorIndexHandleCodec()
+    {
+        return Optional.empty();
+    }
+
+    default Optional<ConnectorCodec<ConnectorDistributedProcedureHandle>> getConnectorDistributedProcedureHandleCodec()
     {
         return Optional.empty();
     }

@@ -268,7 +268,7 @@ class SessionProperties {
   /// creating tiny SerializedPages. For
   /// PartitionedOutputNode::Kind::kPartitioned, PartitionedOutput operator
   /// would buffer up to that number of bytes / number of destinations for each
-  /// destination before producing a SerializedPage.
+  /// destination before producing a SerializedPageBase.
   static constexpr const char* kMaxPartitionedOutputBufferSize =
       "native_max_page_partitioning_buffer_size";
 
@@ -326,6 +326,11 @@ class SessionProperties {
   /// Maximum number of splits to listen to by SplitListener on native workers.
   static constexpr const char* kMaxNumSplitsListenedTo =
       "native_max_num_splits_listened_to";
+
+  /// Maximum number of splits to preload per driver. Set to 0 to disable
+  /// preloading.
+  static constexpr const char* kMaxSplitPreloadPerDriver =
+      "native_max_split_preload_per_driver";
 
   /// Specifies the max number of input batches to prefetch to do index lookup
   /// ahead. If it is zero, then process one input batch at a time.

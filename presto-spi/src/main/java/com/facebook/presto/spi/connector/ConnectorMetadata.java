@@ -14,12 +14,15 @@
 package com.facebook.presto.spi.connector;
 
 import com.facebook.presto.common.CatalogSchemaName;
+import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
+import com.facebook.presto.spi.ConnectorDistributedProcedureHandle;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorMergeTableHandle;
 import com.facebook.presto.spi.ConnectorNewTableLayout;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
 import com.facebook.presto.spi.ConnectorResolvedIndex;
@@ -53,6 +56,7 @@ import com.facebook.presto.spi.statistics.TableStatisticsMetadata;
 import io.airlift.slice.Slice;
 
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -71,6 +75,8 @@ import static java.util.stream.Collectors.toList;
 
 public interface ConnectorMetadata
 {
+    String MODIFYING_ROWS_MESSAGE = "This connector does not support modifying table rows";
+
     /**
      * Checks if a schema exists. The connector may have schemas that exist
      * but are not enumerable via {@link #listSchemaNames}.
@@ -562,6 +568,38 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Get the column handle that will generate row IDs for the merge operation.
+     * These IDs will be passed to the {@link com.facebook.presto.spi.ConnectorMergeSink#storeMergedRows}
+     * method of the {@link com.facebook.presto.spi.ConnectorMergeSink} that created them.
+     */
+    default ColumnHandle getMergeTargetTableRowIdColumnHandle(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        throw new PrestoException(NOT_SUPPORTED, MODIFYING_ROWS_MESSAGE);
+    }
+
+    /**
+     * Begin call distributed procedure
+     */
+    default ConnectorDistributedProcedureHandle beginCallDistributedProcedure(
+            ConnectorSession session,
+            QualifiedObjectName procedureName,
+            ConnectorTableLayoutHandle tableLayoutHandle,
+            Object[] arguments)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support distributed procedure");
+    }
+
+    /**
+     * Finish call distributed procedure
+     *
+     * @param fragments all fragments returned by {@link com.facebook.presto.spi.UpdatablePageSource#finish()}
+     */
+    default void finishCallDistributedProcedure(ConnectorSession session, ConnectorDistributedProcedureHandle procedureHandle, QualifiedObjectName procedureName, Collection<Slice> fragments)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support distributed procedure");
+    }
+
+    /**
      * Begin delete query
      */
     default ConnectorDeleteTableHandle beginDelete(ConnectorSession session, ConnectorTableHandle tableHandle)
@@ -598,6 +636,36 @@ public interface ConnectorMetadata
     default void finishUpdate(ConnectorSession session, ConnectorTableHandle tableHandle, Collection<Slice> fragments)
     {
         throw new PrestoException(NOT_SUPPORTED, "This connector does not support update");
+    }
+
+    /**
+     * Return the row change paradigm supported by the connector on the table.
+     */
+    default RowChangeParadigm getRowChangeParadigm(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        throw new PrestoException(NOT_SUPPORTED, MODIFYING_ROWS_MESSAGE);
+    }
+
+    /**
+     * Do whatever is necessary to start an MERGE query, returning the {@link ConnectorMergeTableHandle}
+     * instance that will be passed to the PageSink, and to the {@link #finishMerge} method.
+     */
+    default ConnectorMergeTableHandle beginMerge(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        throw new PrestoException(NOT_SUPPORTED, MODIFYING_ROWS_MESSAGE);
+    }
+
+    /**
+     * Finish a merge query
+     *
+     * @param session The session
+     * @param mergeTableHandle A ConnectorMergeTableHandle for the table that is the target of the merge
+     * @param fragments All fragments returned by the merge plan
+     * @param computedStatistics Statistics for the table, meaningful only to the connector that produced them.
+     */
+    default void finishMerge(ConnectorSession session, ConnectorMergeTableHandle mergeTableHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        throw new PrestoException(GENERIC_INTERNAL_ERROR, "ConnectorMetadata beginMerge() is implemented without finishMerge()");
     }
 
     /**
@@ -657,6 +725,33 @@ public interface ConnectorMetadata
     }
 
     /**
+     * List materialized view names in the specified schema.
+     * This method is used to populate information_schema.materialized_views.
+     */
+    default List<SchemaTableName> listMaterializedViews(ConnectorSession session, String schemaName)
+    {
+        // Default implementation returns empty list (connectors without MV support)
+        return emptyList();
+    }
+
+    /**
+     * Get multiple materialized view definitions at once.
+     * Connectors can override this for more efficient bulk retrieval.
+     * Default implementation calls getMaterializedView() for each view.
+     */
+    default Map<SchemaTableName, MaterializedViewDefinition> getMaterializedViews(
+            ConnectorSession session,
+            List<SchemaTableName> viewNames)
+    {
+        Map<SchemaTableName, MaterializedViewDefinition> result = new HashMap<>();
+        for (SchemaTableName viewName : viewNames) {
+            getMaterializedView(session, viewName).ifPresent(definition ->
+                    result.put(viewName, definition));
+        }
+        return result;
+    }
+
+    /**
      * Create the specified materialized view. The data for the materialized view is opaque to the connector.
      */
     default void createMaterializedView(ConnectorSession session, ConnectorTableMetadata viewMetadata, MaterializedViewDefinition viewDefinition, boolean ignoreExisting)
@@ -679,11 +774,6 @@ public interface ConnectorMetadata
      * selects a specific date range can consider only partitions from that range when determining view staleness.
      */
     default MaterializedViewStatus getMaterializedViewStatus(ConnectorSession session, SchemaTableName materializedViewName, TupleDomain<String> baseQueryDomain)
-    {
-        throw new PrestoException(NOT_SUPPORTED, "This connector does not support getting materialized views status");
-    }
-
-    default MaterializedViewStatus getMaterializedViewStatus(ConnectorSession session, SchemaTableName materializedViewName)
     {
         throw new PrestoException(NOT_SUPPORTED, "This connector does not support getting materialized views status");
     }
@@ -868,6 +958,22 @@ public interface ConnectorMetadata
     default TableLayoutFilterCoverage getTableLayoutFilterCoverage(ConnectorTableLayoutHandle tableHandle, Set<String> relevantPartitionColumns)
     {
         return NOT_APPLICABLE;
+    }
+
+    /**
+     * Drop the specified branch
+     */
+    default void dropBranch(ConnectorSession session, ConnectorTableHandle tableHandle, String branchName, boolean branchExists)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support dropping table branches");
+    }
+
+    /**
+     * Drop the specified tag
+     */
+    default void dropTag(ConnectorSession session, ConnectorTableHandle tableHandle, String tagName, boolean tagExists)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "This connector does not support dropping table tags");
     }
 
     /**

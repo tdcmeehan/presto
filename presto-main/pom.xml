@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.296-SNAPSHOT</version>
+        <version>0.297-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-main</artifactId>
@@ -474,6 +474,11 @@
             <groupId>org.testcontainers</groupId>
             <artifactId>postgresql</artifactId>
             <scope>test</scope>
+        </dependency>
+        
+        <dependency>
+            <groupId>com.github.luben</groupId>
+            <artifactId>zstd-jni</artifactId>
         </dependency>
     </dependencies>
 

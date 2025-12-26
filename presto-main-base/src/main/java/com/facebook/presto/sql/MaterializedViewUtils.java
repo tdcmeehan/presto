@@ -19,7 +19,6 @@ import com.facebook.presto.common.predicate.NullableValue;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.SessionPropertyManager;
-import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.MaterializedViewStatus;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.relation.DomainTranslator;
@@ -57,9 +56,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.Stack;
 
+import static com.facebook.presto.SystemSessionProperties.isLegacyMaterializedViews;
 import static com.facebook.presto.common.predicate.TupleDomain.extractFixedValues;
 import static com.facebook.presto.common.type.StandardTypes.HYPER_LOG_LOG;
 import static com.facebook.presto.common.type.StandardTypes.VARBINARY;
+import static com.facebook.presto.sql.ExpressionUtils.combineDisjuncts;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.sql.tree.ArithmeticBinaryExpression.Operator.DIVIDE;
 import static com.facebook.presto.sql.tree.BooleanLiteral.FALSE_LITERAL;
@@ -95,6 +96,14 @@ public final class MaterializedViewUtils
 
     public static Session buildOwnerSession(Session session, Optional<String> owner, SessionPropertyManager sessionPropertyManager, String catalog, String schema)
     {
+        // When legacy_materialized_views=false, owner must be present for REFRESH operations
+        if (!isLegacyMaterializedViews(session) && !owner.isPresent()) {
+            throw new IllegalStateException(
+                    "Materialized view owner is required when legacy_materialized_views=false. " +
+                    "This indicates a materialized view created before the security mode feature was added. " +
+                    "Set session property legacy_materialized_views=true to refresh this view, or drop and recreate the view.");
+        }
+
         Identity identity = getOwnerIdentity(owner, session);
 
         Session.SessionBuilder builder = Session.builder(sessionPropertyManager)
@@ -113,13 +122,6 @@ public final class MaterializedViewUtils
 
         for (Map.Entry<String, String> property : session.getSystemProperties().entrySet()) {
             builder.setSystemProperty(property.getKey(), property.getValue());
-        }
-
-        for (Map.Entry<ConnectorId, Map<String, String>> connectorEntry : session.getConnectorProperties().entrySet()) {
-            String catalogName = connectorEntry.getKey().getCatalogName();
-            for (Map.Entry<String, String> property : connectorEntry.getValue().entrySet()) {
-                builder.setCatalogSessionProperty(catalogName, property.getKey(), property.getValue());
-            }
         }
 
         return builder.build();
@@ -393,10 +395,7 @@ public final class MaterializedViewUtils
             return disjuncts.get(0);
         }
         else {
-            return disjuncts.stream()
-                    .reduce((left, right) -> new LogicalBinaryExpression(
-                            LogicalBinaryExpression.Operator.OR, left, right))
-                    .get();
+            return combineDisjuncts(disjuncts);
         }
     }
 

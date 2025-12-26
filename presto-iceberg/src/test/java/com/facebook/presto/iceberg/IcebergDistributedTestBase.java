@@ -20,6 +20,7 @@ import com.facebook.presto.common.block.Block;
 import com.facebook.presto.common.block.BlockBuilder;
 import com.facebook.presto.common.transaction.TransactionId;
 import com.facebook.presto.common.type.FixedWidthType;
+import com.facebook.presto.common.type.TimeType;
 import com.facebook.presto.common.type.TimeZoneKey;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeParameter;
@@ -32,8 +33,10 @@ import com.facebook.presto.hive.HiveClientConfig;
 import com.facebook.presto.hive.HiveCompressionCodec;
 import com.facebook.presto.hive.HiveHdfsConfiguration;
 import com.facebook.presto.hive.HiveStorageFormat;
+import com.facebook.presto.hive.HiveType;
 import com.facebook.presto.hive.MetastoreClientConfig;
 import com.facebook.presto.hive.authentication.NoHdfsAuthentication;
+import com.facebook.presto.hive.metastore.Column;
 import com.facebook.presto.hive.s3.HiveS3Config;
 import com.facebook.presto.hive.s3.PrestoS3ConfigurationUpdater;
 import com.facebook.presto.hive.s3.S3ConfigurationUpdater;
@@ -112,8 +115,11 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -142,9 +148,11 @@ import static com.facebook.presto.common.type.DoubleType.DOUBLE;
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.common.type.RealType.REAL;
 import static com.facebook.presto.common.type.TimeZoneKey.UTC_KEY;
+import static com.facebook.presto.common.type.TimestampWithTimeZoneType.TIMESTAMP_WITH_TIME_ZONE;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.hive.BaseHiveColumnHandle.ColumnType.SYNTHESIZED;
 import static com.facebook.presto.hive.HiveCommonSessionProperties.PARQUET_BATCH_READ_OPTIMIZATION_ENABLED;
+import static com.facebook.presto.iceberg.CatalogType.HADOOP;
 import static com.facebook.presto.iceberg.FileContent.EQUALITY_DELETES;
 import static com.facebook.presto.iceberg.FileContent.POSITION_DELETES;
 import static com.facebook.presto.iceberg.FileFormat.ORC;
@@ -180,8 +188,10 @@ import static java.util.UUID.randomUUID;
 import static java.util.function.Function.identity;
 import static org.apache.iceberg.SnapshotSummary.TOTAL_DATA_FILES_PROP;
 import static org.apache.iceberg.SnapshotSummary.TOTAL_DELETE_FILES_PROP;
+import static org.apache.iceberg.types.Type.TypeID.TIME;
 import static org.apache.parquet.column.ParquetProperties.WriterVersion.PARQUET_1_0;
 import static org.apache.parquet.column.ParquetProperties.WriterVersion.PARQUET_2_0;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertNotNull;
@@ -2039,6 +2049,116 @@ public abstract class IcebergDistributedTestBase
         }
     }
 
+    public void testMetadataDeleteOnV2MorTableWithRewriteDataFiles()
+    {
+        String tableName = "test_rewrite_data_files_table_" + randomTableSuffix();
+        try {
+            // Create a table with partition column `a`, and insert some data under this partition spec
+            assertUpdate("CREATE TABLE " + tableName + " (a INTEGER, b VARCHAR) WITH (format_version = '2', delete_mode = 'merge-on-read')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, '1001'), (2, '1002')", 2);
+            assertUpdate("DELETE FROM " + tableName + " WHERE a = 1", 1);
+            assertQuery("SELECT * FROM " + tableName, "VALUES (2, '1002')");
+
+            Table icebergTable = loadTable(tableName);
+            assertHasDataFiles(icebergTable.currentSnapshot(), 1);
+            assertHasDeleteFiles(icebergTable.currentSnapshot(), 1);
+
+            // Evaluate the partition spec by adding a partition column `c`, and insert some data under the new partition spec
+            assertUpdate("ALTER TABLE " + tableName + " ADD COLUMN c INTEGER WITH (partitioning = 'identity')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (3, '1003', 3), (4, '1004', 4), (5, '1005', 5)", 3);
+
+            icebergTable = loadTable(tableName);
+            assertHasDataFiles(icebergTable.currentSnapshot(), 4);
+            assertHasDeleteFiles(icebergTable.currentSnapshot(), 1);
+
+            // Execute row level delete with filter on column `b`
+            assertUpdate("DELETE FROM " + tableName + " WHERE b = '1004'", 1);
+            assertQuery("SELECT * FROM " + tableName, "VALUES (2, '1002', NULL), (3, '1003', 3), (5, '1005', 5)");
+            icebergTable = loadTable(tableName);
+            assertHasDataFiles(icebergTable.currentSnapshot(), 4);
+            assertHasDeleteFiles(icebergTable.currentSnapshot(), 2);
+
+            assertQueryFails("call system.rewrite_data_files(table_name => '" + tableName + "', schema => 'tpch', filter => 'a > 3')", ".*");
+            assertQueryFails("call system.rewrite_data_files(table_name => '" + tableName + "', schema => 'tpch', filter => 'c > 3')", ".*");
+
+            assertUpdate("call system.rewrite_data_files(table_name => '" + tableName + "', schema => 'tpch')", 3);
+            assertQuery("SELECT * FROM " + tableName, "VALUES (2, '1002', NULL), (3, '1003', 3), (5, '1005', 5)");
+            icebergTable = loadTable(tableName);
+            assertHasDataFiles(icebergTable.currentSnapshot(), 3);
+            assertHasDeleteFiles(icebergTable.currentSnapshot(), 0);
+
+            // Do metadata delete on column `a`, because all partition specs contains partition column `a`
+            assertUpdate("DELETE FROM " + tableName + " WHERE c = 5", 1);
+            assertQuery("SELECT * FROM " + tableName, "VALUES (2, '1002', NULL), (3, '1003', 3)");
+            icebergTable = loadTable(tableName);
+            assertHasDataFiles(icebergTable.currentSnapshot(), 2);
+            assertHasDeleteFiles(icebergTable.currentSnapshot(), 0);
+
+            assertUpdate("call system.rewrite_data_files(table_name => '" + tableName + "', schema => 'tpch', filter => 'c > 2')", 1);
+            assertQuery("SELECT * FROM " + tableName, "VALUES (2, '1002', NULL), (3, '1003', 3)");
+            icebergTable = loadTable(tableName);
+            assertHasDataFiles(icebergTable.currentSnapshot(), 2);
+            assertHasDeleteFiles(icebergTable.currentSnapshot(), 0);
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + tableName);
+        }
+    }
+
+    @Test
+    public void testDropBranch()
+    {
+        assertUpdate("CREATE TABLE test_table_branch (id1 BIGINT, id2 BIGINT)");
+        assertUpdate("INSERT INTO test_table_branch VALUES (0, 00), (1, 10)", 2);
+
+        Table icebergTable = loadTable("test_table_branch");
+        icebergTable.manageSnapshots().createBranch("testBranch1").commit();
+
+        assertUpdate("INSERT INTO test_table_branch VALUES (2, 30), (3, 30)", 2);
+        icebergTable.manageSnapshots().createBranch("testBranch2").commit();
+        assertUpdate("INSERT INTO test_table_branch VALUES (4, 40), (5, 50)", 2);
+        assertEquals(icebergTable.refs().size(), 3);
+
+        assertQuery("SELECT count(*) FROM test_table_branch FOR SYSTEM_VERSION AS OF 'testBranch1'", "VALUES 2");
+        assertQuery("SELECT count(*) FROM test_table_branch FOR SYSTEM_VERSION AS OF 'testBranch2'", "VALUES 4");
+        assertQuery("SELECT count(*) FROM test_table_branch FOR SYSTEM_VERSION AS OF 'main'", "VALUES 6");
+
+        assertQuerySucceeds("ALTER TABLE test_table_branch DROP BRANCH 'testBranch1'");
+        icebergTable = loadTable("test_table_branch");
+        assertEquals(icebergTable.refs().size(), 2);
+        assertQueryFails("ALTER TABLE test_table_branch DROP BRANCH 'testBranchNotExist'", "Branch testBranchNotExist doesn't exist in table test_table_branch");
+        assertQuerySucceeds("ALTER TABLE test_table_branch DROP BRANCH IF EXISTS 'testBranch2'");
+        assertQuerySucceeds("ALTER TABLE test_table_branch DROP BRANCH IF EXISTS 'testBranchNotExist'");
+        assertQuerySucceeds("DROP TABLE test_table_branch");
+    }
+
+    @Test
+    public void testDropTag()
+    {
+        assertUpdate("CREATE TABLE test_table_tag (id1 BIGINT, id2 BIGINT)");
+        assertUpdate("INSERT INTO test_table_tag VALUES (0, 00), (1, 10)", 2);
+
+        Table icebergTable = loadTable("test_table_tag");
+        icebergTable.manageSnapshots().createTag("testTag1", icebergTable.currentSnapshot().snapshotId()).commit();
+
+        assertUpdate("INSERT INTO test_table_tag VALUES (2, 30), (3, 30)", 2);
+        icebergTable.manageSnapshots().createTag("testTag2", icebergTable.currentSnapshot().snapshotId()).commit();
+        assertUpdate("INSERT INTO test_table_tag VALUES (4, 40), (5, 50)", 2);
+        assertEquals(icebergTable.refs().size(), 3);
+
+        assertQuery("SELECT count(*) FROM test_table_tag FOR SYSTEM_VERSION AS OF 'testTag1'", "VALUES 2");
+        assertQuery("SELECT count(*) FROM test_table_tag FOR SYSTEM_VERSION AS OF 'testTag2'", "VALUES 4");
+        assertQuery("SELECT count(*) FROM test_table_tag FOR SYSTEM_VERSION AS OF 'main'", "VALUES 6");
+
+        assertQuerySucceeds("ALTER TABLE test_table_tag DROP TAG 'testTag1'");
+        icebergTable = loadTable("test_table_tag");
+        assertEquals(icebergTable.refs().size(), 2);
+        assertQueryFails("ALTER TABLE test_table_tag DROP TAG 'testTagNotExist'", "Tag testTagNotExist doesn't exist in table test_table_tag");
+        assertQuerySucceeds("ALTER TABLE test_table_tag DROP TAG IF EXISTS 'testTag2'");
+        assertQuerySucceeds("ALTER TABLE test_table_tag DROP TAG IF EXISTS 'testTagNotExist'");
+        assertQuerySucceeds("DROP TABLE test_table_tag");
+    }
+
     @Test
     public void testRefsTable()
     {
@@ -2089,6 +2209,75 @@ public abstract class IcebergDistributedTestBase
         // Currently Presto returns current table schema for any previous snapshot access https://github.com/prestodb/presto/issues/23553
         // otherwise querying a tag uses the snapshot's schema https://iceberg.apache.org/docs/nightly/branching/#schema-selection-with-branches-and-tags
         assertQuery("SELECT * FROM test_table_references FOR SYSTEM_VERSION AS OF 'testTag' where id1=1", "VALUES(1, NULL)");
+    }
+
+    @Test
+    public void testMetadataLogTable()
+    {
+        try {
+            assertUpdate("CREATE TABLE test_table_metadatalog (id1 BIGINT, id2 BIGINT)");
+            assertQuery("SELECT count(*) FROM \"test_table_metadatalog$metadata_log_entries\"", "VALUES 1");
+            //metadata file created at table creation
+            assertQuery("SELECT latest_snapshot_id FROM \"test_table_metadatalog$metadata_log_entries\"", "VALUES NULL");
+
+            assertUpdate("INSERT INTO test_table_metadatalog VALUES (0, 00), (1, 10), (2, 20)", 3);
+            Table icebergTable = loadTable("test_table_metadatalog");
+            Snapshot latestSnapshot = icebergTable.currentSnapshot();
+            assertQuery("SELECT count(*) FROM \"test_table_metadatalog$metadata_log_entries\"", "VALUES 2");
+            assertQuery("SELECT latest_snapshot_id FROM \"test_table_metadatalog$metadata_log_entries\" order by timestamp DESC limit 1", "values " + latestSnapshot.snapshotId());
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS test_table_metadatalog");
+        }
+    }
+
+    @DataProvider(name = "timezoneId")
+    public Object[][] getTimezonesId()
+    {
+        return new Object[][]{{"UTC"}, {"America/Los_Angeles"}, {"Asia/Shanghai"}, {"Asia/Kolkata"}, {"America/Bahia_Banderas"}, {"Europe/Brussels"}};
+    }
+
+    @Test(dataProvider = "timezoneId")
+    public void testMetadataLogTableWithTimeZoneId(String zoneId)
+    {
+        try {
+            Session sessionForTimeZone = Session.builder(getSession())
+                        .setTimeZoneKey(TimeZoneKey.getTimeZoneKey(zoneId)).build();
+
+            assertUpdate(sessionForTimeZone, "CREATE TABLE test_table_metadatalog_tz_id (id1 BIGINT, id2 BIGINT)");
+            assertQuery(sessionForTimeZone, "SELECT count(*) FROM \"test_table_metadatalog_tz_id$metadata_log_entries\"", "VALUES 1");
+            assertQuery(sessionForTimeZone, "SELECT latest_snapshot_id FROM \"test_table_metadatalog_tz_id$metadata_log_entries\"", "VALUES NULL");
+            Table icebergTable = loadTable("test_table_metadatalog_tz_id");
+            TableMetadata tableMetadata = ((BaseTable) icebergTable).operations().current();
+            ZonedDateTime zonedDateTime1 = Instant.ofEpochMilli(tableMetadata.lastUpdatedMillis())
+                    .atZone(ZoneId.of(zoneId));
+            //metadata file created at table creation
+            String metadataFileLocation1 = tableMetadata.metadataFileLocation();
+
+            assertUpdate("INSERT INTO test_table_metadatalog_tz_id VALUES (0, 00), (1, 10), (2, 20)", 3);
+            icebergTable = loadTable("test_table_metadatalog_tz_id");
+            tableMetadata = ((BaseTable) icebergTable).operations().current();
+            ZonedDateTime zonedDateTime2 = Instant.ofEpochMilli(tableMetadata.lastUpdatedMillis())
+                    .atZone(ZoneId.of(zoneId));
+            //metadata file created after table insertion
+            String metadataFileLocation2 = tableMetadata.metadataFileLocation();
+
+            Snapshot latestSnapshot = icebergTable.currentSnapshot();
+            assertQuery("SELECT count(*) FROM \"test_table_metadatalog_tz_id$metadata_log_entries\"", "VALUES 2");
+            assertQuery("SELECT latest_snapshot_id FROM \"test_table_metadatalog_tz_id$metadata_log_entries\" order by timestamp DESC limit 1", "values " + latestSnapshot.snapshotId());
+
+            MaterializedResult actual = getQueryRunner().execute(sessionForTimeZone, "SELECT * FROM \"test_table_metadatalog_tz_id$metadata_log_entries\"");
+            assertThat(actual).hasSize(2);
+            MaterializedResult expected = resultBuilder(getSession(), TIMESTAMP_WITH_TIME_ZONE, VARCHAR, BIGINT, INTEGER, BIGINT)
+                    .row(zonedDateTime1, metadataFileLocation1, null, null, null)
+                    .row(zonedDateTime2, metadataFileLocation2, latestSnapshot.snapshotId(), latestSnapshot.schemaId(), latestSnapshot.sequenceNumber())
+                    .build();
+
+            assertEquals(actual, expected);
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS test_table_metadatalog_tz_id");
+        }
     }
 
     @Test
@@ -2887,14 +3076,14 @@ public abstract class IcebergDistributedTestBase
         test.accept(session, ORC);
     }
 
-    private void assertHasDataFiles(Snapshot snapshot, int dataFilesCount)
+    protected void assertHasDataFiles(Snapshot snapshot, int dataFilesCount)
     {
         Map<String, String> map = snapshot.summary();
         int totalDataFiles = Integer.valueOf(map.get(TOTAL_DATA_FILES_PROP));
         assertEquals(totalDataFiles, dataFilesCount);
     }
 
-    private void assertHasDeleteFiles(Snapshot snapshot, int deleteFilesCount)
+    protected void assertHasDeleteFiles(Snapshot snapshot, int deleteFilesCount)
     {
         Map<String, String> map = snapshot.summary();
         int totalDeleteFiles = Integer.valueOf(map.get(TOTAL_DELETE_FILES_PROP));
@@ -3336,6 +3525,40 @@ public abstract class IcebergDistributedTestBase
         finally {
             assertUpdate(String.format("DROP TABLE IF EXISTS %s", tableName2));
             assertUpdate(String.format("DROP TABLE IF EXISTS %s", tableName1));
+        }
+    }
+
+    @Test
+    public void testTimeColumnPhysicalType()
+    {
+        String tableName = "test_time_type";
+
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id BIGINT, time TIME, name VARCHAR)");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, TIME '12:34:56', 'test')", 1);
+            MaterializedResult result = computeActual("SELECT * FROM " + tableName);
+            List<Type> types = result.getTypes();
+            assertEquals(types.size(), 3);
+            assertTrue(types.get(1) instanceof TimeType, "Expected TIME type but got " + types.get(1));
+
+            Table icebergTable = loadTable(tableName);
+            Schema schema = icebergTable.schema();
+            Types.NestedField timeField = schema.findField("time");
+
+            assertEquals(timeField.type().typeId(), TIME,
+                    "Iceberg schema should have TIME type, not STRING type");
+
+            List<Column> hiveColumns = IcebergUtil.toHiveColumns(schema.columns());
+            Column timeColumn = hiveColumns.stream()
+                    .filter(col -> col.getName().equals("time"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("time not found in Hive columns"));
+
+            assertEquals(timeColumn.getType(), HiveType.HIVE_LONG,
+                    "TIME column should be converted to HIVE_LONG");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + tableName);
         }
     }
 }

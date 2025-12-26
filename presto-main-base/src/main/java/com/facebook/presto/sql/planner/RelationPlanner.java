@@ -15,6 +15,7 @@ package com.facebook.presto.sql.planner;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.SystemSessionProperties;
+import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.ArrayType;
 import com.facebook.presto.common.type.MapType;
@@ -35,6 +36,7 @@ import com.facebook.presto.spi.plan.ExceptNode;
 import com.facebook.presto.spi.plan.FilterNode;
 import com.facebook.presto.spi.plan.IntersectNode;
 import com.facebook.presto.spi.plan.JoinNode;
+import com.facebook.presto.spi.plan.MaterializedViewScanNode;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
 import com.facebook.presto.spi.plan.ProjectNode;
@@ -182,6 +184,11 @@ class RelationPlanner
     @Override
     protected RelationPlan visitTable(Table node, SqlPlannerContext context)
     {
+        Optional<Analysis.MaterializedViewInfo> materializedViewInfo = analysis.getMaterializedViewInfo(node);
+        if (materializedViewInfo.isPresent()) {
+            return planMaterializedView(node, materializedViewInfo.get(), context);
+        }
+
         NamedQuery namedQuery = analysis.getNamedQuery(node);
         Scope scope = analysis.getScope(node);
 
@@ -304,6 +311,59 @@ class RelationPlanner
         return new RelationPlan(planBuilder.getRoot(), plan.getScope(), newMappings.build());
     }
 
+    private RelationPlan planMaterializedView(Table node, Analysis.MaterializedViewInfo materializedViewInfo, SqlPlannerContext context)
+    {
+        RelationPlan dataTablePlan = process(materializedViewInfo.getDataTable(), context);
+        RelationPlan viewQueryPlan = process(materializedViewInfo.getViewQuery(), context);
+
+        Scope scope = analysis.getScope(node);
+
+        QualifiedObjectName materializedViewName = materializedViewInfo.getMaterializedViewName();
+
+        RelationType dataTableDescriptor = dataTablePlan.getDescriptor();
+        List<VariableReferenceExpression> dataTableVariables = dataTablePlan.getFieldMappings();
+        List<VariableReferenceExpression> viewQueryVariables = viewQueryPlan.getFieldMappings();
+
+        checkArgument(
+                dataTableDescriptor.getVisibleFieldCount() == viewQueryVariables.size(),
+                "Materialized view %s has mismatched field counts: data table has %s visible fields but view query has %s fields",
+                materializedViewName,
+                dataTableDescriptor.getVisibleFieldCount(),
+                viewQueryVariables.size());
+
+        ImmutableList.Builder<VariableReferenceExpression> outputVariablesBuilder = ImmutableList.builder();
+        ImmutableMap.Builder<VariableReferenceExpression, VariableReferenceExpression> dataTableMappingsBuilder = ImmutableMap.builder();
+        ImmutableMap.Builder<VariableReferenceExpression, VariableReferenceExpression> viewQueryMappingsBuilder = ImmutableMap.builder();
+
+        for (Field field : dataTableDescriptor.getVisibleFields()) {
+            int fieldIndex = dataTableDescriptor.indexOf(field);
+            VariableReferenceExpression dataTableVar = dataTableVariables.get(fieldIndex);
+            VariableReferenceExpression viewQueryVar = viewQueryVariables.get(fieldIndex);
+
+            VariableReferenceExpression outputVar = variableAllocator.newVariable(dataTableVar);
+            outputVariablesBuilder.add(outputVar);
+
+            dataTableMappingsBuilder.put(outputVar, dataTableVar);
+            viewQueryMappingsBuilder.put(outputVar, viewQueryVar);
+        }
+
+        List<VariableReferenceExpression> outputVariables = outputVariablesBuilder.build();
+        Map<VariableReferenceExpression, VariableReferenceExpression> dataTableMappings = dataTableMappingsBuilder.build();
+        Map<VariableReferenceExpression, VariableReferenceExpression> viewQueryMappings = viewQueryMappingsBuilder.build();
+
+        MaterializedViewScanNode mvScanNode = new MaterializedViewScanNode(
+                getSourceLocation(node.getLocation()),
+                idAllocator.getNextId(),
+                dataTablePlan.getRoot(),
+                viewQueryPlan.getRoot(),
+                materializedViewName,
+                dataTableMappings,
+                viewQueryMappings,
+                outputVariables);
+
+        return new RelationPlan(mvScanNode, scope, outputVariables);
+    }
+
     @Override
     protected RelationPlan visitTableFunctionInvocation(TableFunctionInvocation node, SqlPlannerContext context)
     {
@@ -423,6 +483,11 @@ class RelationPlanner
             return planJoinUsing(node, leftPlan, rightPlan, context);
         }
 
+        return planJoin(analysis.getJoinCriteria(node), node.getType(), analysis.getScope(node), leftPlan, rightPlan, node, context);
+    }
+
+    public RelationPlan planJoin(Expression criteria, Join.Type type, Scope scope, RelationPlan leftPlan, RelationPlan rightPlan, Node node, SqlPlannerContext context)
+    {
         PlanBuilder leftPlanBuilder = initializePlanBuilder(leftPlan);
         PlanBuilder rightPlanBuilder = initializePlanBuilder(rightPlan);
 
@@ -436,12 +501,10 @@ class RelationPlanner
         List<Expression> complexJoinExpressions = new ArrayList<>();
         List<Expression> postInnerJoinConditions = new ArrayList<>();
 
-        if (node.getType() != Join.Type.CROSS && node.getType() != Join.Type.IMPLICIT) {
-            Expression criteria = analysis.getJoinCriteria(node);
+        RelationType left = leftPlan.getDescriptor();
+        RelationType right = rightPlan.getDescriptor();
 
-            RelationType left = analysis.getOutputDescriptor(node.getLeft());
-            RelationType right = analysis.getOutputDescriptor(node.getRight());
-
+        if (type != Join.Type.CROSS && type != Join.Type.IMPLICIT) {
             List<Expression> leftComparisonExpressions = new ArrayList<>();
             List<Expression> rightComparisonExpressions = new ArrayList<>();
             List<ComparisonExpression.Operator> joinConditionComparisonOperators = new ArrayList<>();
@@ -449,7 +512,7 @@ class RelationPlanner
             for (Expression conjunct : ExpressionUtils.extractConjuncts(criteria)) {
                 conjunct = ExpressionUtils.normalize(conjunct);
 
-                if (!isEqualComparisonExpression(conjunct) && node.getType() != INNER) {
+                if (!isEqualComparisonExpression(conjunct) && type != INNER) {
                     complexJoinExpressions.add(conjunct);
                     continue;
                 }
@@ -513,7 +576,7 @@ class RelationPlanner
         PlanNode root = new JoinNode(
                 getSourceLocation(node),
                 idAllocator.getNextId(),
-                JoinNodeUtils.typeConvert(node.getType()),
+                JoinNodeUtils.typeConvert(type),
                 leftPlanBuilder.getRoot(),
                 rightPlanBuilder.getRoot(),
                 equiClauses.build(),
@@ -527,7 +590,7 @@ class RelationPlanner
                 Optional.empty(),
                 ImmutableMap.of());
 
-        if (node.getType() != INNER) {
+        if (type != INNER) {
             for (Expression complexExpression : complexJoinExpressions) {
                 Set<InPredicate> inPredicates = subqueryPlanner.collectInPredicateSubqueries(complexExpression, node);
                 if (!inPredicates.isEmpty()) {
@@ -536,10 +599,7 @@ class RelationPlanner
                 }
             }
 
-            if (node.getType() == LEFT || node.getType() == RIGHT) {
-                RelationType left = analysis.getOutputDescriptor(node.getLeft());
-                RelationType right = analysis.getOutputDescriptor(node.getRight());
-
+            if (type == LEFT || type == RIGHT) {
                 for (Expression complexJoinExpression : complexJoinExpressions) {
                     Set<QualifiedName> dependencies = VariablesExtractor.extractNames(complexJoinExpression, analysis.getColumnReferences());
                     // If there are no dependencies, no subqueries, or if the expression references both inputs,
@@ -555,7 +615,7 @@ class RelationPlanner
                         // If the subquery references the right input, those variables will remain unresolved and caught in NoIdentifierLeftChecker
                         leftPlanBuilder = subqueryPlanner.handleUncorrelatedSubqueries(leftPlanBuilder, ImmutableList.of(complexJoinExpression), node, context);
                     }
-                    else if (node.getType() == LEFT && !dependencies.stream().allMatch(left::canResolve)) {
+                    else if (type == LEFT && !dependencies.stream().allMatch(left::canResolve)) {
                         rightPlanBuilder = subqueryPlanner.handleSubqueries(rightPlanBuilder, complexJoinExpression, node, context);
                     }
                     else {
@@ -570,19 +630,19 @@ class RelationPlanner
             }
         }
 
-        RelationPlan intermediateRootRelationPlan = new RelationPlan(root, analysis.getScope(node), outputs);
+        RelationPlan intermediateRootRelationPlan = new RelationPlan(root, scope, outputs);
         TranslationMap translationMap = new TranslationMap(intermediateRootRelationPlan, analysis, lambdaDeclarationToVariableMap);
         translationMap.setFieldMappings(outputs);
         translationMap.putExpressionMappingsFrom(leftPlanBuilder.getTranslations());
         translationMap.putExpressionMappingsFrom(rightPlanBuilder.getTranslations());
 
-        if (node.getType() != INNER && !complexJoinExpressions.isEmpty()) {
+        if (type != INNER && !complexJoinExpressions.isEmpty()) {
             Expression joinedFilterCondition = ExpressionUtils.and(complexJoinExpressions);
             Expression rewrittenFilterCondition = translationMap.rewrite(joinedFilterCondition);
             root = new JoinNode(
                     getSourceLocation(node),
                     idAllocator.getNextId(),
-                    JoinNodeUtils.typeConvert(node.getType()),
+                    JoinNodeUtils.typeConvert(type),
                     leftPlanBuilder.getRoot(),
                     rightPlanBuilder.getRoot(),
                     equiClauses.build(),
@@ -597,7 +657,7 @@ class RelationPlanner
                     ImmutableMap.of());
         }
 
-        if (node.getType() == INNER) {
+        if (type == INNER) {
             // rewrite all the other conditions using output variables from left + right plan node.
             PlanBuilder rootPlanBuilder = new PlanBuilder(translationMap, root);
             rootPlanBuilder = subqueryPlanner.handleSubqueries(rootPlanBuilder, complexJoinExpressions, node, context);
@@ -614,7 +674,7 @@ class RelationPlanner
             }
         }
 
-        return new RelationPlan(root, analysis.getScope(node), outputs);
+        return new RelationPlan(root, scope, outputs);
     }
 
     private RelationPlan planJoinUsing(Join node, RelationPlan left, RelationPlan right, SqlPlannerContext context)

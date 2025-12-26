@@ -14,6 +14,7 @@
 package com.facebook.presto.sql.planner.iterative.rule.test;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.block.SortOrder;
 import com.facebook.presto.common.function.OperatorType;
 import com.facebook.presto.common.predicate.TupleDomain;
@@ -25,6 +26,7 @@ import com.facebook.presto.spi.IndexHandle;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.WarningCollector;
+import com.facebook.presto.spi.connector.RowChangeParadigm;
 import com.facebook.presto.spi.constraints.TableConstraint;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.plan.AggregationNode;
@@ -46,6 +48,7 @@ import com.facebook.presto.spi.plan.JoinNode;
 import com.facebook.presto.spi.plan.JoinType;
 import com.facebook.presto.spi.plan.LimitNode;
 import com.facebook.presto.spi.plan.MarkDistinctNode;
+import com.facebook.presto.spi.plan.MaterializedViewScanNode;
 import com.facebook.presto.spi.plan.Ordering;
 import com.facebook.presto.spi.plan.OrderingScheme;
 import com.facebook.presto.spi.plan.OutputNode;
@@ -61,6 +64,8 @@ import com.facebook.presto.spi.plan.SortNode;
 import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
+import com.facebook.presto.spi.plan.TableWriterNode.MergeParadigmAndTypes;
+import com.facebook.presto.spi.plan.TableWriterNode.MergeTarget;
 import com.facebook.presto.spi.plan.TopNNode;
 import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.UnnestNode;
@@ -82,6 +87,7 @@ import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
 import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.LateralJoinNode;
+import com.facebook.presto.sql.planner.plan.MergeWriterNode;
 import com.facebook.presto.sql.planner.plan.OffsetNode;
 import com.facebook.presto.sql.planner.plan.RemoteSourceNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
@@ -111,6 +117,7 @@ import java.util.stream.Stream;
 
 import static com.facebook.presto.common.block.SortOrder.ASC_NULLS_FIRST;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
+import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.common.type.UnknownType.UNKNOWN;
 import static com.facebook.presto.common.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.spi.plan.ExchangeEncoding.COLUMNAR;
@@ -601,6 +608,34 @@ public class PlanBuilder
                 Optional.empty(), Optional.empty());
     }
 
+    public MergeWriterNode merge(
+            SchemaTableName schemaTableName,
+            PlanNode mergeSource,
+            List<VariableReferenceExpression> inputSymbols,
+            List<VariableReferenceExpression> outputSymbols)
+    {
+        return new MergeWriterNode(
+                mergeSource.getSourceLocation(),
+                idAllocator.getNextId(),
+                mergeSource,
+                mergeTarget(schemaTableName),
+                inputSymbols,
+                outputSymbols);
+    }
+
+    private MergeTarget mergeTarget(SchemaTableName schemaTableName)
+    {
+        return new MergeTarget(
+                new TableHandle(
+                        new ConnectorId("testConnector"),
+                        new TestingTableHandle(),
+                        TestingTransactionHandle.create(),
+                        Optional.empty()),
+                Optional.empty(),
+                schemaTableName,
+                new MergeParadigmAndTypes(RowChangeParadigm.DELETE_ROW_AND_INSERT_ROW, ImmutableList.of(), INTEGER));
+    }
+
     public ExchangeNode gatheringExchange(ExchangeNode.Scope scope, PlanNode child)
     {
         return exchange(builder -> builder.type(ExchangeNode.Type.GATHER)
@@ -1087,5 +1122,24 @@ public class PlanBuilder
                 groupingColumns,
                 aggregationArguments,
                 groupIdSymbol);
+    }
+
+    public MaterializedViewScanNode materializedViewScan(
+            QualifiedObjectName materializedViewName,
+            PlanNode dataTablePlan,
+            PlanNode viewQueryPlan,
+            Map<VariableReferenceExpression, VariableReferenceExpression> dataTableMappings,
+            Map<VariableReferenceExpression, VariableReferenceExpression> viewQueryMappings,
+            VariableReferenceExpression... outputVariables)
+    {
+        return new MaterializedViewScanNode(
+                Optional.empty(),
+                idAllocator.getNextId(),
+                dataTablePlan,
+                viewQueryPlan,
+                materializedViewName,
+                dataTableMappings,
+                viewQueryMappings,
+                ImmutableList.copyOf(outputVariables));
     }
 }

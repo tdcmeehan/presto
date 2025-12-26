@@ -23,9 +23,10 @@ import com.facebook.airlift.units.MaxDataSize;
 import com.facebook.presto.CompressionCodec;
 import com.facebook.presto.common.function.OperatorType;
 import com.facebook.presto.common.resourceGroups.QueryType;
+import com.facebook.presto.spi.MaterializedViewStaleReadBehavior;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.function.FunctionMetadata;
-import com.facebook.presto.sql.tree.CreateView;
+import com.facebook.presto.spi.security.ViewSecurity;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
@@ -43,11 +44,11 @@ import java.util.stream.Stream;
 import static com.facebook.airlift.units.DataSize.Unit.KILOBYTE;
 import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
 import static com.facebook.presto.spi.StandardErrorCode.INVALID_SESSION_PROPERTY;
+import static com.facebook.presto.spi.security.ViewSecurity.DEFINER;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.AggregationPartitioningMergingStrategy.LEGACY;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinNotNullInferenceStrategy.NONE;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.TaskSpillingStrategy.ORDER_BY_CREATE_TIME;
 import static com.facebook.presto.sql.expressions.ExpressionOptimizerManager.DEFAULT_EXPRESSION_OPTIMIZER_NAME;
-import static com.facebook.presto.sql.tree.CreateView.Security.DEFINER;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
@@ -102,6 +103,7 @@ public class FeaturesConfig
     private boolean cteFilterAndProjectionPushdownEnabled = true;
     private int cteHeuristicReplicationThreshold = 4;
     private int maxReorderedJoins = 9;
+    private int maxPrefixesCount = 100;
     private boolean useHistoryBasedPlanStatistics;
     private boolean trackHistoryBasedPlanStatistics;
     private boolean trackHistoryStatsFromFailedQuery = true;
@@ -192,6 +194,7 @@ public class FeaturesConfig
 
     private boolean listBuiltInFunctionsOnly = true;
     private boolean experimentalFunctionsEnabled;
+    private boolean useConnectorProvidedSerializationCodecs;
     private boolean optimizeCommonSubExpressions = true;
     private boolean preferDistributedUnion = true;
     private boolean optimizeNullsInJoin;
@@ -226,7 +229,9 @@ public class FeaturesConfig
     private boolean materializedViewPartitionFilteringEnabled = true;
     private boolean queryOptimizationWithMaterializedViewEnabled;
     private boolean legacyMaterializedViewRefresh = true;
+    private boolean allowLegacyMaterializedViewsToggle;
     private boolean materializedViewAllowFullRefreshEnabled;
+    private MaterializedViewStaleReadBehavior materializedViewStaleReadBehavior = MaterializedViewStaleReadBehavior.USE_VIEW_QUERY;
 
     private AggregationIfToFilterRewriteStrategy aggregationIfToFilterRewriteStrategy = AggregationIfToFilterRewriteStrategy.DISABLED;
     private String analyzerType = "BUILTIN";
@@ -236,6 +241,7 @@ public class FeaturesConfig
     private boolean streamingForPartialAggregationEnabled;
     private boolean preferMergeJoinForSortedInputs;
     private boolean preferSortMergeJoin;
+    private boolean isSortedExchangeEnabled;
     private boolean segmentedAggregationEnabled;
 
     private int maxStageCountForEagerScheduling = 25;
@@ -245,6 +251,7 @@ public class FeaturesConfig
 
     private boolean pushRemoteExchangeThroughGroupId;
     private boolean isOptimizeMultipleApproxPercentileOnSameFieldEnabled = true;
+    private boolean isOptimizeMultipleApproxDistinctOnSameTypeEnabled;
     private boolean nativeExecutionEnabled;
     private boolean disableTimeStampWithTimeZoneForNative;
     private boolean disableIPAddressForNative;
@@ -295,7 +302,7 @@ public class FeaturesConfig
     private boolean generateDomainFilters;
     private boolean printEstimatedStatsFromCache;
     private boolean removeCrossJoinWithSingleConstantRow = true;
-    private CreateView.Security defaultViewSecurityMode = DEFINER;
+    private ViewSecurity defaultViewSecurityMode = DEFINER;
     private boolean useHistograms;
 
     private boolean isInlineProjectionsOnValuesEnabled;
@@ -313,7 +320,6 @@ public class FeaturesConfig
     private boolean prestoSparkExecutionEnvironment;
     private boolean singleNodeExecutionEnabled;
     private boolean nativeExecutionScaleWritersThreadsEnabled;
-    private boolean nativeExecutionTypeRewriteEnabled;
     private String expressionOptimizerName = DEFAULT_EXPRESSION_OPTIMIZER_NAME;
     private boolean addExchangeBelowPartialAggregationOverGroupId;
     private boolean addDistinctBelowSemiJoinBuild;
@@ -476,6 +482,20 @@ public class FeaturesConfig
     {
         DISABLED,
         ALWAYS_ENABLED
+    }
+
+    @Min(1)
+    @Config("max-prefixes-count")
+    @ConfigDescription("Maximum number of prefixes (catalog/schema/table scopes used to narrow metadata lookups) that Presto generates when querying information_schema.")
+    public FeaturesConfig setMaxPrefixesCount(Integer maxPrefixesCount)
+    {
+        this.maxPrefixesCount = maxPrefixesCount;
+        return this;
+    }
+
+    public int getMaxPrefixesCount()
+    {
+        return maxPrefixesCount;
     }
 
     public double getCpuCostWeight()
@@ -1846,6 +1866,19 @@ public class FeaturesConfig
         return this;
     }
 
+    public boolean isUseConnectorProvidedSerializationCodecs()
+    {
+        return useConnectorProvidedSerializationCodecs;
+    }
+
+    @Config("use-connector-provided-serialization-codecs")
+    @ConfigDescription("Enable use of custom connector-provided serialization codecs for handles")
+    public FeaturesConfig setUseConnectorProvidedSerializationCodecs(boolean useConnectorProvidedSerializationCodecs)
+    {
+        this.useConnectorProvidedSerializationCodecs = useConnectorProvidedSerializationCodecs;
+        return this;
+    }
+
     public boolean isOptimizeCommonSubExpressions()
     {
         return optimizeCommonSubExpressions;
@@ -2170,6 +2203,19 @@ public class FeaturesConfig
         return this;
     }
 
+    public boolean isAllowLegacyMaterializedViewsToggle()
+    {
+        return allowLegacyMaterializedViewsToggle;
+    }
+
+    @Config("experimental.allow-legacy-materialized-views-toggle")
+    @ConfigDescription("Allow toggling legacy materialized views via session property. This should only be enabled in non-production environments.")
+    public FeaturesConfig setAllowLegacyMaterializedViewsToggle(boolean value)
+    {
+        this.allowLegacyMaterializedViewsToggle = value;
+        return this;
+    }
+
     public boolean isMaterializedViewAllowFullRefreshEnabled()
     {
         return materializedViewAllowFullRefreshEnabled;
@@ -2180,6 +2226,19 @@ public class FeaturesConfig
     public FeaturesConfig setMaterializedViewAllowFullRefreshEnabled(boolean value)
     {
         this.materializedViewAllowFullRefreshEnabled = value;
+        return this;
+    }
+
+    public MaterializedViewStaleReadBehavior getMaterializedViewStaleReadBehavior()
+    {
+        return materializedViewStaleReadBehavior;
+    }
+
+    @Config("materialized-view-stale-read-behavior")
+    @ConfigDescription("Default behavior when reading from a stale materialized view (FAIL or USE_VIEW_QUERY)")
+    public FeaturesConfig setMaterializedViewStaleReadBehavior(MaterializedViewStaleReadBehavior value)
+    {
+        this.materializedViewStaleReadBehavior = value;
         return this;
     }
 
@@ -2319,6 +2378,19 @@ public class FeaturesConfig
         return this;
     }
 
+    public boolean isSortedExchangeEnabled()
+    {
+        return isSortedExchangeEnabled;
+    }
+
+    @Config("experimental.optimizer.sorted-exchange-enabled")
+    @ConfigDescription("(Experimental) Enable pushing sort operations down to exchange nodes for distributed queries")
+    public FeaturesConfig setSortedExchangeEnabled(boolean isSortedExchangeEnabled)
+    {
+        this.isSortedExchangeEnabled = isSortedExchangeEnabled;
+        return this;
+    }
+
     public boolean isSegmentedAggregationEnabled()
     {
         return segmentedAggregationEnabled;
@@ -2366,6 +2438,19 @@ public class FeaturesConfig
     public FeaturesConfig setOptimizeMultipleApproxPercentileOnSameFieldEnabled(boolean isOptimizeMultipleApproxPercentileOnSameFieldEnabled)
     {
         this.isOptimizeMultipleApproxPercentileOnSameFieldEnabled = isOptimizeMultipleApproxPercentileOnSameFieldEnabled;
+        return this;
+    }
+
+    public boolean isOptimizeMultipleApproxDistinctOnSameTypeEnabled()
+    {
+        return isOptimizeMultipleApproxDistinctOnSameTypeEnabled;
+    }
+
+    @Config("optimizer.optimize-multiple-approx-distinct-on-same-type")
+    @ConfigDescription("Enable combining individual approx_distinct calls on expressions of the same type using set_agg")
+    public FeaturesConfig setOptimizeMultipleApproxDistinctOnSameTypeEnabled(boolean isOptimizeMultipleApproxDistinctOnSameTypeEnabled)
+    {
+        this.isOptimizeMultipleApproxDistinctOnSameTypeEnabled = isOptimizeMultipleApproxDistinctOnSameTypeEnabled;
         return this;
     }
 
@@ -2915,14 +3000,14 @@ public class FeaturesConfig
         return this;
     }
 
-    public CreateView.Security getDefaultViewSecurityMode()
+    public ViewSecurity getDefaultViewSecurityMode()
     {
         return this.defaultViewSecurityMode;
     }
 
     @Config("default-view-security-mode")
     @ConfigDescription("Sets the default security mode for view creation. The options are definer/invoker.")
-    public FeaturesConfig setDefaultViewSecurityMode(CreateView.Security securityMode)
+    public FeaturesConfig setDefaultViewSecurityMode(ViewSecurity securityMode)
     {
         this.defaultViewSecurityMode = securityMode;
         return this;
@@ -3105,18 +3190,6 @@ public class FeaturesConfig
     public FeaturesConfig setNativeExecutionScaleWritersThreadsEnabled(boolean nativeExecutionScaleWritersThreadsEnabled)
     {
         this.nativeExecutionScaleWritersThreadsEnabled = nativeExecutionScaleWritersThreadsEnabled;
-        return this;
-    }
-
-    public boolean isNativeExecutionTypeRewriteEnabled()
-    {
-        return nativeExecutionTypeRewriteEnabled;
-    }
-
-    @Config("native-execution-type-rewrite-enabled")
-    public FeaturesConfig setNativeExecutionTypeRewriteEnabled(boolean nativeExecutionTypeRewriteEnabled)
-    {
-        this.nativeExecutionTypeRewriteEnabled = nativeExecutionTypeRewriteEnabled;
         return this;
     }
 

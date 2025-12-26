@@ -54,6 +54,7 @@ import com.facebook.presto.sql.tree.DescribeOutput;
 import com.facebook.presto.sql.tree.Descriptor;
 import com.facebook.presto.sql.tree.DescriptorField;
 import com.facebook.presto.sql.tree.DoubleLiteral;
+import com.facebook.presto.sql.tree.DropBranch;
 import com.facebook.presto.sql.tree.DropColumn;
 import com.facebook.presto.sql.tree.DropConstraint;
 import com.facebook.presto.sql.tree.DropFunction;
@@ -61,6 +62,7 @@ import com.facebook.presto.sql.tree.DropMaterializedView;
 import com.facebook.presto.sql.tree.DropRole;
 import com.facebook.presto.sql.tree.DropSchema;
 import com.facebook.presto.sql.tree.DropTable;
+import com.facebook.presto.sql.tree.DropTag;
 import com.facebook.presto.sql.tree.DropView;
 import com.facebook.presto.sql.tree.EmptyTableTreatment;
 import com.facebook.presto.sql.tree.Execute;
@@ -181,6 +183,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static com.facebook.presto.spi.security.ViewSecurity.DEFINER;
+import static com.facebook.presto.spi.security.ViewSecurity.INVOKER;
 import static com.facebook.presto.sql.QueryUtil.aliased;
 import static com.facebook.presto.sql.QueryUtil.equal;
 import static com.facebook.presto.sql.QueryUtil.identifier;
@@ -1570,16 +1574,16 @@ public class TestSqlParser
                 "REFRESH MATERIALIZED VIEW a WHERE p = 'x'",
                 new RefreshMaterializedView(
                         table(QualifiedName.of("a")), Optional.of(
-                        new ComparisonExpression(ComparisonExpression.Operator.EQUAL,
-                                new Identifier("p"),
-                                new StringLiteral("x")))));
+                            new ComparisonExpression(ComparisonExpression.Operator.EQUAL,
+                                    new Identifier("p"),
+                                    new StringLiteral("x")))));
         assertStatement(
                 "REFRESH MATERIALIZED VIEW a.b WHERE p = 'x'",
                 new RefreshMaterializedView(
                         table(QualifiedName.of("a", "b")), Optional.of(
-                        new ComparisonExpression(ComparisonExpression.Operator.EQUAL,
-                                new Identifier("p"),
-                                new StringLiteral("x")))));
+                            new ComparisonExpression(ComparisonExpression.Operator.EQUAL,
+                                    new Identifier("p"),
+                                    new StringLiteral("x")))));
 
         assertStatement(
                 "REFRESH MATERIALIZED VIEW mv",
@@ -1781,8 +1785,8 @@ public class TestSqlParser
         assertStatement("CREATE VIEW a AS SELECT * FROM t", new CreateView(QualifiedName.of("a"), query, false, Optional.empty()));
         assertStatement("CREATE OR REPLACE VIEW a AS SELECT * FROM t", new CreateView(QualifiedName.of("a"), query, true, Optional.empty()));
 
-        assertStatement("CREATE VIEW a SECURITY DEFINER AS SELECT * FROM t", new CreateView(QualifiedName.of("a"), query, false, Optional.of(CreateView.Security.DEFINER)));
-        assertStatement("CREATE VIEW a SECURITY INVOKER AS SELECT * FROM t", new CreateView(QualifiedName.of("a"), query, false, Optional.of(CreateView.Security.INVOKER)));
+        assertStatement("CREATE VIEW a SECURITY DEFINER AS SELECT * FROM t", new CreateView(QualifiedName.of("a"), query, false, Optional.of(DEFINER)));
+        assertStatement("CREATE VIEW a SECURITY INVOKER AS SELECT * FROM t", new CreateView(QualifiedName.of("a"), query, false, Optional.of(INVOKER)));
 
         assertStatement("CREATE VIEW bar.foo AS SELECT * FROM t", new CreateView(QualifiedName.of("bar", "foo"), query, false, Optional.empty()));
         assertStatement("CREATE VIEW \"awesome view\" AS SELECT * FROM t", new CreateView(QualifiedName.of("awesome view"), query, false, Optional.empty()));
@@ -1824,6 +1828,11 @@ public class TestSqlParser
                         " WITH (partitioned_by = ARRAY ['ds'], retention_days = 90)" +
                         " AS SELECT * FROM t",
                 new CreateMaterializedView(Optional.empty(), QualifiedName.of("mv"), query, true, properties1, Optional.of("A simple materialized view")));
+
+        assertStatement("CREATE MATERIALIZED VIEW mv SECURITY DEFINER AS SELECT * FROM t",
+                new CreateMaterializedView(QualifiedName.of("mv"), query, false, Optional.of(DEFINER), ImmutableList.of(), Optional.empty()));
+        assertStatement("CREATE MATERIALIZED VIEW mv SECURITY INVOKER AS SELECT * FROM t",
+                new CreateMaterializedView(QualifiedName.of("mv"), query, false, Optional.of(INVOKER), ImmutableList.of(), Optional.empty()));
     }
 
     @Test
@@ -2857,6 +2866,24 @@ public class TestSqlParser
 
         assertStatement("Use \"test_schema\"", new Use(Optional.empty(), quotedIdentifier("test_schema")));
         assertStatement("Use \"test_catalog\".\"test_schema\"", new Use(Optional.of(quotedIdentifier("test_catalog")), quotedIdentifier("test_schema")));
+    }
+
+    @Test
+    public void testDropBranch()
+    {
+        assertStatement("ALTER TABLE foo.t DROP BRANCH 'cons'", new DropBranch(QualifiedName.of("foo", "t"), "cons", false, false));
+        assertStatement("ALTER TABLE IF EXISTS foo.t DROP BRANCH 'cons'", new DropBranch(QualifiedName.of("foo", "t"), "cons", true, false));
+        assertStatement("ALTER TABLE foo.t DROP BRANCH IF EXISTS 'cons'", new DropBranch(QualifiedName.of("foo", "t"), "cons", false, true));
+        assertStatement("ALTER TABLE IF EXISTS foo.t DROP BRANCH IF EXISTS 'cons'", new DropBranch(QualifiedName.of("foo", "t"), "cons", true, true));
+    }
+
+    @Test
+    public void testDropTag()
+    {
+        assertStatement("ALTER TABLE foo.t DROP TAG 'cons'", new DropTag(QualifiedName.of("foo", "t"), "cons", false, false));
+        assertStatement("ALTER TABLE IF EXISTS foo.t DROP TAG 'cons'", new DropTag(QualifiedName.of("foo", "t"), "cons", true, false));
+        assertStatement("ALTER TABLE foo.t DROP TAG IF EXISTS 'cons'", new DropTag(QualifiedName.of("foo", "t"), "cons", false, true));
+        assertStatement("ALTER TABLE IF EXISTS foo.t DROP TAG IF EXISTS 'cons'", new DropTag(QualifiedName.of("foo", "t"), "cons", true, true));
     }
 
     @Test

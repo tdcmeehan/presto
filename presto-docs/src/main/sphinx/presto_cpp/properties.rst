@@ -65,19 +65,6 @@ alphabetical order.
   This property is required when running Presto C++ workers because of
   underlying differences in behavior from Java workers.
 
-``native-execution-type-rewrite-enabled``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-* **Type:** ``boolean``
-* **Default value:** ``false``
-
-  When set to ``true``:
-    - Custom type names are peeled in the coordinator. Only the actual base type is preserved.
-    - ``CAST(col AS EnumType<T>)`` is rewritten as ``CAST(col AS <T>)``.
-    - ``ENUM_KEY(EnumType<T>)`` is rewritten as ``ELEMENT_AT(MAP(<T>, VARCHAR))``.
-
-  This property can only be enabled with native execution.
-
 ``optimizer.optimize-hash-generation``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -116,7 +103,19 @@ alphabetical order.
 * **Type:** ``string``
 * **Default value:** ``presto.default``
 
-  Specifies the namespace prefix for native C++ functions.
+  Specifies the namespace prefix for native C++ functions. This prefix is used when
+  registering Velox functions in Prestissimo to ensure proper function resolution in
+  multi-catalog environments.
+
+  .. warning::
+
+     **Critical**: When registering Velox functions, you **must** follow the
+     ``catalog.schema.`` prefix pattern. Functions registered without this pattern
+     will cause worker node crashes.
+
+  The configured value (for example, ``presto.default``) is automatically appended with a
+  trailing dot (``.``) to form the complete prefix (``presto.default.``). This results
+  in fully qualified function names like ``presto.default.substr`` or ``presto.default.sum``. Internal functions (prefixed with ``$internal$``) do not follow this pattern and are exempt from the three-part naming requirement.
 
 Worker Properties
 -----------------
@@ -430,6 +429,22 @@ avoid exceeding memory limits for the query.
   If ``true``, global arbitration does not reclaim memory by spilling, but
   only by aborting. This flag is only effective if
   ``shared-arbitrator.global-arbitration-enabled`` is ``true``.
+
+``text-writer-enabled``
+^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``boolean``
+* **Default value:** ``true``
+
+  Enables writing data in ``TEXTFILE`` format.
+
+``text-reader-enabled``
+^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``boolean``
+* **Default value:** ``true``
+
+  Enables reading data in ``TEXTFILE`` format.
 
 Cache Properties
 ----------------

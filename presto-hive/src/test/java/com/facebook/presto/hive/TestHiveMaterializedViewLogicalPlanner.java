@@ -37,11 +37,11 @@ import org.testng.annotations.Test;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
-import java.util.function.Consumer;
 
 import static com.facebook.presto.SystemSessionProperties.CONSIDER_QUERY_FILTERS_FOR_MATERIALIZED_VIEW_PARTITIONS;
 import static com.facebook.presto.SystemSessionProperties.JOIN_DISTRIBUTION_TYPE;
 import static com.facebook.presto.SystemSessionProperties.JOIN_REORDERING_STRATEGY;
+import static com.facebook.presto.SystemSessionProperties.MATERIALIZED_VIEW_DATA_CONSISTENCY_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.PREFER_PARTIAL_AGGREGATION;
 import static com.facebook.presto.SystemSessionProperties.QUERY_OPTIMIZATION_WITH_MATERIALIZED_VIEW_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.SIMPLIFY_PLAN_WITH_EMPTY_INPUT;
@@ -72,6 +72,7 @@ import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.join;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.node;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.project;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.singleGroupingSet;
+import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.tableScan;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.unnest;
 import static com.facebook.presto.sql.planner.assertions.PlanMatchPattern.values;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.INSERT_TABLE;
@@ -87,6 +88,7 @@ import static io.airlift.tpch.TpchTable.SUPPLIER;
 import static java.lang.String.format;
 import static java.util.Collections.emptyList;
 import static java.util.stream.Collectors.joining;
+import static java.util.stream.Collectors.toList;
 import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertTrue;
 
@@ -100,8 +102,235 @@ public class TestHiveMaterializedViewLogicalPlanner
     {
         return HiveQueryRunner.createQueryRunner(
                 ImmutableList.of(ORDERS, LINE_ITEM, CUSTOMER, NATION, SUPPLIER),
-                ImmutableMap.of(),
+                ImmutableMap.of("experimental.allow-legacy-materialized-views-toggle", "true"),
                 Optional.empty());
+    }
+
+    @Test
+    public void testMaterializedViewPartitionFilteringThroughLogicalView()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+        String table = "orders_partitioned_lv_test";
+        String materializedView = "orders_mv_lv_test";
+        String logicalView = "orders_lv_test";
+
+        try {
+            // Create a table partitioned by 'ds' (date string)
+            queryRunner.execute(format("CREATE TABLE %s WITH (partitioned_by = ARRAY['ds']) AS " +
+                    "SELECT orderkey, totalprice, '2025-11-10' AS ds FROM orders WHERE orderkey < 1000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, '2025-11-11' AS ds FROM orders WHERE orderkey >= 1000 AND orderkey < 2000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, '2025-11-12' AS ds FROM orders WHERE orderkey >= 2000 AND orderkey < 3000", table));
+
+            // Create a materialized view partitioned by 'ds'
+            queryRunner.execute(format("CREATE MATERIALIZED VIEW %s WITH (partitioned_by = ARRAY['ds']) AS " +
+                    "SELECT max(totalprice) as max_price, orderkey, ds FROM %s GROUP BY orderkey, ds", materializedView, table));
+
+            assertTrue(getQueryRunner().tableExists(getSession(), materializedView));
+
+            // Only refresh partition for '2025-11-10', leaving '2025-11-11' and '2025-11-12' missing
+            assertUpdate(format("REFRESH MATERIALIZED VIEW %s WHERE ds='2025-11-10'", materializedView), 255);
+
+            // Create a logical view on top of the materialized view
+            queryRunner.execute(format("CREATE VIEW %s AS SELECT * FROM %s", logicalView, materializedView));
+
+            setReferencedMaterializedViews((DistributedQueryRunner) queryRunner, table, ImmutableList.of(materializedView));
+
+            Session session = Session.builder(getQueryRunner().getDefaultSession())
+                    .setSystemProperty(CONSIDER_QUERY_FILTERS_FOR_MATERIALIZED_VIEW_PARTITIONS, "true")
+                    .setCatalogSessionProperty(HIVE_CATALOG, MATERIALIZED_VIEW_MISSING_PARTITIONS_THRESHOLD, Integer.toString(1))
+                    .build();
+
+            // Query the logical view with a predicate
+            // The predicate should be pushed down to the materialized view
+            // Since only ds='2025-11-10' is refreshed and that's what we're querying,
+            // the materialized view should be used (not fall back to base table)
+            String logicalViewQuery = format("SELECT max_price, orderkey FROM %s WHERE ds='2025-11-10' ORDER BY orderkey", logicalView);
+            String directMvQuery = format("SELECT max_price, orderkey FROM %s WHERE ds='2025-11-10' ORDER BY orderkey", materializedView);
+            String baseTableQuery = format("SELECT max(totalprice) as max_price, orderkey FROM %s " +
+                    "WHERE ds='2025-11-10' " +
+                    "GROUP BY orderkey ORDER BY orderkey", table);
+
+            MaterializedResult baseQueryResult = computeActual(session, baseTableQuery);
+            MaterializedResult logicalViewResult = computeActual(session, logicalViewQuery);
+            MaterializedResult directMvResult = computeActual(session, directMvQuery);
+
+            // All three queries should return the same results
+            assertEquals(baseQueryResult, logicalViewResult);
+            assertEquals(baseQueryResult, directMvResult);
+
+            // The plan for the logical view query should use the materialized view
+            // (not fall back to base table) because we're only querying the refreshed partition
+            assertPlan(session, logicalViewQuery, anyTree(
+                    constrainedTableScan(
+                            materializedView,
+                            ImmutableMap.of("ds", singleValue(createVarcharType(10), utf8Slice("2025-11-10"))),
+                            ImmutableMap.of())));
+
+            // Test query for a missing partition through logical view
+            // This should fall back to base table because ds='2025-11-11' is not refreshed
+            String logicalViewQueryMissing = format("SELECT max_price, orderkey FROM %s WHERE ds='2025-11-11' ORDER BY orderkey", logicalView);
+            String baseTableQueryMissing = format("SELECT max(totalprice) as max_price, orderkey FROM %s " +
+                    "WHERE ds='2025-11-11' " +
+                    "GROUP BY orderkey ORDER BY orderkey", table);
+
+            MaterializedResult baseQueryResultMissing = computeActual(session, baseTableQueryMissing);
+            MaterializedResult logicalViewResultMissing = computeActual(session, logicalViewQueryMissing);
+
+            assertEquals(baseQueryResultMissing, logicalViewResultMissing);
+
+            // Should fall back to base table for missing partition
+            assertPlan(session, logicalViewQueryMissing, anyTree(
+                    constrainedTableScan(table, ImmutableMap.of(), ImmutableMap.of())));
+        }
+        finally {
+            queryRunner.execute("DROP VIEW IF EXISTS " + logicalView);
+            queryRunner.execute("DROP MATERIALIZED VIEW IF EXISTS " + materializedView);
+            queryRunner.execute("DROP TABLE IF EXISTS " + table);
+        }
+    }
+
+    @Test
+    public void testMaterializedViewPartitionFilteringThroughLogicalViewWithCTE()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+        String table = "orders_partitioned_cte_test";
+        String materializedView = "orders_mv_cte_test";
+        String logicalView = "orders_lv_cte_test";
+
+        try {
+            // Create a table partitioned by 'ds' (date string)
+            queryRunner.execute(format("CREATE TABLE %s WITH (partitioned_by = ARRAY['ds']) AS " +
+                    "SELECT orderkey, totalprice, '2025-11-10' AS ds FROM orders WHERE orderkey < 1000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, '2025-11-11' AS ds FROM orders WHERE orderkey >= 1000 AND orderkey < 2000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, '2025-11-12' AS ds FROM orders WHERE orderkey >= 2000 AND orderkey < 3000", table));
+
+            // Create a materialized view partitioned by 'ds'
+            queryRunner.execute(format("CREATE MATERIALIZED VIEW %s WITH (partitioned_by = ARRAY['ds']) AS " +
+                    "SELECT max(totalprice) as max_price, orderkey, ds FROM %s GROUP BY orderkey, ds", materializedView, table));
+
+            assertTrue(getQueryRunner().tableExists(getSession(), materializedView));
+
+            // Only refresh partition for '2025-11-11', leaving '2025-11-10' and '2025-11-12' missing
+            assertUpdate(format("REFRESH MATERIALIZED VIEW %s WHERE ds='2025-11-11'", materializedView), 248);
+
+            // Create a logical view on top of the materialized view
+            queryRunner.execute(format("CREATE VIEW %s AS SELECT * FROM %s", logicalView, materializedView));
+
+            setReferencedMaterializedViews((DistributedQueryRunner) queryRunner, table, ImmutableList.of(materializedView));
+
+            Session session = Session.builder(getQueryRunner().getDefaultSession())
+                    .setSystemProperty(CONSIDER_QUERY_FILTERS_FOR_MATERIALIZED_VIEW_PARTITIONS, "true")
+                    .setCatalogSessionProperty(HIVE_CATALOG, MATERIALIZED_VIEW_MISSING_PARTITIONS_THRESHOLD, Integer.toString(1))
+                    .build();
+
+            // Query the logical view through a CTE with a predicate
+            // The predicate should be pushed down to the materialized view
+            String cteQuery = format("WITH PreQuery AS (SELECT * FROM %s WHERE ds='2025-11-11') " +
+                    "SELECT max_price, orderkey FROM PreQuery ORDER BY orderkey", logicalView);
+            String baseTableQuery = format("SELECT max(totalprice) as max_price, orderkey FROM %s " +
+                    "WHERE ds='2025-11-11' " +
+                    "GROUP BY orderkey ORDER BY orderkey", table);
+
+            MaterializedResult baseQueryResult = computeActual(session, baseTableQuery);
+            MaterializedResult cteQueryResult = computeActual(session, cteQuery);
+
+            // Both queries should return the same results
+            assertEquals(baseQueryResult, cteQueryResult);
+
+            // The plan for the CTE query should use the materialized view
+            // (not fall back to base table) because we're only querying the refreshed partition
+            assertPlan(session, cteQuery, anyTree(
+                    constrainedTableScan(
+                            materializedView,
+                            ImmutableMap.of("ds", singleValue(createVarcharType(10), utf8Slice("2025-11-11"))),
+                            ImmutableMap.of())));
+        }
+        finally {
+            queryRunner.execute("DROP VIEW IF EXISTS " + logicalView);
+            queryRunner.execute("DROP MATERIALIZED VIEW IF EXISTS " + materializedView);
+            queryRunner.execute("DROP TABLE IF EXISTS " + table);
+        }
+    }
+
+    @Test
+    public void testMaterializedViewPartitionFilteringInCTE()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+        String table = "orders_partitioned_mv_cte_test";
+        String materializedView = "orders_mv_direct_cte_test";
+
+        try {
+            // Create a table partitioned by 'ds' (date string)
+            queryRunner.execute(format("CREATE TABLE %s WITH (partitioned_by = ARRAY['ds']) AS " +
+                    "SELECT orderkey, totalprice, '2025-11-10' AS ds FROM orders WHERE orderkey < 1000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, '2025-11-11' AS ds FROM orders WHERE orderkey >= 1000 AND orderkey < 2000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, '2025-11-12' AS ds FROM orders WHERE orderkey >= 2000 AND orderkey < 3000", table));
+
+            // Create a materialized view partitioned by 'ds'
+            queryRunner.execute(format("CREATE MATERIALIZED VIEW %s WITH (partitioned_by = ARRAY['ds']) AS " +
+                    "SELECT max(totalprice) as max_price, orderkey, ds FROM %s GROUP BY orderkey, ds", materializedView, table));
+
+            assertTrue(getQueryRunner().tableExists(getSession(), materializedView));
+
+            // Only refresh partition for '2025-11-10', leaving '2025-11-11' and '2025-11-12' missing
+            assertUpdate(format("REFRESH MATERIALIZED VIEW %s WHERE ds='2025-11-10'", materializedView), 255);
+
+            setReferencedMaterializedViews((DistributedQueryRunner) queryRunner, table, ImmutableList.of(materializedView));
+
+            Session session = Session.builder(getQueryRunner().getDefaultSession())
+                    .setSystemProperty(CONSIDER_QUERY_FILTERS_FOR_MATERIALIZED_VIEW_PARTITIONS, "true")
+                    .setCatalogSessionProperty(HIVE_CATALOG, MATERIALIZED_VIEW_MISSING_PARTITIONS_THRESHOLD, Integer.toString(1))
+                    .build();
+
+            // Query the materialized view directly through a CTE with a predicate
+            // The predicate should be used to determine which partitions are needed
+            String cteQuery = format("WITH PreQuery AS (SELECT * FROM %s WHERE ds='2025-11-10') " +
+                    "SELECT max_price, orderkey FROM PreQuery ORDER BY orderkey", materializedView);
+            String baseTableQuery = format("SELECT max(totalprice) as max_price, orderkey FROM %s " +
+                    "WHERE ds='2025-11-10' " +
+                    "GROUP BY orderkey ORDER BY orderkey", table);
+
+            MaterializedResult baseQueryResult = computeActual(session, baseTableQuery);
+            MaterializedResult cteQueryResult = computeActual(session, cteQuery);
+
+            // Both queries should return the same results
+            assertEquals(baseQueryResult, cteQueryResult);
+
+            // The plan for the CTE query should use the materialized view
+            // (not fall back to base table) because we're only querying the refreshed partition
+            assertPlan(session, cteQuery, anyTree(
+                    constrainedTableScan(
+                            materializedView,
+                            ImmutableMap.of("ds", singleValue(createVarcharType(10), utf8Slice("2025-11-10"))),
+                            ImmutableMap.of())));
+
+            // Test query for a missing partition through CTE
+            // This should fall back to base table because ds='2025-11-11' is not refreshed
+            String cteQueryMissing = format("WITH PreQuery AS (SELECT * FROM %s WHERE ds='2025-11-11') " +
+                    "SELECT max_price, orderkey FROM PreQuery ORDER BY orderkey", materializedView);
+            String baseTableQueryMissing = format("SELECT max(totalprice) as max_price, orderkey FROM %s " +
+                    "WHERE ds='2025-11-11' " +
+                    "GROUP BY orderkey ORDER BY orderkey", table);
+
+            MaterializedResult baseQueryResultMissing = computeActual(session, baseTableQueryMissing);
+            MaterializedResult cteQueryResultMissing = computeActual(session, cteQueryMissing);
+
+            assertEquals(baseQueryResultMissing, cteQueryResultMissing);
+
+            // Should fall back to base table for missing partition
+            assertPlan(session, cteQueryMissing, anyTree(
+                    constrainedTableScan(table, ImmutableMap.of(), ImmutableMap.of())));
+        }
+        finally {
+            queryRunner.execute("DROP MATERIALIZED VIEW IF EXISTS " + materializedView);
+            queryRunner.execute("DROP TABLE IF EXISTS " + table);
+        }
     }
 
     @Test
@@ -2175,6 +2404,139 @@ public class TestHiveMaterializedViewLogicalPlanner
     }
 
     @Test
+    public void testMaterializedViewPartitionFilteringCaseInsensitive()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+        String table = "orders_partitioned_case_test";
+        String view = "orders_view_case_test";
+
+        try {
+            // Create a table partitioned by 'country' (lowercase)
+            queryRunner.execute(format("CREATE TABLE %s WITH (partitioned_by = ARRAY['country']) AS " +
+                    "SELECT orderkey, totalprice, 'US' AS country FROM orders WHERE orderkey < 1000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, 'UK' AS country FROM orders WHERE orderkey >= 1000 AND orderkey < 2000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, totalprice, 'CA' AS country FROM orders WHERE orderkey >= 2000 AND orderkey < 3000", table));
+
+            // Create a materialized view partitioned by 'country'
+            queryRunner.execute(format("CREATE MATERIALIZED VIEW %s WITH (partitioned_by = ARRAY['country']) AS " +
+                    "SELECT max(totalprice) as max_price, orderkey, country FROM %s GROUP BY orderkey, country", view, table));
+
+            assertTrue(getQueryRunner().tableExists(getSession(), view));
+
+            // Only refresh partitions for 'US' and 'UK', leaving 'CA' missing
+            assertUpdate(format("REFRESH MATERIALIZED VIEW %s WHERE country='US'", view), 255);
+            assertUpdate(format("REFRESH MATERIALIZED VIEW %s WHERE country='UK'", view), 248);
+
+            setReferencedMaterializedViews((DistributedQueryRunner) queryRunner, table, ImmutableList.of(view));
+
+            Session session = Session.builder(getQueryRunner().getDefaultSession())
+                    .setSystemProperty(CONSIDER_QUERY_FILTERS_FOR_MATERIALIZED_VIEW_PARTITIONS, "true")
+                    .setCatalogSessionProperty(HIVE_CATALOG, MATERIALIZED_VIEW_MISSING_PARTITIONS_THRESHOLD, Integer.toString(1))
+                    .build();
+
+            // Query with UPPERCASE column name, filtering for countries that ARE in the MV
+            // This tests that case-insensitive lookup works correctly
+            String viewQueryWithUpperCaseFilter = format("SELECT max_price, orderkey FROM %s WHERE COUNTRY >= 'UK' AND COUNTRY <= 'US' ORDER BY orderkey", view);
+            String viewQueryWithLowerCaseFilter = format("SELECT max_price, orderkey FROM %s WHERE country >= 'UK' AND country <= 'US' ORDER BY orderkey", view);
+            String baseQueryWithFilter = format("SELECT max(totalprice) as max_price, orderkey FROM %s " +
+                    "WHERE country >= 'UK' AND country <= 'US' " +
+                    "GROUP BY orderkey ORDER BY orderkey", table);
+
+            MaterializedResult baseQueryResult = computeActual(session, baseQueryWithFilter);
+            MaterializedResult viewQueryUpperCaseResult = computeActual(session, viewQueryWithUpperCaseFilter);
+            MaterializedResult viewQueryLowerCaseResult = computeActual(session, viewQueryWithLowerCaseFilter);
+
+            // Both queries should return the same results
+            assertEquals(baseQueryResult, viewQueryUpperCaseResult);
+            assertEquals(baseQueryResult, viewQueryLowerCaseResult);
+
+            // The plan should use the materialized view for countries UK and US (both are refreshed)
+            // and should NOT count the missing 'CA' partition because the query filter excludes it
+            assertPlan(session, viewQueryWithUpperCaseFilter, anyTree(
+                    constrainedTableScan(
+                            view,
+                            ImmutableMap.of("country", multipleValues(createVarcharType(2), utf8Slices("UK", "US"))),
+                            ImmutableMap.of())));
+            assertPlan(session, viewQueryWithLowerCaseFilter, anyTree(
+                    constrainedTableScan(
+                            view,
+                            ImmutableMap.of("country", multipleValues(createVarcharType(2), utf8Slices("UK", "US"))),
+                            ImmutableMap.of())));
+        }
+        finally {
+            queryRunner.execute("DROP MATERIALIZED VIEW IF EXISTS " + view);
+            queryRunner.execute("DROP TABLE IF EXISTS " + table);
+        }
+    }
+
+    @Test
+    public void testMaterializedViewMissingPartitionsCountWithMultiplePartitionColumns()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+        String table = "orders_multi_partition_count_test";
+        String view = "orders_view_multi_partition_count_test";
+
+        try {
+            // Create a table partitioned by TWO columns: 'country' and 'region'
+            queryRunner.execute(format("CREATE TABLE %s (id BIGINT, price DOUBLE, country VARCHAR, region VARCHAR) " +
+                    "WITH (partitioned_by = ARRAY['country', 'region'])", table));
+
+            // Insert data into 4 different partitions
+            assertUpdate(format("INSERT INTO %s VALUES (1, 100.0, 'US', 'West'), (2, 200.0, 'US', 'West')", table), 2);
+            assertUpdate(format("INSERT INTO %s VALUES (3, 300.0, 'US', 'East'), (4, 400.0, 'US', 'East')", table), 2);
+            assertUpdate(format("INSERT INTO %s VALUES (5, 500.0, 'UK', 'North'), (6, 600.0, 'UK', 'North')", table), 2);
+            assertUpdate(format("INSERT INTO %s VALUES (7, 700.0, 'UK', 'South'), (8, 800.0, 'UK', 'South')", table), 2);
+
+            // Create a materialized view partitioned by both columns
+            queryRunner.execute(format("CREATE MATERIALIZED VIEW %s WITH (partitioned_by = ARRAY['country', 'region']) AS " +
+                    "SELECT max(price) as max_price, id, country, region FROM %s GROUP BY id, country, region", view, table));
+
+            assertTrue(getQueryRunner().tableExists(getSession(), view));
+
+            // Only refresh 2 out of 4 partitions, leaving 2 missing (UK/North and UK/South are missing)
+            assertUpdate(format("REFRESH MATERIALIZED VIEW %s WHERE country='US' AND region='West'", view), 2);
+            assertUpdate(format("REFRESH MATERIALIZED VIEW %s WHERE country='US' AND region='East'", view), 2);
+
+            setReferencedMaterializedViews((DistributedQueryRunner) queryRunner, table, ImmutableList.of(view));
+
+            // Set the threshold to 2 missing partitions to test that the counted missingPartitions is 2
+            Session sessionWithThreshold2 = Session.builder(getQueryRunner().getDefaultSession())
+                    .setSystemProperty(QUERY_OPTIMIZATION_WITH_MATERIALIZED_VIEW_ENABLED, "true")
+                    .setCatalogSessionProperty(HIVE_CATALOG, MATERIALIZED_VIEW_MISSING_PARTITIONS_THRESHOLD, Integer.toString(2))
+                    .build();
+
+            String baseQuery = format("SELECT max(price) as max_price, id FROM %s GROUP BY id ORDER BY id", table);
+
+            // With threshold = 2 and 2 missing partitions, the materialized view should still be used
+            assertPlan(sessionWithThreshold2, baseQuery, anyTree(exchange(
+                    anyTree(constrainedTableScan(
+                            table,
+                            ImmutableMap.of(),
+                            ImmutableMap.of())),
+                    anyTree(constrainedTableScan(
+                            view,
+                            ImmutableMap.of(),
+                            ImmutableMap.of())))));
+
+            // Now set threshold to 1 - should fall back to base table since we have 2 missing partitions
+            Session sessionWithThreshold1 = Session.builder(getQueryRunner().getDefaultSession())
+                    .setSystemProperty(QUERY_OPTIMIZATION_WITH_MATERIALIZED_VIEW_ENABLED, "true")
+                    .setCatalogSessionProperty(HIVE_CATALOG, MATERIALIZED_VIEW_MISSING_PARTITIONS_THRESHOLD, Integer.toString(1))
+                    .build();
+
+            // With threshold = 1 and 2 missing partitions, should use only the base table
+            assertPlan(sessionWithThreshold1, baseQuery, anyTree(
+                    constrainedTableScan(table, ImmutableMap.of(), ImmutableMap.of())));
+        }
+        finally {
+            queryRunner.execute("DROP MATERIALIZED VIEW IF EXISTS " + view);
+            queryRunner.execute("DROP TABLE IF EXISTS " + table);
+        }
+    }
+
+    @Test
     public void testMaterializedViewApproxDistinctRewrite()
     {
         Session queryOptimizationWithMaterializedView = Session.builder(getSession())
@@ -2592,12 +2954,25 @@ public class TestHiveMaterializedViewLogicalPlanner
     public void testMaterializedViewQueryAccessControl()
     {
         QueryRunner queryRunner = getQueryRunner();
-        Session invokerSession = Session.builder(getSession())
+
+        Session invokerStichingSession = Session.builder(getSession())
                 .setIdentity(new Identity("test_view_invoker", Optional.empty()))
                 .setCatalog(getSession().getCatalog().get())
                 .setSchema(getSession().getSchema().get())
                 .setSystemProperty(QUERY_OPTIMIZATION_WITH_MATERIALIZED_VIEW_ENABLED, "true")
                 .build();
+
+        /* Non-stitching session test is needed as the query is not rewritten
+        with base table. In this case the analyzer should process the materialized view
+        definition sql to check all the base tables permissions.
+        */
+        Session invokerNonStichingSession = Session.builder(getSession())
+                .setIdentity(new Identity("test_view_invoker2", Optional.empty()))
+                .setCatalog(getSession().getCatalog().get())
+                .setSchema(getSession().getSchema().get())
+                .setSystemProperty(MATERIALIZED_VIEW_DATA_CONSISTENCY_ENABLED, "false")
+                .build();
+
         Session ownerSession = getSession();
 
         queryRunner.execute(
@@ -2611,37 +2986,60 @@ public class TestHiveMaterializedViewLogicalPlanner
                         "AS SELECT SUM(totalprice) AS totalprice, orderstatus FROM test_orders_base GROUP BY orderstatus");
         setReferencedMaterializedViews((DistributedQueryRunner) getQueryRunner(), "test_orders_base", ImmutableList.of("test_orders_view"));
 
-        Consumer<String> testQueryWithDeniedPrivilege = query -> {
-            // Verify checking the base table instead of the materialized view for SELECT permission
-            assertAccessDenied(
-                    invokerSession,
-                    query,
-                    "Cannot select from columns \\[.*\\] in table .*test_orders_base.*",
-                    privilege(invokerSession.getUser(), "test_orders_base", SELECT_COLUMN));
-            assertAccessAllowed(
-                    invokerSession,
-                    query,
-                    privilege(invokerSession.getUser(), "test_orders_view", SELECT_COLUMN));
-        };
-
         try {
             // Check for both the direct materialized view query and the base table query optimization with materialized view
-            String directMaterializedViewQuery = "SELECT totalprice, orderstatus FROM test_orders_view";
-            String queryWithMaterializedViewOptimization = "SELECT SUM(totalprice) AS totalprice, orderstatus FROM test_orders_base GROUP BY orderstatus";
+            // for direct materialized view query, check when stitching is enabled/disabled
+            String queryMaterializedView = "SELECT totalprice, orderstatus FROM test_orders_view";
+            String queryBaseTable = "SELECT SUM(totalprice) AS totalprice, orderstatus FROM test_orders_base GROUP BY orderstatus";
 
-            // Test when the materialized view is not materialized yet
-            testQueryWithDeniedPrivilege.accept(directMaterializedViewQuery);
-            testQueryWithDeniedPrivilege.accept(queryWithMaterializedViewOptimization);
+            assertAccessDenied(
+                    invokerNonStichingSession,
+                    queryBaseTable,
+                    "Cannot select from columns \\[.*\\] in table .*test_orders_base.*",
+                    privilege(invokerNonStichingSession.getUser(), "test_orders_base", SELECT_COLUMN));
+
+            assertAccessDenied(
+                    invokerStichingSession,
+                    queryBaseTable,
+                    "Cannot select from columns \\[.*\\] in table .*test_orders_base.*",
+                    privilege(invokerStichingSession.getUser(), "test_orders_base", SELECT_COLUMN));
+
+            assertAccessAllowed(
+                    invokerStichingSession,
+                    queryMaterializedView,
+                    privilege(invokerStichingSession.getUser(), "test_orders_view", SELECT_COLUMN));
+
+            assertAccessDenied(
+                    invokerNonStichingSession,
+                    queryMaterializedView,
+                    "Cannot select from columns \\[.*\\] in table .*test_orders_base.*",
+                    privilege(invokerNonStichingSession.getUser(), "test_orders_base", SELECT_COLUMN));
 
             // Test when the materialized view is partially materialized
             queryRunner.execute(ownerSession, "REFRESH MATERIALIZED VIEW test_orders_view WHERE orderstatus = 'F'");
-            testQueryWithDeniedPrivilege.accept(directMaterializedViewQuery);
-            testQueryWithDeniedPrivilege.accept(queryWithMaterializedViewOptimization);
+            assertAccessAllowed(
+                    invokerStichingSession,
+                    queryMaterializedView,
+                    privilege(invokerStichingSession.getUser(), "test_orders_view", SELECT_COLUMN));
+
+            assertAccessDenied(
+                    invokerNonStichingSession,
+                    queryMaterializedView,
+                    "Cannot select from columns \\[.*\\] in table .*test_orders_base.*",
+                    privilege(invokerNonStichingSession.getUser(), "test_orders_base", SELECT_COLUMN));
 
             // Test when the materialized view is fully materialized
             queryRunner.execute(ownerSession, "REFRESH MATERIALIZED VIEW test_orders_view WHERE orderstatus <> 'F'");
-            testQueryWithDeniedPrivilege.accept(directMaterializedViewQuery);
-            testQueryWithDeniedPrivilege.accept(queryWithMaterializedViewOptimization);
+            assertAccessAllowed(
+                    invokerStichingSession,
+                    queryMaterializedView,
+                    privilege(invokerStichingSession.getUser(), "test_orders_view", SELECT_COLUMN));
+
+            assertAccessDenied(
+                    invokerNonStichingSession,
+                    queryMaterializedView,
+                    "Cannot select from columns \\[.*\\] in table .*test_orders_base.*",
+                    privilege(invokerNonStichingSession.getUser(), "test_orders_base", SELECT_COLUMN));
         }
         finally {
             queryRunner.execute(ownerSession, "DROP MATERIALIZED VIEW test_orders_view");
@@ -2863,6 +3261,166 @@ public class TestHiveMaterializedViewLogicalPlanner
         finally {
             queryRunner.execute(ownerSession, format("DROP MATERIALIZED VIEW %s", view));
             queryRunner.execute(ownerSession, format("DROP TABLE %s", table));
+        }
+    }
+
+    @Test
+    public void testAutoRefreshMaterializedViewAfterInsertion()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+
+        String table = "test_auto_refresh";
+        String view = "test_auto_refresh_mv";
+
+        Session fullRefreshSession = Session.builder(getSession())
+                .setSystemProperty("materialized_view_allow_full_refresh_enabled", "true")
+                .setSystemProperty("materialized_view_data_consistency_enabled", "false")
+                .build();
+        Session ownerSession = getSession();
+
+        queryRunner.execute(
+                fullRefreshSession,
+                format("CREATE TABLE %s (col1 bigint, col2 varchar, part_key varchar) " +
+                        "WITH (partitioned_by = ARRAY['part_key'])", table));
+
+        queryRunner.execute(
+                fullRefreshSession,
+                format("INSERT INTO %s VALUES (1, 'aaa', 'p1'), " +
+                        "(2, 'bbb', 'p2'), (3, 'aaa', 'p1')", table));
+
+        queryRunner.execute(
+                fullRefreshSession,
+                format("CREATE MATERIALIZED VIEW %s " +
+                        "WITH (partitioned_by = ARRAY['part_key']) " +
+                        "AS SELECT col1, part_key FROM %s", view, table));
+
+        try {
+            queryRunner.execute(fullRefreshSession, format("REFRESH MATERIALIZED VIEW %s", view));
+
+            MaterializedResult result = queryRunner.execute(fullRefreshSession,
+                    format("SELECT COUNT(DISTINCT part_key) FROM %s", view));
+            assertEquals((long) ((Long) result.getOnlyValue()), 2, "Materialized view should contain all data after refreshes");
+
+            queryRunner.execute(
+                    fullRefreshSession,
+                    format("INSERT INTO %s VALUES (1, 'aaa', 'p3'), " +
+                            "(2, 'bbb', 'p4'), (3, 'aaa', 'p5')", table));
+
+            queryRunner.execute(fullRefreshSession,
+                    format("REFRESH MATERIALIZED VIEW %s", view));
+
+            result = queryRunner.execute(fullRefreshSession,
+                    format("SELECT COUNT(DISTINCT part_key) FROM %s", view));
+            assertEquals((long) ((Long) result.getOnlyValue()), 5, "Materialized view should contain all data after refreshes");
+        }
+        finally {
+            queryRunner.execute(ownerSession, format("DROP MATERIALIZED VIEW %s", view));
+            queryRunner.execute(ownerSession, format("DROP TABLE %s", table));
+        }
+    }
+
+    @Test
+    public void testMVJoinQueryWithOtherTableColumnFiltering()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+        Session session = getSession();
+
+        assertUpdate("CREATE TABLE mv_base (mv_col1 int, mv_col2 varchar, mv_col3 varchar) " +
+                "WITH (partitioned_by=ARRAY['mv_col3'])");
+        assertUpdate("CREATE TABLE join_table (table_col1 int, table_col2 varchar, table_col3 varchar) " +
+                " WITH (partitioned_by=ARRAY['table_col3'])");
+
+        assertUpdate("INSERT INTO mv_base VALUES (1, 'Alice', 'A'), (2, 'Bob', 'B'), (3, 'Charlie', 'C')", 3);
+        assertUpdate("INSERT INTO join_table VALUES (1, 'CityA', 'A'), (21, 'CityA', 'B'), (32, 'CityB', 'C')", 3);
+
+        assertUpdate("CREATE MATERIALIZED VIEW mv " +
+                        "WITH (partitioned_by=ARRAY['mv_col3']) " +
+                        "AS SELECT mv_col1, mv_col2, mv_col3 FROM mv_base");
+
+        assertUpdate("REFRESH MATERIALIZED VIEW mv WHERE mv_col3>='A'", 3);
+
+        // Query MV with JOIN and WHERE clause on column from joined table (not in MV)
+        MaterializedResult result = queryRunner.execute(session,
+                "SELECT mv_col2 FROM mv " +
+                        "JOIN join_table ON mv_col3=table_col3 " +
+                        "WHERE table_col1>10 ORDER BY mv_col1");
+        assertEquals(result.getRowCount(), 2, "Materialized view join produced unexpected row counts");
+
+        List<Object> expectedResults = List.of("Bob", "Charlie");
+        List<Object> actualResults = result.getMaterializedRows().stream()
+                .map(row -> row.getField(0))
+                .collect(toList());
+        assertEquals(actualResults, expectedResults, "Materialized view join returned unexpected row values");
+
+        // WHERE clause on MV column
+        result = queryRunner.execute(session, "SELECT mv_col2 FROM mv JOIN join_table " +
+                        "ON mv_col3=table_col3 WHERE mv_col2>'Alice' ORDER BY mv_col2");
+        assertEquals(result.getRowCount(), 2, "Materialized view join produced unexpected row counts");
+
+        expectedResults = List.of("Bob", "Charlie");
+        actualResults = result.getMaterializedRows().stream()
+                .map(row -> row.getField(0))
+                .collect(toList());
+        assertEquals(actualResults, expectedResults, "Materialized view join returned unexpected row values");
+
+        // Test with multiple conditions in WHERE clause (non-partition column)
+        result = queryRunner.execute(session, "SELECT mv_col1 FROM mv JOIN join_table ON mv_col3=table_col3 " +
+                        "WHERE table_col1>10 AND table_col3='B' AND mv_col1>1");
+        assertEquals(result.getRowCount(), 1, "Materialized view join produced unexpected row counts");
+
+        expectedResults = List.of(2);
+        actualResults = result.getMaterializedRows().stream()
+                .map(row -> row.getField(0))
+                .collect(toList());
+        assertEquals(actualResults, expectedResults, "Materialized view join returned unexpected row values");
+
+        // Test with multiple conditions in WHERE clause (partition column)
+        result = queryRunner.execute(session, "SELECT mv_col1 FROM mv JOIN join_table ON mv_col3=table_col3 " +
+                "WHERE table_col1>10 AND table_col3='B' AND mv_col3='C'");
+        assertEquals(result.getRowCount(), 0, "Materialized view join produced wrong results");
+
+        assertUpdate("DROP MATERIALIZED VIEW mv");
+        assertUpdate("DROP TABLE join_table");
+        assertUpdate("DROP TABLE mv_base");
+    }
+
+    public void testMaterializedViewNotRefreshedInNonLegacyMode()
+    {
+        Session nonLegacySession = Session.builder(getSession())
+                .setSystemProperty("legacy_materialized_views", "false")
+                .build();
+        try {
+            assertUpdate("CREATE TABLE base_table (id BIGINT, name VARCHAR, part_key BIGINT) WITH (partitioned_by = ARRAY['part_key'])");
+            assertUpdate("INSERT INTO base_table VALUES (1, 'Alice', 100), (2, 'Bob', 200)", 2);
+            assertUpdate("CREATE MATERIALIZED VIEW simple_mv WITH (partitioned_by = ARRAY['part_key']) AS SELECT id, name, part_key FROM base_table");
+
+            assertPlan(nonLegacySession, "SELECT * FROM simple_mv",
+                    anyTree(tableScan("base_table")));
+        }
+        finally {
+            assertUpdate("DROP TABLE base_table");
+            assertUpdate("DROP MATERIALIZED VIEW simple_mv");
+        }
+    }
+
+    @Test
+    public void testMaterializedViewRefreshedInNonLegacyMode()
+    {
+        Session nonLegacySession = Session.builder(getSession())
+                .setSystemProperty("legacy_materialized_views", "false")
+                .build();
+        try {
+            assertUpdate("CREATE TABLE base_table (id BIGINT, name VARCHAR, part_key BIGINT) WITH (partitioned_by = ARRAY['part_key'])");
+            assertUpdate("INSERT INTO base_table VALUES (1, 'Alice', 100), (2, 'Bob', 200)", 2);
+            assertUpdate("CREATE MATERIALIZED VIEW simple_mv WITH (partitioned_by = ARRAY['part_key']) AS SELECT id, name, part_key FROM base_table");
+            assertUpdate("REFRESH MATERIALIZED VIEW simple_mv where part_key > 0", 2);
+
+            assertPlan(nonLegacySession, "SELECT * FROM simple_mv",
+                    anyTree(tableScan("simple_mv")));
+        }
+        finally {
+            assertUpdate("DROP TABLE base_table");
+            assertUpdate("DROP MATERIALIZED VIEW simple_mv");
         }
     }
 

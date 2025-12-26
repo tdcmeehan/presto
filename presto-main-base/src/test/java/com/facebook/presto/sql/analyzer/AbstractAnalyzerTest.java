@@ -46,6 +46,7 @@ import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.ConnectorTableMetadata;
+import com.facebook.presto.spi.MaterializedViewDefinition;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.WarningCollector;
 import com.facebook.presto.spi.analyzer.ViewDefinition;
@@ -57,6 +58,11 @@ import com.facebook.presto.spi.function.FunctionImplementationType;
 import com.facebook.presto.spi.function.Parameter;
 import com.facebook.presto.spi.function.RoutineCharacteristics;
 import com.facebook.presto.spi.function.SqlInvokedFunction;
+import com.facebook.presto.spi.procedure.BaseProcedure;
+import com.facebook.presto.spi.procedure.DistributedProcedure;
+import com.facebook.presto.spi.procedure.Procedure;
+import com.facebook.presto.spi.procedure.Procedure.Argument;
+import com.facebook.presto.spi.procedure.TableDataRewriteDistributedProcedure;
 import com.facebook.presto.spi.security.AccessControl;
 import com.facebook.presto.spi.security.AllowAllAccessControl;
 import com.facebook.presto.spi.session.PropertyMetadata;
@@ -64,6 +70,7 @@ import com.facebook.presto.spi.transaction.IsolationLevel;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.tree.NodeLocation;
 import com.facebook.presto.sql.tree.Statement;
+import com.facebook.presto.testing.TestProcedureRegistry;
 import com.facebook.presto.testing.TestingAccessControlManager;
 import com.facebook.presto.testing.TestingMetadata;
 import com.facebook.presto.testing.TestingWarningCollector;
@@ -74,6 +81,8 @@ import com.google.common.collect.ImmutableMap;
 import org.intellij.lang.annotations.Language;
 import org.testng.annotations.BeforeClass;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -92,6 +101,8 @@ import static com.facebook.presto.spi.function.FunctionVersion.notVersioned;
 import static com.facebook.presto.spi.function.RoutineCharacteristics.Determinism.DETERMINISTIC;
 import static com.facebook.presto.spi.function.RoutineCharacteristics.Language.SQL;
 import static com.facebook.presto.spi.function.RoutineCharacteristics.NullCallClause.RETURNS_NULL_ON_NULL_INPUT;
+import static com.facebook.presto.spi.procedure.TableDataRewriteDistributedProcedure.SCHEMA;
+import static com.facebook.presto.spi.procedure.TableDataRewriteDistributedProcedure.TABLE_NAME;
 import static com.facebook.presto.spi.session.PropertyMetadata.integerProperty;
 import static com.facebook.presto.spi.session.PropertyMetadata.stringProperty;
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
@@ -145,8 +156,7 @@ public class AbstractAnalyzerTest
         CatalogManager catalogManager = new CatalogManager();
         transactionManager = createTestTransactionManager(catalogManager);
         accessControl = new TestingAccessControlManager(transactionManager);
-
-        metadata = createTestMetadataManager(transactionManager);
+        metadata = createTestMetadataManager(transactionManager, new FeaturesConfig(), new FunctionsConfig(), new TestProcedureRegistry());
 
         metadata.getFunctionAndTypeManager().registerBuiltInFunctions(ImmutableList.of(APPLY_FUNCTION));
 
@@ -174,6 +184,22 @@ public class AbstractAnalyzerTest
                         new PolymorphicStaticReturnTypeFunction(),
                         new PassThroughFunction(),
                         new RequiredColumnsFunction()));
+
+        List<Argument> arguments = new ArrayList<>();
+        arguments.add(new Argument(SCHEMA, StandardTypes.VARCHAR));
+        arguments.add(new Argument(TABLE_NAME, StandardTypes.VARCHAR));
+
+        List<DistributedProcedure.Argument> distributedArguments = new ArrayList<>();
+        distributedArguments.add(new DistributedProcedure.Argument(SCHEMA, StandardTypes.VARCHAR));
+        distributedArguments.add(new DistributedProcedure.Argument(TABLE_NAME, StandardTypes.VARCHAR));
+        List<BaseProcedure<?>> procedures = new ArrayList<>();
+        procedures.add(new Procedure("system", "procedure", arguments));
+        procedures.add(new TableDataRewriteDistributedProcedure("system", "distributed_procedure",
+                distributedArguments,
+                (session, transactionContext, procedureHandle, fragments) -> null,
+                (session, transactionContext, procedureHandle, fragments) -> {},
+                ignored -> new TestProcedureRegistry.TestProcedureContext()));
+        metadata.getProcedureRegistry().addProcedures(SECOND_CONNECTOR_ID, procedures);
 
         Catalog tpchTestCatalog = createTestingCatalog(TPCH_CATALOG, TPCH_CONNECTOR_ID);
         catalogManager.registerCatalog(tpchTestCatalog);
@@ -312,6 +338,33 @@ public class AbstractAnalyzerTest
                         ColumnMetadata.builder().setName("y").setType(BIGINT).build(),
                         ColumnMetadata.builder().setName("z").setType(BIGINT).build())),
                 false));
+
+        // materialized view referencing table in same schema
+        List<SchemaTableName> baseTables = new ArrayList<>(Collections.singletonList(table2));
+        MaterializedViewDefinition.TableColumn baseTableColumns = new MaterializedViewDefinition.TableColumn(table2, "a", true);
+
+        SchemaTableName materializedTable = new SchemaTableName("s1", "mv1");
+        MaterializedViewDefinition.TableColumn materializedViewTableColumn = new MaterializedViewDefinition.TableColumn(materializedTable, "a", true);
+
+        List<MaterializedViewDefinition.ColumnMapping> columnMappings = Collections.singletonList(
+                new MaterializedViewDefinition.ColumnMapping(materializedViewTableColumn, Collections.singletonList(baseTableColumns)));
+
+        MaterializedViewDefinition materializedViewData1 = new MaterializedViewDefinition(
+                        "select a from t2",
+                        "s1",
+                        "mv1",
+                        baseTables,
+                        Optional.of("user"),
+                        Optional.empty(),
+                        columnMappings,
+                        new ArrayList<>(),
+                        Optional.of(new ArrayList<>(Collections.singletonList("a"))));
+
+        ConnectorTableMetadata materializedViewMetadata1 = new ConnectorTableMetadata(
+                materializedTable, ImmutableList.of(ColumnMetadata.builder().setName("a").setType(BIGINT).build()));
+
+        inSetupTransaction(session ->
+                metadata.createMaterializedView(session, TPCH_CATALOG, materializedViewMetadata1, materializedViewData1, false));
 
         // valid view referencing table in same schema
         String viewData1 = JsonCodec.jsonCodec(ViewDefinition.class).toJson(

@@ -212,12 +212,12 @@ class ResponseHandler : public proxygen::HTTPTransactionHandler {
   }
 
   void setTransaction(proxygen::HTTPTransaction* txn) noexcept override {
-    if (txn) {
-      protocol_ = txn->getTransport().getCodec().getProtocol();
-    }
+    txn_ = CHECK_NOTNULL(txn);
+    protocol_ = txn_->getTransport().getCodec().getProtocol();
   }
 
   void detachTransaction() noexcept override {
+    txn_ = nullptr;
     self_.reset();
   }
 
@@ -248,13 +248,17 @@ class ResponseHandler : public proxygen::HTTPTransactionHandler {
   }
 
   void onEOM() noexcept override {
-    promise_.setValue(std::move(response_));
+    if (!promise_.isFulfilled()) {
+      promise_.setValue(std::move(response_));
+    }
   }
 
   void onUpgrade(proxygen::UpgradeProtocol /* protocol*/) noexcept override {}
 
   void onError(const proxygen::HTTPException& error) noexcept override {
-    promise_.setException(error);
+    if (!promise_.isFulfilled()) {
+      promise_.setException(error);
+    }
   }
 
   void onEgressPaused() noexcept override {}
@@ -269,12 +273,14 @@ class ResponseHandler : public proxygen::HTTPTransactionHandler {
     self_.reset();
   }
 
-  void sendRequest(proxygen::HTTPTransaction* txn) {
-    txn->sendHeaders(request_);
-    if (!body_.empty()) {
-      txn->sendBody(folly::IOBuf::wrapBuffer(body_.c_str(), body_.size()));
+  void sendRequest() {
+    if (txn_) {
+      txn_->sendHeaders(request_);
+      if (!body_.empty()) {
+        txn_->sendBody(folly::IOBuf::wrapBuffer(body_.c_str(), body_.size()));
+      }
+      txn_->sendEOM();
     }
-    txn->sendEOM();
   }
 
  private:
@@ -288,6 +294,7 @@ class ResponseHandler : public proxygen::HTTPTransactionHandler {
   std::shared_ptr<ResponseHandler> self_;
   std::shared_ptr<HttpClient> client_;
   std::optional<proxygen::CodecProtocol> protocol_;
+  proxygen::HTTPTransaction* txn_{nullptr};
 };
 
 // Responsible for making an HTTP request. The request will be made in 2
@@ -354,10 +361,8 @@ class ConnectionHandler : public proxygen::HTTPConnector::Callback {
           http2InitialStreamWindow_, http2StreamWindow_, http2SessionWindow_);
       session->setMaxConcurrentOutgoingStreams(maxConcurrentStreams_);
     }
-    auto txn = session->newTransaction(responseHandler_.get());
-    if (txn) {
-      responseHandler_->sendRequest(txn);
-    }
+    session->newTransaction(responseHandler_.get());
+    responseHandler_->sendRequest();
 
     sessionPool_->putSession(session);
     delete this;
@@ -535,7 +540,9 @@ void HttpClient::sendRequest(std::shared_ptr<ResponseHandler> responseHandler) {
   auto doSend = [this, responseHandler = std::move(responseHandler)](
                     proxygen::HTTPTransaction* txn) {
     if (txn) {
-      responseHandler->sendRequest(txn);
+      // txn may no longer be valid, ::onError and ::detachTransaction would
+      // have been called. In such case, ::sendRequest will be no-op
+      responseHandler->sendRequest();
       return;
     }
     VLOG(2) << "Create new connection to " << address_.describe();

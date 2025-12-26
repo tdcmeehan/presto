@@ -68,11 +68,13 @@ import com.facebook.presto.index.IndexManager;
 import com.facebook.presto.memory.MemoryManagerConfig;
 import com.facebook.presto.memory.NodeMemoryConfig;
 import com.facebook.presto.metadata.AnalyzePropertyManager;
+import com.facebook.presto.metadata.BuiltInProcedureRegistry;
 import com.facebook.presto.metadata.CatalogManager;
 import com.facebook.presto.metadata.ColumnPropertyManager;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.metadata.HandleJsonModule;
 import com.facebook.presto.metadata.InternalNodeManager;
+import com.facebook.presto.metadata.MaterializedViewPropertyManager;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.metadata.SchemaPropertyManager;
@@ -137,13 +139,16 @@ import com.facebook.presto.spark.planner.optimizers.AdaptivePlanOptimizers;
 import com.facebook.presto.spi.NodeManager;
 import com.facebook.presto.spi.PageIndexerFactory;
 import com.facebook.presto.spi.PageSorter;
+import com.facebook.presto.spi.RowExpressionSerde;
 import com.facebook.presto.spi.analyzer.ViewDefinition;
 import com.facebook.presto.spi.memory.ClusterMemoryPoolManager;
 import com.facebook.presto.spi.plan.SimplePlanFragment;
 import com.facebook.presto.spi.plan.SimplePlanFragmentSerde;
+import com.facebook.presto.spi.procedure.ProcedureRegistry;
 import com.facebook.presto.spi.relation.DeterminismEvaluator;
 import com.facebook.presto.spi.relation.DomainTranslator;
 import com.facebook.presto.spi.relation.PredicateCompiler;
+import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.spi.session.WorkerSessionPropertyProvider;
 import com.facebook.presto.spiller.GenericPartitioningSpillerFactory;
@@ -178,6 +183,7 @@ import com.facebook.presto.sql.analyzer.MetadataExtractorMBean;
 import com.facebook.presto.sql.analyzer.QueryExplainer;
 import com.facebook.presto.sql.analyzer.QueryPreparerProviderManager;
 import com.facebook.presto.sql.expressions.ExpressionOptimizerManager;
+import com.facebook.presto.sql.expressions.JsonCodecRowExpressionSerde;
 import com.facebook.presto.sql.gen.ExpressionCompiler;
 import com.facebook.presto.sql.gen.JoinCompiler;
 import com.facebook.presto.sql.gen.JoinFilterFunctionCompiler;
@@ -308,6 +314,7 @@ public class PrestoSparkModule
         jsonCodecBinder(binder).bindJsonCodec(BroadcastFileInfo.class);
         jsonCodecBinder(binder).bindJsonCodec(SimplePlanFragment.class);
         binder.bind(SimplePlanFragmentSerde.class).to(JsonCodecSimplePlanFragmentSerde.class).in(Scopes.SINGLETON);
+        jsonCodecBinder(binder).bindJsonCodec(RowExpression.class);
 
         // smile codecs
         smileCodecBinder(binder).bindSmileCodec(TaskSource.class);
@@ -351,6 +358,7 @@ public class PrestoSparkModule
         binder.bind(SessionPropertyDefaults.class).in(Scopes.SINGLETON);
         binder.bind(SchemaPropertyManager.class).in(Scopes.SINGLETON);
         binder.bind(TablePropertyManager.class).in(Scopes.SINGLETON);
+        binder.bind(MaterializedViewPropertyManager.class).in(Scopes.SINGLETON);
         binder.bind(ColumnPropertyManager.class).in(Scopes.SINGLETON);
         binder.bind(AnalyzePropertyManager.class).in(Scopes.SINGLETON);
         binder.bind(QuerySessionSupplier.class).in(Scopes.SINGLETON);
@@ -365,6 +373,7 @@ public class PrestoSparkModule
 
         // expression manager
         binder.bind(ExpressionOptimizerManager.class).in(Scopes.SINGLETON);
+        binder.bind(RowExpressionSerde.class).to(JsonCodecRowExpressionSerde.class).in(Scopes.SINGLETON);
 
         // tracer provider managers
         binder.bind(TracerProviderManager.class).in(Scopes.SINGLETON);
@@ -383,6 +392,8 @@ public class PrestoSparkModule
         binder.bind(Metadata.class).to(MetadataManager.class).in(Scopes.SINGLETON);
         binder.bind(StaticFunctionNamespaceStore.class).in(Scopes.SINGLETON);
         binder.bind(StaticTypeManagerStore.class).in(Scopes.SINGLETON);
+        binder.bind(BuiltInProcedureRegistry.class).in(Scopes.SINGLETON);
+        binder.bind(ProcedureRegistry.class).to(BuiltInProcedureRegistry.class).in(Scopes.SINGLETON);
 
         // type
         newSetBinder(binder, Type.class);

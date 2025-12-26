@@ -50,11 +50,13 @@ import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.planner.optimizations.StreamPropertyDerivations.StreamProperties;
 import com.facebook.presto.sql.planner.plan.ApplyNode;
+import com.facebook.presto.sql.planner.plan.CallDistributedProcedureNode;
 import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
 import com.facebook.presto.sql.planner.plan.ExplainAnalyzeNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.LateralJoinNode;
+import com.facebook.presto.sql.planner.plan.MergeWriterNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.StatisticsWriterNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
@@ -79,7 +81,6 @@ import static com.facebook.presto.SystemSessionProperties.isNativeJoinBuildParti
 import static com.facebook.presto.SystemSessionProperties.isQuickDistinctLimitEnabled;
 import static com.facebook.presto.SystemSessionProperties.isSegmentedAggregationEnabled;
 import static com.facebook.presto.SystemSessionProperties.isSpillEnabled;
-import static com.facebook.presto.SystemSessionProperties.preferSortMergeJoin;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.operator.aggregation.AggregationUtils.hasSingleNodeExecutionPreference;
@@ -597,6 +598,20 @@ public class AddLocalExchanges
             return planAndEnforceChildren(node, requiredProperties, requiredProperties);
         }
 
+        @Override
+        public PlanWithProperties visitCallDistributedProcedure(CallDistributedProcedureNode node, StreamPreferredProperties parentPreferences)
+        {
+            if (node.getPartitioningScheme().isPresent() && getTaskPartitionedWriterCount(session) == 1) {
+                return planAndEnforceChildren(node, singleStream(), defaultParallelism(session));
+            }
+
+            if (!node.getPartitioningScheme().isPresent() && getTaskWriterCount(session) == 1) {
+                return planAndEnforceChildren(node, singleStream(), defaultParallelism(session));
+            }
+
+            return planAndEnforceChildren(node, fixedParallelism(), fixedParallelism());
+        }
+
         //
         // Table Writer
         //
@@ -717,6 +732,24 @@ public class AddLocalExchanges
                             tableWrite.getTableCommitContextVariable(),
                             statisticAggregations.map(StatisticAggregations.Parts::getIntermediateAggregation)),
                     gatherExchangeWithProperties.getProperties());
+        }
+
+        private PlanWithProperties visitPartitionedWriter(PlanNode node)
+        {
+            if (getTaskWriterCount(session) == 1) {
+                return planAndEnforceChildren(node, singleStream(), defaultParallelism(session));
+            }
+            return planAndEnforceChildren(node, fixedParallelism(), fixedParallelism());
+        }
+
+        //
+        // Merge
+        //
+
+        @Override
+        public PlanWithProperties visitMergeWriter(MergeWriterNode node, StreamPreferredProperties parentPreferences)
+        {
+            return visitPartitionedWriter(node);
         }
 
         @Override
@@ -893,12 +926,11 @@ public class AddLocalExchanges
         @Override
         public PlanWithProperties visitMergeJoin(MergeJoinNode node, StreamPreferredProperties parentPreferences)
         {
-            if (preferSortMergeJoin(session)) {
-                PlanWithProperties probe = planAndEnforce(node.getLeft(), singleStream(), singleStream());
-                PlanWithProperties build = planAndEnforce(node.getRight(), singleStream(), singleStream());
-                return rebaseAndDeriveProperties(node, ImmutableList.of(probe, build));
-            }
-            return super.visitMergeJoin(node, parentPreferences);
+            // The optimizer rule MergeJoinForSortedInputOptimizer and SortMergeJoinOptimizer which add the merge join node is responsible to ensure the input of the merge join is sorted.
+            // Here we use `any().withOrderSensitivity()` meaning respect the input distribution of the input and keep the input order.
+            PlanWithProperties probe = planAndEnforce(node.getLeft(), any().withOrderSensitivity(), any().withOrderSensitivity());
+            PlanWithProperties build = planAndEnforce(node.getRight(), any().withOrderSensitivity(), any().withOrderSensitivity());
+            return rebaseAndDeriveProperties(node, ImmutableList.of(probe, build));
         }
 
         @Override

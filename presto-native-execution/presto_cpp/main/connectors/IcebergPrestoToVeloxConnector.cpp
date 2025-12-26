@@ -51,7 +51,8 @@ std::unique_ptr<velox::connector::ConnectorTableHandle> toIcebergTableHandle(
     const std::string& tableName,
     const protocol::List<protocol::Column>& dataColumns,
     const protocol::TableHandle& tableHandle,
-    const protocol::Map<protocol::String, protocol::String>& tableParameters,
+    const std::vector<velox::connector::hive::HiveColumnHandlePtr>&
+        columnHandles,
     const VeloxExprConverter& exprConverter,
     const TypeParser& typeParser) {
   velox::common::SubfieldFilters subfieldFilters;
@@ -96,14 +97,6 @@ std::unique_ptr<velox::connector::ConnectorTableHandle> toIcebergTableHandle(
     finalDataColumns = ROW(std::move(names), std::move(types));
   }
 
-  std::unordered_map<std::string, std::string> finalTableParameters = {};
-  if (!tableParameters.empty()) {
-    finalTableParameters.reserve(tableParameters.size());
-    for (const auto& [key, value] : tableParameters) {
-      finalTableParameters[key] = value;
-    }
-  }
-
   return std::make_unique<velox::connector::hive::HiveTableHandle>(
       tableHandle.connectorId,
       tableName,
@@ -111,7 +104,50 @@ std::unique_ptr<velox::connector::ConnectorTableHandle> toIcebergTableHandle(
       std::move(subfieldFilters),
       remainingFilter,
       finalDataColumns,
-      finalTableParameters);
+      std::unordered_map<std::string, std::string>{},
+      columnHandles);
+}
+
+velox::connector::hive::iceberg::IcebergPartitionSpec::Field
+toVeloxIcebergPartitionField(
+    const protocol::iceberg::IcebergPartitionField& field,
+    const TypeParser& typeParser,
+    const protocol::iceberg::PrestoIcebergSchema& schema) {
+  std::string type;
+  for (const auto& column : schema.columns) {
+    if (column.name == field.name) {
+      type = column.prestoType;
+      break;
+    }
+  }
+
+  VELOX_USER_CHECK(
+      !type.empty(),
+      "Partition column not found in table schema: {}",
+      field.name);
+
+  return velox::connector::hive::iceberg::IcebergPartitionSpec::Field{
+      field.name,
+      stringToType(type, typeParser),
+      static_cast<velox::connector::hive::iceberg::TransformType>(
+          field.transform),
+      field.parameter ? *field.parameter : std::optional<int32_t>()};
+}
+
+std::unique_ptr<velox::connector::hive::iceberg::IcebergPartitionSpec>
+toVeloxIcebergPartitionSpec(
+    const protocol::iceberg::PrestoIcebergPartitionSpec& spec,
+    const TypeParser& typeParser) {
+  std::vector<velox::connector::hive::iceberg::IcebergPartitionSpec::Field>
+      fields;
+  fields.reserve(spec.fields.size());
+  for (const auto& field : spec.fields) {
+    fields.emplace_back(
+        toVeloxIcebergPartitionField(field, typeParser, spec.schema));
+  }
+  return std::make_unique<
+      velox::connector::hive::iceberg::IcebergPartitionSpec>(
+      spec.specId, fields);
 }
 
 } // namespace
@@ -211,19 +247,7 @@ std::unique_ptr<velox::connector::ConnectorTableHandle>
 IcebergPrestoToVeloxConnector::toVeloxTableHandle(
     const protocol::TableHandle& tableHandle,
     const VeloxExprConverter& exprConverter,
-    const TypeParser& typeParser,
-    velox::connector::ColumnHandleMap& assignments) const {
-  auto addSynthesizedColumn = [&](const std::string& name,
-                                  protocol::hive::ColumnType columnType,
-                                  const protocol::ColumnHandle& column) {
-    if (toHiveColumnType(columnType) ==
-        velox::connector::hive::HiveColumnHandle::ColumnType::kSynthesized) {
-      if (assignments.count(name) == 0) {
-        assignments.emplace(name, toVeloxColumnHandle(&column, typeParser));
-      }
-    }
-  };
-
+    const TypeParser& typeParser) const {
   auto icebergLayout = std::dynamic_pointer_cast<
       const protocol::iceberg::IcebergTableLayoutHandle>(
       tableHandle.connectorTableLayout);
@@ -232,14 +256,25 @@ IcebergPrestoToVeloxConnector::toVeloxTableHandle(
       "Unexpected layout type {}",
       tableHandle.connectorTableLayout->_type);
 
+  std::unordered_set<std::string> columnNames;
+  std::vector<velox::connector::hive::HiveColumnHandlePtr> columnHandles;
   for (const auto& entry : icebergLayout->partitionColumns) {
-    assignments.emplace(
-        entry.columnIdentity.name, toVeloxColumnHandle(&entry, typeParser));
+    if (columnNames.emplace(entry.columnIdentity.name).second) {
+      columnHandles.emplace_back(
+          std::dynamic_pointer_cast<
+              const velox::connector::hive::HiveColumnHandle>(
+              std::shared_ptr(toVeloxColumnHandle(&entry, typeParser))));
+    }
   }
 
   // Add synthesized columns to the TableScanNode columnHandles as well.
   for (const auto& entry : icebergLayout->predicateColumns) {
-    addSynthesizedColumn(entry.first, entry.second.columnType, entry.second);
+    if (columnNames.emplace(entry.second.columnIdentity.name).second) {
+      columnHandles.emplace_back(
+          std::dynamic_pointer_cast<
+              const velox::connector::hive::HiveColumnHandle>(
+              std::shared_ptr(toVeloxColumnHandle(&entry.second, typeParser))));
+    }
   }
 
   auto icebergTableHandle =
@@ -265,7 +300,7 @@ IcebergPrestoToVeloxConnector::toVeloxTableHandle(
       tableName,
       icebergLayout->dataColumns,
       tableHandle,
-      {},
+      columnHandles,
       exprConverter,
       typeParser);
 }
@@ -299,6 +334,8 @@ IcebergPrestoToVeloxConnector::toVeloxInsertTableHandle(
           fmt::format("{}/data", icebergOutputTableHandle->outputPath),
           velox::connector::hive::LocationHandle::TableType::kNew),
       toVeloxFileFormat(icebergOutputTableHandle->fileFormat),
+      toVeloxIcebergPartitionSpec(
+          icebergOutputTableHandle->partitionSpec, typeParser),
       std::optional(
           toFileCompressionKind(icebergOutputTableHandle->compressionCodec)));
 }
@@ -327,6 +364,8 @@ IcebergPrestoToVeloxConnector::toVeloxInsertTableHandle(
           fmt::format("{}/data", icebergInsertTableHandle->outputPath),
           velox::connector::hive::LocationHandle::TableType::kExisting),
       toVeloxFileFormat(icebergInsertTableHandle->fileFormat),
+      toVeloxIcebergPartitionSpec(
+          icebergInsertTableHandle->partitionSpec, typeParser),
       std::optional(
           toFileCompressionKind(icebergInsertTableHandle->compressionCodec)));
 }

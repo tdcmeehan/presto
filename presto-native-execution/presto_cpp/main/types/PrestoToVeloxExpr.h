@@ -13,12 +13,13 @@
  */
 #pragma once
 
-#include <stdexcept>
 #include "presto_cpp/main/types/TypeParser.h"
 #include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
 #include "velox/core/Expressions.h"
 
 namespace facebook::presto {
+
+const std::unordered_map<std::string, std::string> prestoOperatorMap();
 
 class VeloxExprConverter {
  public:

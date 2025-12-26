@@ -148,6 +148,12 @@ public final class FunctionResolution
         return functionAndTypeResolver.getFunctionMetadata(functionHandle).getOperatorType().equals(Optional.of(OperatorType.CAST));
     }
 
+    @Override
+    public FunctionHandle lookupCast(String castType, Type fromType, Type toType)
+    {
+        return functionAndTypeResolver.lookupCast(castType, fromType, toType);
+    }
+
     public boolean isTryCastFunction(FunctionHandle functionHandle)
     {
         return functionAndTypeResolver.getFunctionMetadata(functionHandle).getName().equals(QualifiedObjectName.valueOf(JAVA_BUILTIN_NAMESPACE, "TRY_CAST"));
@@ -437,5 +443,11 @@ public final class FunctionResolution
     public FunctionHandle lookupBuiltInFunction(String functionName, List<Type> inputTypes)
     {
         return functionAndTypeResolver.lookupFunction(functionName, fromTypes(inputTypes));
+    }
+
+    @Override
+    public FunctionHandle lookupFunction(String catalog, String schema, String functionName, List<Type> inputTypes)
+    {
+        return functionAndTypeResolver.resolveFunction(Optional.empty(), Optional.empty(), QualifiedObjectName.valueOf(catalog, schema, functionName), fromTypes(inputTypes));
     }
 }

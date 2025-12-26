@@ -49,6 +49,7 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
+import static com.facebook.presto.SystemSessionProperties.getMaxPrefixesCount;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.VarcharType.createUnboundedVarcharType;
 import static com.facebook.presto.metadata.MetadataUtil.SchemaMetadataBuilder.schemaMetadataBuilder;
@@ -73,6 +74,7 @@ public class InformationSchemaMetadata
     public static final SchemaTableName TABLE_COLUMNS = new SchemaTableName(INFORMATION_SCHEMA, "columns");
     public static final SchemaTableName TABLE_TABLES = new SchemaTableName(INFORMATION_SCHEMA, "tables");
     public static final SchemaTableName TABLE_VIEWS = new SchemaTableName(INFORMATION_SCHEMA, "views");
+    public static final SchemaTableName TABLE_MATERIALIZED_VIEWS = new SchemaTableName(INFORMATION_SCHEMA, "materialized_views");
     public static final SchemaTableName TABLE_SCHEMATA = new SchemaTableName(INFORMATION_SCHEMA, "schemata");
     public static final SchemaTableName TABLE_TABLE_PRIVILEGES = new SchemaTableName(INFORMATION_SCHEMA, "table_privileges");
     public static final SchemaTableName TABLE_ROLES = new SchemaTableName(INFORMATION_SCHEMA, "roles");
@@ -108,6 +110,18 @@ public class InformationSchemaMetadata
                     .column("view_owner", createUnboundedVarcharType())
                     .column("view_definition", createUnboundedVarcharType())
                     .build())
+            .table(tableMetadataBuilder(TABLE_MATERIALIZED_VIEWS)
+                    .column("table_catalog", createUnboundedVarcharType())
+                    .column("table_schema", createUnboundedVarcharType())
+                    .column("table_name", createUnboundedVarcharType())
+                    .column("view_definition", createUnboundedVarcharType())
+                    .column("view_owner", createUnboundedVarcharType())
+                    .column("view_security", createUnboundedVarcharType())
+                    .column("storage_schema", createUnboundedVarcharType())
+                    .column("storage_table_name", createUnboundedVarcharType())
+                    .column("base_tables", createUnboundedVarcharType())
+                    .column("freshness_state", createUnboundedVarcharType())
+                    .build())
             .table(tableMetadataBuilder(TABLE_SCHEMATA)
                     .column("catalog_name", createUnboundedVarcharType())
                     .column("schema_name", createUnboundedVarcharType())
@@ -141,7 +155,6 @@ public class InformationSchemaMetadata
     private static final InformationSchemaColumnHandle CATALOG_COLUMN_HANDLE = new InformationSchemaColumnHandle("table_catalog");
     private static final InformationSchemaColumnHandle SCHEMA_COLUMN_HANDLE = new InformationSchemaColumnHandle("table_schema");
     private static final InformationSchemaColumnHandle TABLE_NAME_COLUMN_HANDLE = new InformationSchemaColumnHandle("table_name");
-    private static final int MAX_PREFIXES_COUNT = 100;
 
     private final String catalogName;
     private final Metadata metadata;
@@ -237,16 +250,17 @@ public class InformationSchemaMetadata
     public ConnectorTableLayoutResult getTableLayoutForConstraint(ConnectorSession session, ConnectorTableHandle table, Constraint<ColumnHandle> constraint, Optional<Set<ColumnHandle>> desiredColumns)
     {
         InformationSchemaTableHandle handle = checkTableHandle(table);
+        int maxPrefixesCount = getMaxPrefixesCount(((FullConnectorSession) session).getSession());
 
         Set<QualifiedTablePrefix> prefixes = calculatePrefixesWithSchemaName(session, constraint.getSummary(), constraint.predicate());
         if (isTablesEnumeratingTable(handle.getSchemaTableName())) {
             Set<QualifiedTablePrefix> tablePrefixes = calculatePrefixesWithTableName(session, prefixes, constraint.getSummary(), constraint.predicate());
             // in case of high number of prefixes it is better to populate all data and then filter
-            if (tablePrefixes.size() <= MAX_PREFIXES_COUNT) {
+            if (tablePrefixes.size() <= maxPrefixesCount) {
                 prefixes = tablePrefixes;
             }
         }
-        if (prefixes.size() > MAX_PREFIXES_COUNT) {
+        if (prefixes.size() > maxPrefixesCount) {
             // in case of high number of prefixes it is better to populate all data and then filter
             prefixes = ImmutableSet.of(new QualifiedTablePrefix(catalogName));
         }
@@ -257,7 +271,7 @@ public class InformationSchemaMetadata
 
     private boolean isTablesEnumeratingTable(SchemaTableName schemaTableName)
     {
-        return ImmutableSet.of(TABLE_COLUMNS, TABLE_VIEWS, TABLE_TABLES, TABLE_TABLE_PRIVILEGES).contains(schemaTableName);
+        return ImmutableSet.of(TABLE_COLUMNS, TABLE_VIEWS, TABLE_MATERIALIZED_VIEWS, TABLE_TABLES, TABLE_TABLE_PRIVILEGES).contains(schemaTableName);
     }
 
     private Set<QualifiedTablePrefix> calculatePrefixesWithSchemaName(
@@ -303,8 +317,10 @@ public class InformationSchemaMetadata
 
         return prefixes.stream()
                 .flatMap(prefix -> Stream.concat(
-                        metadata.listTables(session, prefix).stream(),
-                        metadata.listViews(session, prefix).stream()))
+                        Stream.concat(
+                                metadata.listTables(session, prefix).stream(),
+                                metadata.listViews(session, prefix).stream()),
+                        metadata.listMaterializedViews(session, prefix).stream()))
                 .filter(objectName -> !predicate.isPresent() || predicate.get().test(asFixedValues(objectName)))
                 .map(value -> toQualifiedTablePrefix(new QualifiedObjectName(
                         value.getCatalogName(),

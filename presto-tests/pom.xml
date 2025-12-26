@@ -5,7 +5,7 @@
     <parent>
         <artifactId>presto-root</artifactId>
         <groupId>com.facebook.presto</groupId>
-        <version>0.296-SNAPSHOT</version>
+        <version>0.297-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-tests</artifactId>
@@ -478,6 +478,7 @@
                         <ignoredNonTestScopedDependency>com.facebook.airlift.drift:drift-codec</ignoredNonTestScopedDependency>
                         <ignoredNonTestScopedDependency>com.facebook.airlift:jaxrs</ignoredNonTestScopedDependency>
                         <ignoredNonTestScopedDependency>com.facebook.presto:presto-plugin-toolkit</ignoredNonTestScopedDependency>
+                        <ignoredNonTestScopedDependency>com.facebook.airlift:node</ignoredNonTestScopedDependency>
                     </ignoredNonTestScopedDependencies>
                 </configuration>
             </plugin>

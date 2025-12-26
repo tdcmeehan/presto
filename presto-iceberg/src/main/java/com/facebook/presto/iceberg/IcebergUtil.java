@@ -276,7 +276,16 @@ public final class IcebergUtil
         if (!(catalog instanceof ViewCatalog)) {
             throw new PrestoException(NOT_SUPPORTED, "This connector does not support get views");
         }
-        return ((ViewCatalog) catalog).loadView(toIcebergTableIdentifier(table, catalogFactory.isNestedNamespaceEnabled()));
+        return ((ViewCatalog) catalog).loadView(toIcebergTableIdentifier(getBaseSchemaTableName(table), catalogFactory.isNestedNamespaceEnabled()));
+    }
+
+    /**
+     * Removes Iceberg-specific suffixes from the table name
+     */
+    private static SchemaTableName getBaseSchemaTableName(SchemaTableName table)
+    {
+        IcebergTableName icebergTableName = IcebergTableName.from(table.getTableName());
+        return new SchemaTableName(table.getSchemaName(), icebergTableName.getTableName());
     }
 
     public static List<IcebergColumnHandle> getPartitionKeyColumnHandles(IcebergTableHandle tableHandle, Table table, TypeManager typeManager)
@@ -411,10 +420,20 @@ public final class IcebergUtil
         return columns.stream()
                 .map(column -> new Column(
                         column.name(),
-                        HiveType.toHiveType(HiveSchemaUtil.convert(column.type())),
+                        icebergTypeToHiveType(column.type()),
                         Optional.empty(),
                         Optional.empty()))
                 .collect(toImmutableList());
+    }
+
+    private static HiveType icebergTypeToHiveType(org.apache.iceberg.types.Type icebergType)
+    {
+        // Special handling for TIME type: use bigint instead of 'string'
+        if (icebergType.typeId() == org.apache.iceberg.types.Type.TypeID.TIME) {
+            return HiveType.HIVE_LONG;
+        }
+
+        return HiveType.toHiveType(HiveSchemaUtil.convert(icebergType));
     }
 
     public static FileFormat getFileFormat(Table table)

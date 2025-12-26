@@ -16,9 +16,11 @@ package com.facebook.presto.spark.execution;
 import com.facebook.airlift.bootstrap.Bootstrap;
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.json.JsonModule;
+import com.facebook.drift.codec.guice.ThriftCodecModule;
 import com.facebook.presto.Session;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeManager;
+import com.facebook.presto.connector.ConnectorManager;
 import com.facebook.presto.execution.Location;
 import com.facebook.presto.execution.ScheduledSplit;
 import com.facebook.presto.execution.TaskId;
@@ -45,6 +47,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.inject.Injector;
 import com.google.inject.Key;
 import com.google.inject.Module;
+import com.google.inject.Scopes;
 import org.testng.annotations.Test;
 
 import java.util.ArrayList;
@@ -75,7 +78,7 @@ public class TestBatchTaskUpdateRequest
         PrestoSparkLocalShuffleInfoTranslator shuffleInfoTranslator = new PrestoSparkLocalShuffleInfoTranslator(
                 PRESTO_SPARK_LOCAL_SHUFFLE_READ_INFO_JSON_CODEC,
                 PRESTO_SPARK_LOCAL_SHUFFLE_WRITE_INFO_JSON_CODEC);
-        PrestoSparkLocalShuffleReadInfo readInfo = new PrestoSparkLocalShuffleReadInfo("test_query_id", ImmutableList.of("shuffle1"), "/dummy/read/path");
+        PrestoSparkLocalShuffleReadInfo readInfo = new PrestoSparkLocalShuffleReadInfo("test_query_id", ImmutableList.of("shuffle1"), "/dummy/read/path", false);
 
         String stringSerializedReadInfo = shuffleInfoTranslator.createSerializedReadInfo(readInfo);
         PlanNodeId planNodeId = new PlanNodeId("planNodeId");
@@ -124,8 +127,8 @@ public class TestBatchTaskUpdateRequest
         PrestoSparkLocalShuffleInfoTranslator shuffleTranslator = new PrestoSparkLocalShuffleInfoTranslator(
                 PRESTO_SPARK_LOCAL_SHUFFLE_READ_INFO_JSON_CODEC,
                 PRESTO_SPARK_LOCAL_SHUFFLE_WRITE_INFO_JSON_CODEC);
-        PrestoSparkLocalShuffleReadInfo readInfo = new PrestoSparkLocalShuffleReadInfo("test_query_id", ImmutableList.of("shuffle1"), "/dummy/read/path");
-        PrestoSparkLocalShuffleWriteInfo writeInfo = new PrestoSparkLocalShuffleWriteInfo(1, "test_query_id", 0, "/dummy/write/path");
+        PrestoSparkLocalShuffleReadInfo readInfo = new PrestoSparkLocalShuffleReadInfo("test_query_id", ImmutableList.of("shuffle1"), "/dummy/read/path", false);
+        PrestoSparkLocalShuffleWriteInfo writeInfo = new PrestoSparkLocalShuffleWriteInfo(1, "test_query_id", 0, "/dummy/write/path", false);
         String stringSerializedReadInfo = shuffleTranslator.createSerializedReadInfo(readInfo);
         String stringSerializedWriteInfo = shuffleTranslator.createSerializedWriteInfo(writeInfo);
         assertEquals(
@@ -133,7 +136,8 @@ public class TestBatchTaskUpdateRequest
                 "{\n" +
                         "  \"queryId\" : \"test_query_id\",\n" +
                         "  \"partitionIds\" : [ \"shuffle1\" ],\n" +
-                        "  \"rootPath\" : \"/dummy/read/path\"\n" +
+                        "  \"rootPath\" : \"/dummy/read/path\",\n" +
+                        "  \"sortedShuffle\" : false\n" +
                         "}");
         assertEquals(
                 stringSerializedWriteInfo,
@@ -141,7 +145,8 @@ public class TestBatchTaskUpdateRequest
                         "  \"numPartitions\" : 1,\n" +
                         "  \"queryId\" : \"test_query_id\",\n" +
                         "  \"shuffleId\" : 0,\n" +
-                        "  \"rootPath\" : \"/dummy/write/path\"\n" +
+                        "  \"rootPath\" : \"/dummy/write/path\",\n" +
+                        "  \"sortedShuffle\" : false\n" +
                         "}");
     }
 
@@ -151,6 +156,8 @@ public class TestBatchTaskUpdateRequest
         Module module = binder -> {
             binder.install(new JsonModule());
             binder.install(new HandleJsonModule());
+            binder.bind(ConnectorManager.class).toProvider(() -> null).in(Scopes.SINGLETON);
+            binder.install(new ThriftCodecModule());
             configBinder(binder).bindConfig(FeaturesConfig.class);
             FunctionAndTypeManager functionAndTypeManager = createTestFunctionAndTypeManager();
             binder.bind(TypeManager.class).toInstance(functionAndTypeManager);

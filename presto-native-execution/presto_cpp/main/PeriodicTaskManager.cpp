@@ -441,38 +441,26 @@ void PeriodicTaskManager::updateOperatingSystemStats() {
   const int64_t userCpuTimeUs{
       static_cast<int64_t>(usage.ru_utime.tv_sec) * 1'000'000 +
       static_cast<int64_t>(usage.ru_utime.tv_usec)};
-  RECORD_METRIC_VALUE(
-      kCounterOsUserCpuTimeMicros, userCpuTimeUs - lastUserCpuTimeUs_);
-  lastUserCpuTimeUs_ = userCpuTimeUs;
+  RECORD_METRIC_VALUE(kCounterOsUserCpuTimeMicros, userCpuTimeUs);
 
   const int64_t systemCpuTimeUs{
       static_cast<int64_t>(usage.ru_stime.tv_sec) * 1'000'000 +
       static_cast<int64_t>(usage.ru_stime.tv_usec)};
-  RECORD_METRIC_VALUE(
-      kCounterOsSystemCpuTimeMicros, systemCpuTimeUs - lastSystemCpuTimeUs_);
-  lastSystemCpuTimeUs_ = systemCpuTimeUs;
+  RECORD_METRIC_VALUE(kCounterOsSystemCpuTimeMicros, systemCpuTimeUs);
 
   const int64_t softPageFaults{usage.ru_minflt};
-  RECORD_METRIC_VALUE(
-      kCounterOsNumSoftPageFaults, softPageFaults - lastSoftPageFaults_);
-  lastSoftPageFaults_ = softPageFaults;
+  RECORD_METRIC_VALUE(kCounterOsNumSoftPageFaults, softPageFaults);
 
   const int64_t hardPageFaults{usage.ru_majflt};
-  RECORD_METRIC_VALUE(
-      kCounterOsNumHardPageFaults, hardPageFaults - lastHardPageFaults_);
-  lastHardPageFaults_ = hardPageFaults;
+  RECORD_METRIC_VALUE(kCounterOsNumHardPageFaults, hardPageFaults);
 
   const int64_t voluntaryContextSwitches{usage.ru_nvcsw};
   RECORD_METRIC_VALUE(
-      kCounterOsNumVoluntaryContextSwitches,
-      voluntaryContextSwitches - lastVoluntaryContextSwitches_);
-  lastVoluntaryContextSwitches_ = voluntaryContextSwitches;
+      kCounterOsNumVoluntaryContextSwitches, voluntaryContextSwitches);
 
   const int64_t forcedContextSwitches{usage.ru_nivcsw};
   RECORD_METRIC_VALUE(
-      kCounterOsNumForcedContextSwitches,
-      forcedContextSwitches - lastForcedContextSwitches_);
-  lastForcedContextSwitches_ = forcedContextSwitches;
+      kCounterOsNumForcedContextSwitches, forcedContextSwitches);
 }
 
 void PeriodicTaskManager::addOperatingSystemStatsUpdateTask() {
@@ -540,6 +528,8 @@ void PeriodicTaskManager::addWatchdogTask() {
         }
         RECORD_METRIC_VALUE(kCounterNumStuckDrivers, stuckOpCalls.size());
 
+        const char* detachReason = nullptr;
+
         // Detach worker from the cluster if more than a certain number of
         // driver threads are blocked by stuck operators (one unique operator
         // can only get stuck on one unique thread).
@@ -547,9 +537,33 @@ void PeriodicTaskManager::addWatchdogTask() {
             SystemConfig::instance()->driverNumStuckOperatorsToDetachWorker(),
             numDriverThreads_);
         if (stuckOpCalls.size() >= numStuckOperatorsToDetachWorker) {
-          detachWorker("detected stuck operators");
+          detachReason = "detected stuck operators";
         } else if (!deadlockTasks.empty()) {
-          detachWorker("starving or deadlocked task");
+          detachReason = "starving or deadlocked task";
+        }
+
+        // Detach worker from the cluster if it has been overloaded for too
+        // long.
+        const auto now = velox::getCurrentTimeSec();
+        const auto lastNotOverloadedTime =
+            taskManager_->lastNotOverloadedTimeInSecs();
+        const auto overloadedDurationSec =
+            taskManager_->isServerOverloaded() && (now > lastNotOverloadedTime)
+            ? now - lastNotOverloadedTime
+            : 0UL;
+        RECORD_METRIC_VALUE(
+            kCounterOverloadedDurationSec, overloadedDurationSec);
+        if (detachReason == nullptr) {
+          const uint64_t secondsThreshold =
+              SystemConfig::instance()->workerOverloadedSecondsToDetachWorker();
+          if (secondsThreshold > 0 &&
+              overloadedDurationSec > secondsThreshold) {
+            detachReason = "worker has been overloaded for too long";
+          }
+        }
+
+        if (detachReason != nullptr) {
+          detachWorker(detachReason);
         } else {
           maybeAttachWorker();
         }

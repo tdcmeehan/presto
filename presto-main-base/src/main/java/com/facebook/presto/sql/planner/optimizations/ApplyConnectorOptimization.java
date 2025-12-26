@@ -34,6 +34,7 @@ import com.facebook.presto.spi.plan.IntersectNode;
 import com.facebook.presto.spi.plan.JoinNode;
 import com.facebook.presto.spi.plan.LimitNode;
 import com.facebook.presto.spi.plan.MarkDistinctNode;
+import com.facebook.presto.spi.plan.MaterializedViewScanNode;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
 import com.facebook.presto.spi.plan.ProjectNode;
@@ -62,6 +63,7 @@ import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 
+import static com.facebook.presto.SystemSessionProperties.isEmptyConnectorOptimizerEnabled;
 import static com.facebook.presto.SystemSessionProperties.isIncludeValuesNodeInConnectorOptimizer;
 import static com.facebook.presto.common.RuntimeUnit.NANO;
 import static com.facebook.presto.sql.OptimizerRuntimeTrackUtil.getOptimizerNameForLog;
@@ -89,6 +91,7 @@ public class ApplyConnectorOptimization
             ProjectNode.class,
             AggregationNode.class,
             MarkDistinctNode.class,
+            MaterializedViewScanNode.class,
             UnionNode.class,
             IntersectNode.class,
             ExceptNode.class,
@@ -101,7 +104,7 @@ public class ApplyConnectorOptimization
             DeleteNode.class);
 
     // for a leaf node that does not belong to any connector (e.g., ValuesNode)
-    private static final ConnectorId EMPTY_CONNECTOR_ID = new ConnectorId("$internal$" + ApplyConnectorOptimization.class + "_CONNECTOR");
+    private static final ConnectorId EMPTY_CONNECTOR_ID = new ConnectorId("$internal$ApplyConnectorOptimization_EMPTY_CONNECTOR");
 
     private final Supplier<Map<ConnectorId, Set<ConnectorPlanOptimizer>>> connectorOptimizersSupplier;
 
@@ -128,6 +131,7 @@ public class ApplyConnectorOptimization
         // retrieve all the connectors
         ImmutableSet.Builder<ConnectorId> connectorIds = ImmutableSet.builder();
         getAllConnectorIds(plan, connectorIds);
+        Set<ConnectorId> connectorIdSet = connectorIds.build();
 
         // for each connector, retrieve the set of subplans to optimize
         // TODO: what if a new connector is added by an existing one
@@ -135,8 +139,21 @@ public class ApplyConnectorOptimization
         // create a UNION_ALL to federate data sources from both C1 and C2 (regardless of the classloader issue).
         // For such case, it is dangerous to re-calculate the "max closure" given the fixpoint property will be broken.
         // In order to preserve the fixpoint, we will "pretend" the newly added C2 table scan is part of C1's job to maintain.
-        for (ConnectorId connectorId : connectorIds.build()) {
-            Set<ConnectorPlanOptimizer> optimizers = connectorOptimizers.get(connectorId);
+        for (ConnectorId connectorId : connectorIdSet) {
+            Set<ConnectorPlanOptimizer> optimizers;
+            if (isEmptyConnectorOptimizerEnabled(session) && connectorIdSet.stream()
+                    .allMatch(x -> x.equals(EMPTY_CONNECTOR_ID)) && session.getCatalog().isPresent()) {
+                ConnectorId queryConnectorId = new ConnectorId(session.getCatalog().get());
+                optimizers = connectorOptimizers.get(queryConnectorId) == null ? null
+                        : connectorOptimizers.get(queryConnectorId).stream()
+                        .filter(x -> x.getSupportedConnectorIds().size() == 1
+                                && x.getSupportedConnectorIds().get(0).equals(EMPTY_CONNECTOR_ID))
+                        .collect(
+                                toImmutableSet());
+            }
+            else {
+                optimizers = connectorOptimizers.get(connectorId);
+            }
             if (optimizers == null || optimizers.isEmpty()) {
                 continue;
             }
@@ -186,6 +203,9 @@ public class ApplyConnectorOptimization
                     for (ConnectorPlanOptimizer optimizer : entry.getValue()) {
                         long start = System.nanoTime();
                         ConnectorSession connectorSession = session.toConnectorSession(connectorId);
+                        if (isEmptyConnectorOptimizerEnabled(session) && connectorId.equals(EMPTY_CONNECTOR_ID) && session.getCatalog().isPresent()) {
+                            connectorSession = session.toConnectorSession(new ConnectorId(session.getCatalog().get()));
+                        }
                         checkState(connectorSession.getConnectorId().isPresent());
                         newNode = optimizer.optimize(newNode, connectorSession, variableAllocator, idAllocator);
                         if (enableVerboseRuntimeStats || trackOptimizerRuntime(session, optimizer)) {
@@ -335,6 +355,9 @@ public class ApplyConnectorOptimization
 
         boolean isClosure(ConnectorId connectorId, Session session, List<ConnectorId> supportedConnectorId)
         {
+            if (isEmptyConnectorOptimizerEnabled(session) && reachableConnectors.stream().allMatch(x -> x.equals(EMPTY_CONNECTOR_ID)) && supportedConnectorId.size() == 1 && supportedConnectorId.get(0).equals(EMPTY_CONNECTOR_ID)) {
+                return containsAll(CONNECTOR_ACCESSIBLE_PLAN_NODES, reachablePlanNodeTypes);
+            }
             // check if all children can reach the only connector
             boolean includeValuesNode = isIncludeValuesNodeInConnectorOptimizer(session);
             Set<ConnectorId> connectorIds = includeValuesNode ? reachableConnectors.stream().filter(x -> !x.equals(EMPTY_CONNECTOR_ID)).collect(toImmutableSet()) : reachableConnectors;

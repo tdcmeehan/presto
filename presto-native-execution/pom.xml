@@ -5,7 +5,7 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.296-SNAPSHOT</version>
+        <version>0.297-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-native-execution</artifactId>
@@ -52,6 +52,12 @@
         <dependency>
             <groupId>org.jetbrains</groupId>
             <artifactId>annotations</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.airlift</groupId>
+            <artifactId>json</artifactId>
             <scope>test</scope>
         </dependency>
 
@@ -413,7 +419,7 @@
                 <configuration>
                     <forkCount>1</forkCount>
                     <reuseForks>false</reuseForks>
-                    <excludedGroups>remote-function,textfile_reader</excludedGroups>
+                    <excludedGroups>remote-function</excludedGroups>
                     <systemPropertyVariables>
                         <PRESTO_SERVER>/root/project/build/debug/presto_cpp/main/presto_server</PRESTO_SERVER>
                         <DATA_DIR>/tmp/velox</DATA_DIR>
@@ -465,7 +471,7 @@
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-surefire-plugin</artifactId>
                         <configuration>
-                            <excludedGroups combine.self="override">writer,parquet,remote-function,textfile_reader,no_textfile_reader,async_data_cache</excludedGroups>
+                            <excludedGroups combine.self="override">writer,parquet,remote-function,textfile,async_data_cache</excludedGroups>
                         </configuration>
                     </plugin>
                 </plugins>
@@ -501,6 +507,12 @@
                                             <directory>${project.parent.basedir}/presto-cli/target</directory>
                                             <includes>
                                                 <include>presto-cli-*-executable.jar</include>
+                                            </includes>
+                                        </resource>
+                                        <resource>
+                                            <directory>${project.parent.basedir}/presto-function-server/target</directory>
+                                            <includes>
+                                                <include>presto-function-server-executable.jar</include>
                                             </includes>
                                         </resource>
                                         <resource>
@@ -574,7 +586,7 @@
                                                 <args>
                                                     <BUILD_TYPE>Release</BUILD_TYPE>
                                                     <DEPENDENCY_IMAGE>presto-native-dependency:latest</DEPENDENCY_IMAGE>
-                                                    <EXTRA_CMAKE_FLAGS>-DPRESTO_ENABLE_TESTING=OFF</EXTRA_CMAKE_FLAGS>
+                                                    <EXTRA_CMAKE_FLAGS>"-DPRESTO_ENABLE_TESTING=OFF -DPRESTO_ENABLE_REMOTE_FUNCTIONS=ON"</EXTRA_CMAKE_FLAGS>
                                                     <NUM_THREADS>2</NUM_THREADS>
                                                     <BASE_IMAGE>ubuntu:22.04</BASE_IMAGE>
                                                     <OSNAME>ubuntu</OSNAME>

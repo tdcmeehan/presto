@@ -127,7 +127,7 @@ public class IcebergTableProperties
     @Inject
     public IcebergTableProperties(IcebergConfig icebergConfig)
     {
-        List<PropertyMetadata<?>> properties = ImmutableList.<PropertyMetadata<?>>builder()
+        List<PropertyMetadata<?>> baseTableProperties = ImmutableList.<PropertyMetadata<?>>builder()
                 .add(new PropertyMetadata<>(
                         PARTITIONING_PROPERTY,
                         "Partition transforms",
@@ -221,7 +221,7 @@ public class IcebergTableProperties
                         false))
                 .build();
 
-        deprecatedPropertyMetadata = properties.stream()
+        deprecatedPropertyMetadata = baseTableProperties.stream()
                 .filter(prop -> DEPRECATED_PROPERTIES.inverse().containsKey(prop.getName()))
                 .map(prop -> new PropertyMetadata<>(
                         DEPRECATED_PROPERTIES.inverse().get(prop.getName()),
@@ -235,7 +235,7 @@ public class IcebergTableProperties
                 .collect(toImmutableMap(property -> property.getName(), property -> property));
 
         tableProperties = ImmutableList.<PropertyMetadata<?>>builder()
-                .addAll(properties)
+                .addAll(baseTableProperties)
                 .addAll(deprecatedPropertyMetadata.values().iterator())
                 .build();
 

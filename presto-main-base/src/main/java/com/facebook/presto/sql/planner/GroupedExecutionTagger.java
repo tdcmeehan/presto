@@ -27,7 +27,9 @@ import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
+import com.facebook.presto.spi.plan.TableWriterNode.CallDistributedProcedureTarget;
 import com.facebook.presto.spi.plan.WindowNode;
+import com.facebook.presto.sql.planner.plan.CallDistributedProcedureNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
@@ -39,7 +41,6 @@ import java.util.Optional;
 import java.util.OptionalInt;
 
 import static com.facebook.presto.SystemSessionProperties.GROUPED_EXECUTION;
-import static com.facebook.presto.SystemSessionProperties.isGroupedExecutionEnabled;
 import static com.facebook.presto.SystemSessionProperties.preferSortMergeJoin;
 import static com.facebook.presto.spi.StandardErrorCode.INVALID_PLAN_ERROR;
 import static com.facebook.presto.spi.connector.ConnectorCapabilities.SUPPORTS_PAGE_SINK_COMMIT;
@@ -58,13 +59,15 @@ class GroupedExecutionTagger
     private final Metadata metadata;
     private final NodePartitioningManager nodePartitioningManager;
     private final boolean groupedExecutionEnabled;
+    private final boolean isPrestoOnSpark;
 
-    public GroupedExecutionTagger(Session session, Metadata metadata, NodePartitioningManager nodePartitioningManager)
+    public GroupedExecutionTagger(Session session, Metadata metadata, NodePartitioningManager nodePartitioningManager, boolean groupedExecutionEnabled, boolean isPrestoOnSpark)
     {
         this.session = requireNonNull(session, "session is null");
         this.metadata = requireNonNull(metadata, "metadata is null");
         this.nodePartitioningManager = requireNonNull(nodePartitioningManager, "nodePartitioningManager is null");
-        this.groupedExecutionEnabled = isGroupedExecutionEnabled(session);
+        this.groupedExecutionEnabled = groupedExecutionEnabled;
+        this.isPrestoOnSpark = isPrestoOnSpark;
     }
 
     @Override
@@ -166,6 +169,15 @@ class GroupedExecutionTagger
             // TODO: This will break the other use case for merge join operating on sorted tables, which requires grouped execution for correctness.
             return GroupedExecutionTagger.GroupedExecutionProperties.notCapable();
         }
+
+        if (isPrestoOnSpark) {
+            GroupedExecutionTagger.GroupedExecutionProperties mergeJoinLeft = node.getLeft().accept(new GroupedExecutionTagger(session, metadata, nodePartitioningManager, true, true), null);
+            GroupedExecutionTagger.GroupedExecutionProperties mergeJoinRight = node.getRight().accept(new GroupedExecutionTagger(session, metadata, nodePartitioningManager, true, true), null);
+            if (mergeJoinLeft.currentNodeCapable || mergeJoinRight.currentNodeCapable) {
+                return GroupedExecutionTagger.GroupedExecutionProperties.notCapable();
+            }
+        }
+
         throw new PrestoException(
                 INVALID_PLAN_ERROR,
                 format("When grouped execution can't be enabled, merge join plan is not valid." +
@@ -229,6 +241,22 @@ class GroupedExecutionTagger
             return new GroupedExecutionTagger.GroupedExecutionProperties(true, true, properties.capableTableScanNodes, properties.totalLifespans, properties.recoveryEligible);
         }
         return GroupedExecutionTagger.GroupedExecutionProperties.notCapable();
+    }
+
+    @Override
+    public GroupedExecutionTagger.GroupedExecutionProperties visitCallDistributedProcedure(CallDistributedProcedureNode node, Void context)
+    {
+        GroupedExecutionTagger.GroupedExecutionProperties properties = node.getSource().accept(this, null);
+        boolean recoveryEligible = properties.isRecoveryEligible();
+        CallDistributedProcedureTarget target = node.getTarget().orElseThrow(() -> new VerifyException("target is absent"));
+        recoveryEligible &= metadata.getConnectorCapabilities(session, target.getConnectorId()).contains(SUPPORTS_PAGE_SINK_COMMIT);
+
+        return new GroupedExecutionTagger.GroupedExecutionProperties(
+                properties.isCurrentNodeCapable(),
+                properties.isSubTreeUseful(),
+                properties.getCapableTableScanNodes(),
+                properties.getTotalLifespans(),
+                recoveryEligible);
     }
 
     @Override

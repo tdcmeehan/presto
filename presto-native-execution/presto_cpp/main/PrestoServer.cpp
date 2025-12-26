@@ -16,6 +16,7 @@
 #include <boost/asio/ip/host_name.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <glog/logging.h>
+#include <proxygen/lib/http/HTTPHeaders.h>
 #include "presto_cpp/main/Announcer.h"
 #include "presto_cpp/main/CoordinatorDiscoverer.h"
 #include "presto_cpp/main/PeriodicMemoryChecker.h"
@@ -41,6 +42,8 @@
 #include "presto_cpp/main/operators/PartitionAndSerialize.h"
 #include "presto_cpp/main/operators/ShuffleExchangeSource.h"
 #include "presto_cpp/main/operators/ShuffleRead.h"
+#include "presto_cpp/main/operators/ShuffleWrite.h"
+#include "presto_cpp/main/types/ExpressionOptimizer.h"
 #include "presto_cpp/main/types/PrestoToVeloxQueryPlan.h"
 #include "presto_cpp/main/types/VeloxPlanConversion.h"
 #include "velox/common/base/Counters.h"
@@ -61,8 +64,10 @@
 #include "velox/dwio/orc/reader/OrcReader.h"
 #include "velox/dwio/parquet/RegisterParquetReader.h"
 #include "velox/dwio/parquet/RegisterParquetWriter.h"
+#include "velox/dwio/text/RegisterTextReader.h"
 #include "velox/dwio/text/RegisterTextWriter.h"
 #include "velox/exec/OutputBufferManager.h"
+#include "velox/exec/TraceUtil.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
@@ -97,6 +102,8 @@ constexpr char const* kTaskUriFormat =
 constexpr char const* kConnectorName = "connector.name";
 constexpr char const* kLinuxSharedLibExt = ".so";
 constexpr char const* kMacOSSharedLibExt = ".dylib";
+constexpr char const* kOptimized = "OPTIMIZED";
+constexpr char const* kEvaluated = "EVALUATED";
 
 protocol::NodeState convertNodeState(presto::NodeState nodeState) {
   switch (nodeState) {
@@ -187,6 +194,50 @@ void unregisterVeloxCudf() {
     PRESTO_SHUTDOWN_LOG(INFO) << "cuDF is unregistered.";
   }
 #endif
+}
+
+json::array_t getOptimizedExpressions(
+    const proxygen::HTTPHeaders& httpHeaders,
+    const std::vector<std::unique_ptr<folly::IOBuf>>& body,
+    folly::Executor* executor,
+    velox::memory::MemoryPool* pool) {
+  static constexpr char const* kOptimizerLevelHeader =
+      "X-Presto-Expression-Optimizer-Level";
+  const auto& optimizerLevelString =
+      httpHeaders.getSingleOrEmpty(kOptimizerLevelHeader);
+  VELOX_USER_CHECK(
+      (optimizerLevelString == kOptimized) ||
+          (optimizerLevelString == kEvaluated),
+      "Optimizer level should be OPTIMIZED or EVALUATED, received {}.",
+      optimizerLevelString);
+  auto optimizerLevel = (optimizerLevelString == kOptimized)
+      ? expression::OptimizerLevel::kOptimized
+      : expression::OptimizerLevel::kEvaluated;
+
+  static constexpr char const* kTimezoneHeader = "X-Presto-Time-Zone";
+  const auto& timezone = httpHeaders.getSingleOrEmpty(kTimezoneHeader);
+  std::unordered_map<std::string, std::string> config(
+      {{velox::core::QueryConfig::kSessionTimezone, timezone},
+       {velox::core::QueryConfig::kAdjustTimestampToTimezone, "true"}});
+  auto queryConfig = velox::core::QueryConfig{std::move(config)};
+  auto queryCtx =
+      velox::core::QueryCtx::create(executor, std::move(queryConfig));
+
+  json input = json::parse(util::extractMessageBody(body));
+  VELOX_USER_CHECK(input.is_array(), "Body of request should be a JSON array.");
+  const json::array_t expressionList = static_cast<json::array_t>(input);
+  std::vector<RowExpressionPtr> expressions;
+  for (const auto& j : expressionList) {
+    expressions.push_back(j);
+  }
+  const auto optimizedList = expression::optimizeExpressions(
+      expressions, timezone, optimizerLevel, queryCtx.get(), pool);
+
+  json::array_t result;
+  for (const auto& optimized : optimizedList) {
+    result.push_back(optimized);
+  }
+  return result;
 }
 
 } // namespace
@@ -423,13 +474,23 @@ void PrestoServer::run() {
     if (folly::Singleton<velox::BaseStatsReporter>::try_get()) {
       httpServer_->registerGet(
           "/v1/info/metrics",
-          [](proxygen::HTTPMessage* /*message*/,
+          [](proxygen::HTTPMessage* message,
              const std::vector<std::unique_ptr<folly::IOBuf>>& /*body*/,
              proxygen::ResponseHandler* downstream) {
-            http::sendOkResponse(
-                downstream,
-                folly::Singleton<velox::BaseStatsReporter>::try_get()
-                    ->fetchMetrics());
+            auto acceptHeader = message->getHeaders().getSingleOrEmpty(
+                proxygen::HTTPHeaderCode::HTTP_HEADER_ACCEPT);
+            if (acceptHeader.find(http::kMimeTypeTextPlain) !=
+                std::string::npos) {
+              http::sendOkTextResponse(
+                  downstream,
+                  folly::Singleton<velox::BaseStatsReporter>::try_get()
+                      ->fetchMetrics());
+            } else {
+              http::sendOkResponse(
+                  downstream,
+                  folly::Singleton<velox::BaseStatsReporter>::try_get()
+                      ->fetchMetrics());
+            }
           });
     }
   }
@@ -437,6 +498,7 @@ void PrestoServer::run() {
   registerRemoteFunctions();
   registerVectorSerdes();
   registerPrestoPlanNodeSerDe();
+  registerTraceNodeFactories();
   registerDynamicFunctions();
 
   facebook::velox::exec::ExchangeSource::registerFactory(
@@ -546,8 +608,8 @@ void PrestoServer::run() {
   }
   if (spillerExecutor_ != nullptr) {
     PRESTO_STARTUP_LOG(INFO)
-        << "Spiller CPU executor '" << spillerExecutor_->getName() << "', has "
-        << spillerExecutor_->numThreads() << " threads.";
+        << "Spiller CPU executor '" << spillerCpuExecutor_->getName()
+        << "', has " << spillerCpuExecutor_->numThreads() << " threads.";
   } else {
     PRESTO_STARTUP_LOG(INFO) << "Spill executor was not configured.";
   }
@@ -558,7 +620,7 @@ void PrestoServer::run() {
   auto* asyncDataCache = velox::cache::AsyncDataCache::getInstance();
   periodicTaskManager_ = std::make_unique<PeriodicTaskManager>(
       driverCpuExecutor_,
-      spillerExecutor_.get(),
+      spillerCpuExecutor_,
       httpSrvIoExecutor_.get(),
       httpSrvCpuExecutor_.get(),
       exchangeHttpIoExecutor_.get(),
@@ -834,10 +896,10 @@ void PrestoServer::initializeThreadPools() {
     threadFactory = std::make_shared<folly::NamedThreadFactory>("Driver");
   }
 
-  auto driverExecutor = std::make_unique<folly::CPUThreadPoolExecutor>(
+  driverExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(
       numDriverCpuThreads, threadFactory);
-  driverCpuExecutor_ = driverExecutor.get();
-  driverExecutor_ = std::move(driverExecutor);
+  driverCpuExecutor_ = velox::checkedPointerCast<folly::CPUThreadPoolExecutor>(
+      driverExecutor_.get());
 
   const auto numIoThreads = std::max<size_t>(
       systemConfig->httpServerNumIoThreadsHwMultiplier() * hwConcurrency, 1);
@@ -855,8 +917,10 @@ void PrestoServer::initializeThreadPools() {
     spillerExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(
         numSpillerCpuThreads,
         std::make_shared<folly::NamedThreadFactory>("Spiller"));
+    spillerCpuExecutor_ =
+        velox::checkedPointerCast<folly::CPUThreadPoolExecutor>(
+            spillerExecutor_.get());
   }
-
   const auto numExchangeHttpClientIoThreads = std::max<size_t>(
       systemConfig->exchangeHttpClientNumIoThreadsHwMultiplier() *
           std::thread::hardware_concurrency(),
@@ -1243,7 +1307,7 @@ std::vector<std::string> PrestoServer::registerVeloxConnectors(
   if (numConnectorCpuThreads > 0) {
     connectorCpuExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(
         numConnectorCpuThreads,
-        std::make_shared<folly::NamedThreadFactory>("Connector"));
+        std::make_shared<folly::NamedThreadFactory>("ConnectorCPU"));
 
     PRESTO_STARTUP_LOG(INFO)
         << "Connector CPU executor has " << connectorCpuExecutor_->numThreads()
@@ -1257,7 +1321,7 @@ std::vector<std::string> PrestoServer::registerVeloxConnectors(
   if (numConnectorIoThreads > 0) {
     connectorIoExecutor_ = std::make_unique<folly::IOThreadPoolExecutor>(
         numConnectorIoThreads,
-        std::make_shared<folly::NamedThreadFactory>("Connector"));
+        std::make_shared<folly::NamedThreadFactory>("ConnectorIO"));
 
     PRESTO_STARTUP_LOG(INFO)
         << "Connector IO executor has " << connectorIoExecutor_->numThreads()
@@ -1389,11 +1453,12 @@ void PrestoServer::registerRemoteFunctions() {
           << catalogName << "' catalog.";
     } else {
       VELOX_FAIL(
-          "To register remote functions using a json file path you need to "
-          "specify the remote server location using '{}', '{}' or '{}'.",
+          "To register remote functions you need to specify the remote server "
+          "location using '{}', '{}' or '{}' or {}.",
           SystemConfig::kRemoteFunctionServerThriftAddress,
           SystemConfig::kRemoteFunctionServerThriftPort,
-          SystemConfig::kRemoteFunctionServerThriftUdsPath);
+          SystemConfig::kRemoteFunctionServerThriftUdsPath,
+          SystemConfig::kRemoteFunctionServerRestURL);
     }
   }
 #endif
@@ -1445,6 +1510,9 @@ void PrestoServer::registerFileReadersAndWriters() {
   if (SystemConfig::instance()->textWriterEnabled()) {
     velox::text::registerTextWriterFactory();
   }
+  if (SystemConfig::instance()->textReaderEnabled()) {
+    velox::text::registerTextReaderFactory();
+  }
 }
 
 void PrestoServer::unregisterFileReadersAndWriters() {
@@ -1454,6 +1522,9 @@ void PrestoServer::unregisterFileReadersAndWriters() {
   velox::parquet::unregisterParquetWriterFactory();
   if (SystemConfig::instance()->textWriterEnabled()) {
     velox::text::unregisterTextWriterFactory();
+  }
+  if (SystemConfig::instance()->textReaderEnabled()) {
+    velox::text::unregisterTextReaderFactory();
   }
 }
 
@@ -1714,6 +1785,18 @@ void PrestoServer::registerSidecarEndpoints() {
             });
       });
   httpServer_->registerPost(
+      "/v1/expressions",
+      [this](
+          proxygen::HTTPMessage* message,
+          const std::vector<std::unique_ptr<folly::IOBuf>>& body,
+          proxygen::ResponseHandler* downstream) {
+        const auto& httpHeaders = message->getHeaders();
+        const auto result = getOptimizedExpressions(
+            httpHeaders, body, driverExecutor_.get(), nativeWorkerPool_.get());
+        http::sendOkResponse(downstream, result);
+      });
+
+  httpServer_->registerPost(
       "/v1/velox/plan",
       [server = this](
           proxygen::HTTPMessage* message,
@@ -1804,5 +1887,48 @@ void PrestoServer::reportNodeStats(proxygen::ResponseHandler* downstream) {
   nodeStats.nodeState = convertNodeState(this->nodeState());
 
   http::sendOkResponse(downstream, json(nodeStats));
+}
+
+void PrestoServer::registerTraceNodeFactories() {
+  // Register trace node factory for BroadcastWrite operator.
+  velox::exec::trace::registerTraceNodeFactory(
+      "BroadcastWrite",
+      [](const velox::core::PlanNode* traceNode,
+         const velox::core::PlanNodeId& nodeId) -> velox::core::PlanNodePtr {
+        if (const auto* broadcastWriteNode =
+                dynamic_cast<const operators::BroadcastWriteNode*>(traceNode)) {
+          return std::make_shared<operators::BroadcastWriteNode>(
+              nodeId,
+              broadcastWriteNode->basePath(),
+              broadcastWriteNode->maxBroadcastBytes(),
+              broadcastWriteNode->serdeRowType(),
+              std::make_shared<velox::exec::trace::DummySourceNode>(
+                  broadcastWriteNode->sources().front()->outputType()));
+        }
+        return nullptr;
+      });
+
+  // Register trace node factory for PartitionAndSerialize operator
+  velox::exec::trace::registerTraceNodeFactory(
+      "PartitionAndSerialize",
+      [](const velox::core::PlanNode* traceNode,
+         const velox::core::PlanNodeId& nodeId) -> velox::core::PlanNodePtr {
+        if (const auto* partitionAndSerializeNode =
+                dynamic_cast<const operators::PartitionAndSerializeNode*>(
+                    traceNode)) {
+          return std::make_shared<operators::PartitionAndSerializeNode>(
+              nodeId,
+              partitionAndSerializeNode->keys(),
+              partitionAndSerializeNode->numPartitions(),
+              partitionAndSerializeNode->serializedRowType(),
+              std::make_shared<velox::exec::trace::DummySourceNode>(
+                  partitionAndSerializeNode->sources().front()->outputType()),
+              partitionAndSerializeNode->isReplicateNullsAndAny(),
+              partitionAndSerializeNode->partitionFunctionFactory(),
+              partitionAndSerializeNode->sortingOrders(),
+              partitionAndSerializeNode->sortingKeys());
+        }
+        return nullptr;
+      });
 }
 } // namespace facebook::presto

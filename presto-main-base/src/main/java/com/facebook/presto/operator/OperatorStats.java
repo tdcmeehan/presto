@@ -243,7 +243,7 @@ public class OperatorStats
         this.blockedReason = blockedReason;
 
         this.info = info;
-        this.infoUnion = null;
+        this.infoUnion = (info != null) ? OperatorInfoUnion.convertToOperatorInfoUnion(info) : null;
         this.nullJoinBuildKeyCount = nullJoinBuildKeyCount;
         this.joinBuildKeyCount = joinBuildKeyCount;
         this.nullJoinProbeKeyCount = nullJoinProbeKeyCount;
@@ -390,7 +390,7 @@ public class OperatorStats
         this.blockedReason = blockedReason;
 
         this.infoUnion = infoUnion;
-        this.info = null;
+        this.info = (infoUnion != null) ? OperatorInfoUnion.convertToOperatorInfo(infoUnion) : null;
         this.nullJoinBuildKeyCount = nullJoinBuildKeyCount;
         this.joinBuildKeyCount = joinBuildKeyCount;
         this.nullJoinProbeKeyCount = nullJoinProbeKeyCount;
@@ -668,6 +668,9 @@ public class OperatorStats
     @JsonProperty
     public OperatorInfo getInfo()
     {
+        if (info == null && infoUnion != null) {
+            return OperatorInfoUnion.convertToOperatorInfo(infoUnion);
+        }
         return info;
     }
 
@@ -675,6 +678,9 @@ public class OperatorStats
     @ThriftField(39)
     public OperatorInfoUnion getInfoUnion()
     {
+        if (infoUnion == null && info != null) {
+            return OperatorInfoUnion.convertToOperatorInfoUnion(info);
+        }
         return infoUnion;
     }
 
@@ -885,7 +891,9 @@ public class OperatorStats
             nullJoinProbeKeyCount += operator.getNullJoinProbeKeyCount();
             joinProbeKeyCount += operator.getJoinProbeKeyCount();
         }
-
+        if (finishCpu < 0) {
+            finishCpu = Long.MAX_VALUE;
+        }
         return Optional.of(new OperatorStats(
                 stageId,
                 stageExecutionId,

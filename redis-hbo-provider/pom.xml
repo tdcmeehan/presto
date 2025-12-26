@@ -5,7 +5,7 @@
     <parent>
         <artifactId>presto-root</artifactId>
         <groupId>com.facebook.presto</groupId>
-        <version>0.296-SNAPSHOT</version>
+        <version>0.297-SNAPSHOT</version>
     </parent>
 
     <properties>
@@ -202,7 +202,7 @@
         <dependency>
             <groupId>com.github.fppt</groupId>
             <artifactId>jedis-mock</artifactId>
-            <version>1.0.9</version>
+            <version>1.1.12</version>
             <scope>test</scope>
             <exclusions>
                 <exclusion>

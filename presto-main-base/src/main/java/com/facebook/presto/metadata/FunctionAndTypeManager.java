@@ -94,6 +94,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
+import static com.facebook.presto.SystemSessionProperties.getNonBuiltInFunctionNamespacesToListFunctions;
 import static com.facebook.presto.SystemSessionProperties.isExperimentalFunctionsEnabled;
 import static com.facebook.presto.SystemSessionProperties.isListBuiltInFunctionsOnly;
 import static com.facebook.presto.common.type.TypeSignature.parseTypeSignature;
@@ -544,8 +545,10 @@ public class FunctionAndTypeManager
             functions.addAll(builtInWorkerFunctionNamespaceManager.listFunctions(likePattern, escape).stream().collect(toImmutableList()));
         }
         else {
+            Set<String> catalogsToListFunction = getNonBuiltInFunctionNamespacesToListFunctions(session);
             functions.addAll(SessionFunctionUtils.listFunctions(session.getSessionFunctions()));
             functions.addAll(functionNamespaceManagers.values().stream()
+                    .filter(x -> x instanceof BuiltInTypeAndFunctionNamespaceManager || catalogsToListFunction.isEmpty() || catalogsToListFunction.contains(x.getCatalogName()))
                     .flatMap(manager -> manager.listFunctions(likePattern, escape).stream())
                     .collect(toImmutableList()));
             functions.addAll(builtInPluginFunctionNamespaceManager.listFunctions(likePattern, escape).stream().collect(toImmutableList()));
@@ -853,6 +856,11 @@ public class FunctionAndTypeManager
     public CatalogSchemaName getDefaultNamespace()
     {
         return defaultNamespace;
+    }
+
+    public HandleResolver getHandleResolver()
+    {
+        return handleResolver;
     }
 
     protected Type getType(UserDefinedType userDefinedType)
