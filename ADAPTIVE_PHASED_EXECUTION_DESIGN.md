@@ -14,10 +14,11 @@ This document describes a design for adaptive query execution in Presto that wor
 
 Rather than attempting mid-stream re-optimization (which conflicts with streaming), we propose:
 
-1. **Bottom-up decision making**: At each join build completion, decide only the immediate next step
-2. **Parallel variant preparation**: Build hash tables for multiple join candidates in parallel
-3. **Variant selection via existing mechanisms**: Use `noMoreSplits` and split scheduling to activate/deactivate prepared variants
-4. **No additional storage**: Hash tables already reside in memory; no separate materialization needed
+1. **Confidence-based materialization points**: Use Presto's existing `ConfidenceLevel` (LOW/HIGH/FACT) to decide where runtime measurement is needed
+2. **Bottom-up decision making**: At each join build completion, decide only the immediate next step
+3. **On-demand builds**: Only build hash tables when needed, not all in parallel (memory efficient)
+4. **Variant selection via existing mechanisms**: Use `noMoreSplits` and split scheduling to activate/deactivate prepared variants
+5. **No additional storage**: Hash tables already reside in memory; no separate materialization needed
 
 ---
 
@@ -56,7 +57,35 @@ Hash join builds are **blocking operators**:
 
 ## 3. Design Overview
 
-### 3.1 Core Concept: Bottom-Up Adaptive Join Ordering
+### 3.1 Confidence-Based Materialization Points
+
+Presto already has a statistics confidence system we can leverage:
+
+```java
+// From presto-spi/src/main/java/com/facebook/presto/spi/statistics/SourceInfo.java
+public enum ConfidenceLevel {
+    LOW(0),   // Unreliable - derived estimates, missing stats
+    HIGH(1),  // Good - catalog stats, histograms available
+    FACT(2);  // Exact - VALUES clause, completed aggregation
+}
+```
+
+**Existing usage**: `ConfidenceBasedBroadcastUtil` already uses confidence to choose join distribution type.
+
+**Our extension**: Use confidence to decide where materialization points (MPs) are needed:
+
+| Confidence | Source Examples | MP Decision |
+|------------|-----------------|-------------|
+| **FACT** | VALUES clause, global agg | No MP - stats are exact |
+| **HIGH** | Table scan with good catalog stats | No MP - trust estimate |
+| **LOW** | Join output, complex filter, missing stats | **Insert MP** - measure at runtime |
+
+This is more general than "leaf vs. non-leaf":
+- A leaf scan with **missing** catalog stats → LOW → needs MP
+- A leaf scan with **good** catalog stats → HIGH → no MP needed
+- Any join output → LOW (JoinStatsRule doesn't boost confidence) → needs MP
+
+### 3.2 Core Concept: Bottom-Up Adaptive Join Ordering
 
 For a multi-way join, make decisions incrementally at each phase boundary:
 
@@ -68,59 +97,75 @@ Traditional (static):
   Execute with fingers crossed
 
 Adaptive (bottom-up):
-  Phase 1: Build hash tables for all base tables (A, B, C, D)
-           → Now we know all base cardinalities
+  Phase 1: Use catalog stats (HIGH confidence) to pick first join
+           → Catalog says |dim1| < |dim2| < |dim3|
+           → Pick: fact ⋈ dim1
+           → Build dim1 hash table, probe with fact
 
-  Phase 2: Pick best first join, say A ⋈ B
-           Build hash table for A ⋈ B result
-           → Now we know |A ⋈ B|
+  Phase 2: Join completes (LOW confidence output becomes FACT)
+           → Actual |fact ⋈ dim1| = 50M (was estimated 500M!)
+           → Pick next: (fact ⋈ dim1) ⋈ dim2
+           → Build dim2 hash table now (not earlier!)
 
-  Phase 3: Pick next join partner (C or D) based on actual |A ⋈ B|
-           Build hash table for (A ⋈ B) ⋈ X
-           → Now we know |A ⋈ B ⋈ X|
-
-  Phase 4: Join with remaining table
-           Stream to output
+  Phase 3: Join completes
+           → Actual |(fact ⋈ dim1) ⋈ dim2| = 45M
+           → Continue with dim3
+           → Stream to output
 ```
 
-### 3.2 Key Insight: All Builds Can Run in Parallel
+### 3.3 On-Demand Builds (Memory Efficient)
 
-Hash builds for different tables are independent. We can:
-- Start all builds in parallel
-- As each completes, we learn its actual cardinality
-- Make join decisions based on complete information
+**Key insight**: We don't need to build all hash tables upfront.
+
+- **Catalog stats (HIGH confidence)** tell us base table sizes
+- **Only build what we need** for the current join
+- **Measure output** at join completion (LOW → FACT)
+- **Decide next join** based on actual cardinality
 
 ```
-Time →
-───────────────────────────────────────────────────────
+Memory-Efficient Execution:
 
-A scan ──► A build ──────────────────┐
-                                     │
-B scan ──► B build ──────┐           │
-                         ├─► Decision: A ⋈ B
-C scan ──► C build ──────┤           │
-                         │           ▼
-D scan ──► D build ──────┴─► (A ⋈ B) build ──┐
-                                              │
-                              ┌───────────────┘
-                              ▼
-                         Decision: join C or D next?
-                         Based on actual |A ⋈ B|
+Phase 1:
+  - Trust catalog: |dim1|=10K, |dim2|=100K, |dim3|=1M
+  - Build only dim1 hash table (10K rows)
+  - Execute fact ⋈ dim1
+  - Memory: just dim1 hash table
+
+Phase 2:
+  - Actual |fact ⋈ dim1| = 50M known
+  - Build dim2 hash table (100K rows)
+  - Execute (fact ⋈ dim1) ⋈ dim2
+  - Memory: dim2 hash table + intermediate
+
+Phase 3:
+  - Build dim3 hash table (1M rows)
+  - Execute final join
+  - Stream to output
 ```
 
-### 3.3 Variant Preparation and Selection
+Compare to parallel builds:
+```
+Parallel (wasteful):
+  Memory = |dim1 HT| + |dim2 HT| + |dim3 HT| simultaneously
 
-Rather than re-planning at runtime, **pre-generate variant plan fragments**:
+On-demand (efficient):
+  Memory = max(|dim1 HT|, |dim2 HT|, |dim3 HT|) at any time
+```
+
+### 3.4 Variant Preparation and Selection
+
+Rather than re-planning at runtime, **pre-generate variant plan fragments** for uncertain decision points:
 
 ```
 At Optimization Time:
-  - Identify phase boundaries (join builds)
+  - Identify materialization points (MPs) where stats have LOW confidence
   - Generate variant fragments for each decision point
   - All variants share common upstream (the completed build)
 
 At Execution Time:
-  - Run all builds in parallel
-  - At decision point, select best variant
+  - Build hash table for current join (on-demand)
+  - Execute join, measure output cardinality
+  - At MP completion, select best variant for next step
   - Activate chosen variant (schedule its splits)
   - Deactivate other variants (noMoreSplits)
 ```
@@ -243,41 +288,58 @@ void deactivateVariant(PlanVariant variant) {
 }
 ```
 
-### 4.6 Plan Structure: DAG with Shared Builds
+### 4.6 Plan Structure: On-Demand Execution Flow
 
-The plan becomes a DAG where build outputs can be consumed by multiple potential probe variants:
+The plan executes with on-demand builds, making decisions at materialization points:
 
 ```
-                                    ┌─► Variant A: probe C next
-                                    │   (C build) ⋈ (A⋈B output)
-A scan ─► A build ─┐                │
-                   ├─► (A⋈B) build ─┼─► Variant B: probe D next
-B scan ─► B build ─┘                │   (D build) ⋈ (A⋈B output)
-                                    │
-C scan ─► C build ──────────────────┤
-                                    │
-D scan ─► D build ──────────────────┘
+Phase 1: First Join (catalog stats are HIGH confidence)
+  dim1 scan ─► dim1 build ─┐
+                           ├─► fact ⋈ dim1 ─► MP: measure output
+  fact scan ────────────────┘
+                              │
+                              ▼ (output now FACT confidence)
+                         Decision Point 1
 
-At decision point:
-  - All builds complete, we know actual cardinalities
-  - Select Variant A or B based on costs with actual stats
-  - Activate chosen, deactivate other
+Phase 2: Second Join (choose based on actual cardinality)
+                                    ┌─► Variant A: (fact⋈dim1) ⋈ dim2
+  Activate chosen variant ─────────┤
+                                    └─► Variant B: (fact⋈dim1) ⋈ dim3
+
+  dim2 scan ─► dim2 build (on-demand) ─┐
+                                       ├─► (fact⋈dim1) ⋈ dim2 ─► MP
+  (fact⋈dim1) output ──────────────────┘
+                                          │
+                                          ▼
+                                     Decision Point 2
+Phase 3: Final Join
+  dim3 scan ─► dim3 build (on-demand) ─┐
+                                       ├─► final join ─► output
+  previous output ─────────────────────┘
 ```
+
+At each decision point:
+  - Current join completes, we measure actual cardinality
+  - Select best variant for next join based on actual stats
+  - Build hash table for chosen dimension (on-demand)
+  - Activate chosen, deactivate others
 
 ### 4.7 Memory Management
 
-**Hash tables for unchosen variants:**
-- Built in parallel (work is done)
-- Memory can be reclaimed after decision
-- Trade-off: extra memory during decision window vs. ability to choose
+**On-demand builds (memory efficient):**
+- Hash tables built only when needed for current join
+- Memory footprint: one hash table at a time (plus intermediate results)
+- No wasted memory on unchosen variants
 
-**Hash table for chosen variant:**
+**Hash table lifecycle:**
+- Built on-demand when join is scheduled
 - Consumed by probe as normal
 - Memory reclaimed as probe progresses
 
 **No additional storage needed:**
 - Hash tables are the only "materialization"
 - They exist in memory as part of normal join execution
+- Materialization points measure statistics, not store data
 - No checkpointing to disk or external storage
 
 ---
@@ -314,61 +376,57 @@ Based on estimates, optimizer chooses:
 
 ### 5.4 Adaptive Execution
 
-**Phase 1: All builds run in parallel**
+**Phase 1: First Join (using catalog stats)**
+
+Catalog has HIGH confidence stats for dimensions: |dim1|=10K, |dim2|=100K, |dim3|=1M
+
+Static optimizer picks dim1 first (smallest). Build dim1 on-demand:
 
 ```
-fact scan  ──► fact build (partitioned)
-dim1 scan  ──► dim1 build ──► complete: 10K rows ✓
-dim2 scan  ──► dim2 build ──► complete: 95K rows ✓
-dim3 scan  ──► dim3 build ──► complete: 1.2M rows ✓
-```
-
-Dimension builds complete first (small tables).
-
-**Decision Point 1: First join partner for fact**
-
-We now know actual dimension sizes. The decision:
-- Join with dim1 (10K build) → smaller build, good for broadcast
-- Join with dim2 (95K build)
-- Join with dim3 (1.2M build) → largest, probably not first
-
-Coordinator selects: **fact ⋈ dim1** (smallest dimension)
-
-Activate dim1 probe variant, deactivate dim2/dim3 probe variants (for now).
-
-**Phase 2: fact ⋈ dim1 executes**
-
-```
-fact scan ──► probe dim1 hash table ──► (fact ⋈ dim1) build
-                                              │
-                                              ▼
-                                        complete: 50M rows
-                                        (10x smaller than estimated!)
-```
-
-**Decision Point 2: Next join partner**
-
-We now know:
-- |fact ⋈ dim1| = 50M (actual, was estimated 500M)
-- |dim2| = 95K
-- |dim3| = 1.2M
-
-With 50M intermediate rows (much smaller than expected), joining dim3 next might be fine.
-
-Coordinator re-evaluates costs and selects: **(fact ⋈ dim1) ⋈ dim2**
-
-**Phase 3: (fact ⋈ dim1) ⋈ dim2 executes**
-
-```
-(fact ⋈ dim1) output ──► probe dim2 hash table ──► ((f ⋈ d1) ⋈ d2) build
+dim1 scan ──► dim1 build ──► complete: 10K rows ✓
+                    │
+fact scan ──────────┴──► probe dim1 hash table ──► MP: measure output
                                                           │
                                                           ▼
-                                                    complete: 45M rows
+                                                    actual: 50M rows
+                                                    (10x smaller than estimated!)
 ```
 
-**Phase 4: Final join with dim3**
+**Decision Point 1: Next join partner**
 
-Only one option left. Execute and stream to output.
+We now know:
+- |fact ⋈ dim1| = 50M (actual FACT, was estimated 500M with LOW confidence)
+- |dim2| = 100K (catalog stats, HIGH confidence)
+- |dim3| = 1M (catalog stats, HIGH confidence)
+
+Coordinator re-evaluates: with 50M rows (not 500M), cost model picks dim2 next.
+
+**Phase 2: (fact ⋈ dim1) ⋈ dim2 (on-demand build)**
+
+Build dim2 hash table now (not earlier - saves memory):
+
+```
+dim2 scan ──► dim2 build ──► complete: 95K rows ✓
+                    │
+(f⋈d1) output ──────┴──► probe dim2 hash table ──► MP: measure output
+                                                          │
+                                                          ▼
+                                                    actual: 45M rows
+```
+
+**Decision Point 2: Final join**
+
+Only dim3 remains. No decision needed.
+
+**Phase 3: Final join with dim3 (on-demand build)**
+
+Build dim3 hash table, execute final join, stream to output:
+
+```
+dim3 scan ──► dim3 build ──► complete: 1.2M rows ✓
+                    │
+((f⋈d1)⋈d2) ────────┴──► probe dim3 hash table ──► stream to output
+```
 
 ### 5.5 Benefit
 
@@ -427,37 +485,38 @@ Our design:
 
 **Question**: When exactly can we make the variant decision?
 
-**Scenario**:
+With on-demand builds, the timing is simpler:
+
 ```
-Build A completes at T=10s
-Build B completes at T=12s
-Build C completes at T=15s
+Phase 1: Build dim1 → probe fact → MP reports |fact⋈dim1|
+         Decision: which dimension to join next?
 
-We need all of A, B, C complete to make fully informed first join decision.
-But can probe of A start while waiting for B and C?
+Phase 2: Build chosen dimension → probe result → MP reports cardinality
+         Decision: which dimension for final join?
+         (Only 1 choice remaining - no decision needed)
 ```
 
-**Options**:
-1. **Wait for all sibling builds**: Most information, but delays start
-2. **Decide as soon as any build completes**: Less information, earlier start
-3. **Speculative execution**: Start most likely probe, switch if better option emerges
+**Key Insight**: Each decision is made at the materialization point (MP), after the current join completes. We have:
+- Actual cardinality from just-completed join (FACT confidence)
+- Catalog estimates for remaining dimensions (HIGH confidence if available)
 
-**Recommendation**: Start with option 1 (wait for all sibling builds). Simpler, and build times for dimensions are usually fast anyway.
+**No waiting dilemma**: We build one hash table at a time, make a decision at each MP. No parallel builds means no question of "when to decide."
 
-### 7.3 Memory Pressure from Parallel Builds
+### 7.3 First Join Decision with On-Demand Builds
 
-**Question**: Building hash tables for all join candidates in parallel increases peak memory usage. Is this acceptable?
+**Question**: With on-demand builds, how do we make the first join decision (before any join output is observed)?
 
 **Analysis**:
-- For star schemas: dimension tables are typically small (fit in memory)
-- For arbitrary joins: could be multiple large tables
+- For the first join, we only have catalog statistics
+- If catalog stats have HIGH confidence, trust them for the first decision
+- If catalog stats have LOW confidence (missing stats), we may need special handling
 
-**Mitigations**:
-1. Only parallelize builds for tables below size threshold
-2. Spill large builds to disk (existing spill infrastructure)
-3. Limit concurrent builds based on memory budget
+**Options**:
+1. **Trust catalog for base tables**: Assume catalog stats are "good enough" for dimension tables even if marked LOW. Dimension sizing is usually reasonable from catalogs.
+2. **Build smallest estimated dimension first**: Conservative approach - if wrong, limited downside.
+3. **Add table scan statistics**: Extend table scans to report row count before join (minimal overhead).
 
-**Recommendation**: Implement with configurable limit on parallel builds. Default to dimension-table-sized threshold.
+**Recommendation**: Option 2 (build smallest estimated dimension first). This is what static optimization does anyway, and the first join cardinality is typically dominated by fact table selectivity, not dimension choice.
 
 ### 7.4 Number of Variants to Generate
 
@@ -503,38 +562,50 @@ But can probe of A start while waiting for B and C?
 - Pushed to probe-side scans
 - Applied before probe reads data
 
-**With Adaptive Execution**:
-- If we change which build is probed first, different dynamic filters apply
-- The fact table scan might start before we decide join order
-- How to handle dynamic filters for a not-yet-chosen join?
+**With On-Demand Adaptive Execution**:
+- We build dimension hash tables one at a time
+- Each build generates a dynamic filter for its join
+- Filters are applied to the probe side (fact or intermediate result)
 
-**Options**:
-1. **Delay fact scan until decision made**: Simplest, but delays everything
-2. **Apply all dynamic filters**: Collect filters from all builds, intersect them
-3. **No early dynamic filtering**: Only apply after variant selection
+**Interaction**:
+```
+Phase 1: Build dim1 → generates DF1 for d1_key
+         Probe fact with DF1 applied → (fact ⋈ dim1)
 
-**Recommendation**: Option 2 (apply all filters) - dimension builds complete fast, fact scan benefits from all filters regardless of join order chosen.
+Phase 2: Build dim2 → generates DF2 for d2_key
+         Probe (fact ⋈ dim1) with DF2 applied → ((fact ⋈ dim1) ⋈ dim2)
+```
+
+**Observation**: Dynamic filtering works naturally with on-demand builds. Each phase has exactly one build generating one dynamic filter, applied to the current probe side.
+
+**Enhancement Opportunity**: If all dimensions are small and build fast, could generate all dynamic filters upfront and apply intersection to fact scan (separate from adaptive join ordering).
 
 ### 7.7 Cascading Decisions
 
 **Question**: After first join decision, subsequent decisions have different input. How to handle?
 
-**Example**:
+**Example with On-Demand Builds**:
 ```
-Phase 1: fact, dim1, dim2, dim3 builds complete
-Decision 1: fact ⋈ dim1 (now we wait for this to complete)
+Phase 1: Static optimizer picks dim1 first (smallest catalog estimate)
+         Build dim1, execute fact ⋈ dim1
+         MP reports: |fact ⋈ dim1| = 50M (actual)
 
-Phase 2: (fact ⋈ dim1) build completes
-Decision 2: (fact ⋈ dim1) ⋈ ?
-           At this point, dim2 and dim3 builds already done
-           Decision is purely based on cardinalities
+Decision 1: Next join = (fact ⋈ dim1) ⋈ ?
+            Inputs: actual 50M rows, catalog estimates for dim2 (100K), dim3 (1M)
+            → Pick dim2 (smaller remaining dimension)
+
+Phase 2: Build dim2 (on-demand), execute join
+         MP reports: |(fact ⋈ dim1) ⋈ dim2| = 45M
+
+Decision 2: Only dim3 remains
+            → No real decision, proceed with dim3
 ```
 
-**Observation**: This works naturally. Each decision only needs statistics from:
-- Completed builds (available)
-- Not-yet-chosen dimension builds (already complete)
+**Observation**: This works naturally with on-demand builds. Each decision only needs:
+- Actual cardinality from just-completed join (FACT)
+- Catalog estimates for remaining dimensions (HIGH confidence)
 
-No special handling needed for cascading.
+The bottom-up approach means we never need to speculate about future joins.
 
 ### 7.8 Probe-Side Scheduling Delay
 
@@ -719,14 +790,17 @@ adaptive_phased_execution_enabled=true
 # Maximum variants per decision point
 adaptive_max_variants_per_decision=3
 
-# Maximum concurrent parallel builds
-adaptive_max_parallel_builds=10
+# Confidence level threshold for inserting materialization points
+# LOW = insert MP (need runtime measurement)
+# HIGH or FACT = skip MP (trust estimates)
+adaptive_mp_confidence_threshold=LOW
 
-# Memory threshold for parallel builds (bytes)
-adaptive_parallel_build_memory_limit=10GB
-
-# Decision timeout (fall back to default after this)
+# Decision timeout (fall back to static plan after this)
 adaptive_decision_timeout=5s
+
+# Minimum cardinality estimation error ratio to trigger re-ordering
+# e.g., 2.0 means actual must be 2x different from estimate to consider change
+adaptive_reorder_threshold=2.0
 ```
 
 ## Appendix C: Telemetry (Proposed)
@@ -734,8 +808,9 @@ adaptive_decision_timeout=5s
 Metrics to track:
 - `adaptive.decisions.total` - Number of variant decisions made
 - `adaptive.decisions.changed_from_default` - Decisions that differed from static plan
-- `adaptive.build_statistics.reported` - Build completions with statistics
+- `adaptive.materialization_points.hit` - MPs where cardinality was measured
+- `adaptive.cardinality_error_ratio` - Ratio of actual vs estimated cardinality
 - `adaptive.decision_latency_ms` - Time to make each decision
 - `adaptive.variants.activated` - Variants that were executed
 - `adaptive.variants.deactivated` - Variants that were skipped
-- `adaptive.memory.parallel_builds_peak` - Peak memory for concurrent builds
+- `adaptive.query_improvement_ratio` - Performance gain vs static plan (A/B testing)
