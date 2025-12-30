@@ -6,6 +6,7 @@
 **Authors**: Tim Meehan
 **Date**: December 2024
 **Version**: 0.2
+**Runtime**: Velox (C++) only
 
 ---
 
@@ -21,6 +22,8 @@ This document describes the **Adaptive Exchange Framework (AEF)**, a unified app
 6. **Release buffers** and continue streaming execution
 
 This approach provides Axiom-like statistics quality (actual cardinalities, measured join selectivities) without separate pilot queries, using the real query execution as an inline "pilot."
+
+> **Note**: This design targets the Velox (C++) execution engine only. There are no plans to port this functionality to the Java runtime.
 
 ### Why This Approach
 
@@ -977,6 +980,73 @@ adaptive_exchange_reoptimization_timeout=1s
 # Enable global (full query) reoptimization
 adaptive_exchange_global_reoptimization_enabled=true
 ```
+
+### 7.3 Memory Management and Spilling
+
+Adaptive exchange buffers can grow large when upstream stages produce more data than expected. The framework uses Velox's spilling infrastructure to handle memory pressure.
+
+**Current Velox Spilling Status:**
+
+The Velox spilling framework (`velox/exec/Spiller.h`) supports:
+- Hash Aggregation, Order By, Hash Join, TableWriter, RowNumber, TopNRowNumber, Window
+
+The Exchange operator does **not** currently support spilling in core Velox. For adaptive exchanges, we will extend the operator to integrate with the spilling framework.
+
+**Adaptive Exchange Spilling Design:**
+
+```cpp
+class AdaptiveExchangeOperator : public Exchange {
+ public:
+  // Memory reclaim callback for memory arbitration
+  uint64_t reclaim(uint64_t targetBytes, MemoryReclaimer::Stats& stats) override {
+    // Spill buffered pages to disk
+    return spiller_->spill(targetBytes);
+  }
+
+ private:
+  // Buffer for statistics collection
+  std::vector<RowVectorPtr> buffer_;
+
+  // Spiller for memory pressure handling
+  std::unique_ptr<Spiller> spiller_;
+
+  // Row container backing the spiller
+  std::unique_ptr<RowContainer> spillContainer_;
+};
+```
+
+**Spilling Behavior:**
+
+| State | Memory Pressure Response |
+|-------|-------------------------|
+| BUFFERING | Spill oldest pages from buffer to disk |
+| STATS_READY | Spill entire buffer if needed (stats already reported) |
+| STREAMING | Normal Exchange behavior (no buffering) |
+
+**Configuration:**
+
+```properties
+# Enable spilling for adaptive exchange buffers
+adaptive_exchange_spill_enabled=true
+
+# Spill compression codec (ZSTD, LZ4, SNAPPY, NONE)
+adaptive_exchange_spill_compression_codec=ZSTD
+
+# Maximum spill file size
+adaptive_exchange_max_spill_file_size=1GB
+
+# Spill directory (uses Velox spill path by default)
+adaptive_exchange_spill_path=/tmp/presto/spill
+```
+
+**Integration with Memory Arbitration:**
+
+Velox's memory arbitration system will automatically trigger spilling when:
+1. Query memory usage exceeds limits
+2. System-wide memory pressure is detected
+3. Memory reservation fails
+
+The adaptive exchange operator registers with the memory arbitration framework via `MemoryReclaimer`, allowing graceful degradation under memory pressure while preserving correctness.
 
 ---
 
