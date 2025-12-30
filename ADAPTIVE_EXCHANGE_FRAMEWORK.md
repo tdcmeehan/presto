@@ -1027,6 +1027,77 @@ Axiom's approach:
 | Bushy plans | Yes | Limited (depends on cascade depth) |
 | Catches errors early | No (pilots run once) | Yes (build progress monitoring) |
 
+### 8.4 Relationship to Dynamic Partition Pruning (RFC-0022)
+
+The Dynamic Partition Pruning RFC (RFC-0022-dynamic-filtering.md) introduces a **Task Outputs** infrastructure that AEF should leverage:
+
+**Shared Infrastructure:**
+
+| Component | DPP Use | AEF Use |
+|-----------|---------|---------|
+| `outputsVersion` in TaskStatus | Signals filter availability | Signals stats availability |
+| `GET /v1/task/{taskId}/outputs/{version}` | Fetches dynamic filters | Fetches build progress, buffer stats |
+| `outputs_` map in PrestoTask | Stores filter outputs | Stores all output types |
+| `TaskOutputDispatcher` | Routes to LocalDynamicFilter | Routes to JoinOutputEstimator, AdaptiveExchangeCoordinator |
+
+**Output Types:**
+
+The Task Outputs infrastructure uses a typed envelope. DPP defines `dynamicFilter`; AEF will add:
+
+```json
+// Build progress (periodic during hash build)
+{
+  "type": "buildProgress",
+  "planNodeId": "hash_build_1",
+  "payload": {
+    "rowsProcessed": 50000,
+    "projectedTotal": 100000,
+    "distinctKeyCount": 45000,
+    "memoryBytes": 8388608,
+    "fractionComplete": 0.5
+  }
+}
+
+// Buffer statistics (when adaptive exchange buffer fills)
+{
+  "type": "bufferStats",
+  "planNodeId": "exchange_3",
+  "payload": {
+    "rowCount": 100000,
+    "distinctKeyCount": 80000,
+    "skewFactor": 1.2,
+    "topKKeys": [{"key": "BigCorp", "count": 15000}, ...]
+  }
+}
+
+// Probe statistics (after probing hash table with buffer)
+{
+  "type": "probeStats",
+  "planNodeId": "exchange_3",
+  "joinNodeId": "join_1",
+  "payload": {
+    "probeKeysFound": 60000,
+    "totalMatches": 72000,
+    "containment": 0.75,
+    "fanout": 1.2,
+    "projectedJoinOutput": 900000000
+  }
+}
+```
+
+**Implementation Benefit:**
+
+By building on the DPP infrastructure, AEF avoids duplicating:
+- Worker-side output collection and versioning
+- Coordinator-side polling and incremental fetch
+- HTTP endpoint implementation
+- Serialization/deserialization framework
+
+AEF implementation can focus on:
+- New output type definitions and handlers
+- Adaptive decision logic (JoinOutputEstimator, hold signals)
+- Reoptimization triggering and plan modification
+
 ---
 
 ## 9. Implementation Roadmap
