@@ -366,6 +366,114 @@ Caveats:
   - Use as early warning, validate with full probe
 ```
 
+#### Signal 3b: Sketch-Based Early Estimation (Investigation Area)
+
+An alternative to probing the partial hash table is to use **approximate data structures** that can be built incrementally and merged across workers. This enables parallel statistics collection without waiting for build completion.
+
+**Proposed Architecture:**
+
+```
+Build Workers:                          Probe Workers:
+  ┌─────────────────┐                    ┌─────────────────┐
+  │ Bloom Filter    │ ──────┐    ┌────── │ HyperLogLog     │
+  │ (key presence)  │       │    │       │ (probe NDV)     │
+  ├─────────────────┤       │    │       ├─────────────────┤
+  │ Count-Min Sketch│ ──┐   │    │   ┌── │ Key Sample      │
+  │ (key frequency) │   │   │    │   │   │ (reservoir)     │
+  └─────────────────┘   │   │    │   │   └─────────────────┘
+                        │   │    │   │
+                        v   v    v   v
+                    ┌─────────────────────┐
+                    │    Coordinator      │
+                    │  Merge & Estimate   │
+                    └─────────────────────┘
+```
+
+**Build Side Sketch:**
+
+```cpp
+struct BuildSideSketch {
+    BloomFilter keyPresence;      // For containment: "is key present?"
+    CountMinSketch keyFrequency;  // For fanout: "how many rows per key?"
+    HyperLogLog distinctKeys;     // Build NDV estimate
+    uint64_t totalRows;
+};
+
+// Streamable: can send partial sketches during build
+// Mergeable: coordinator combines sketches from all build workers
+```
+
+**Probe Side Sketch:**
+
+```cpp
+struct ProbeSideSketch {
+    HyperLogLog distinctKeys;           // Probe NDV estimate
+    std::vector<uint64_t> keySample;    // Reservoir sample of key hashes
+    uint64_t totalRows;
+};
+```
+
+**Coordinator Estimation:**
+
+```cpp
+EstimateResult estimateFromSketches(BuildSideSketch& build, ProbeSideSketch& probe) {
+    uint64_t keysFound = 0;
+    uint64_t totalFanout = 0;
+
+    for (auto& keyHash : probe.keySample) {
+        if (build.keyPresence.mayContain(keyHash)) {
+            keysFound++;
+            totalFanout += build.keyFrequency.estimate(keyHash);
+        }
+    }
+
+    double rawContainment = (double)keysFound / probe.keySample.size();
+    double containment = adjustForBloomFPR(rawContainment, build.keyPresence.fpr());
+    double fanout = keysFound > 0 ? (double)totalFanout / keysFound : 0;
+
+    return {containment, fanout, computeConfidenceInterval(...)};
+}
+```
+
+**Alternative: Theta Sketch for Set Intersection**
+
+[Apache DataSketches Theta Sketches](https://datasketches.apache.org/docs/Theta/ThetaSketchFramework.html) support set intersection directly:
+
+```cpp
+// Both sides send Theta Sketches of their key sets
+ThetaSketch buildKeys = ...;   // Mergeable across build workers
+ThetaSketch probeKeys = ...;   // Mergeable across probe workers
+
+// Coordinator computes intersection estimate
+ThetaSketch intersection = ThetaIntersection(buildKeys, probeKeys);
+double containment = intersection.estimate() / probeKeys.estimate();
+
+// Limitation: Theta Sketch doesn't track duplicates, so no fanout estimate
+// Would need Count-Min Sketch or similar for fanout
+```
+
+**Research Questions:**
+
+| Question | Notes |
+|----------|-------|
+| What's the right sketch for fanout? | Count-Min Sketch overestimates; need error bounds |
+| What sample size for probe keys? | Trade-off between accuracy and network overhead |
+| How to bound estimation error? | Need confidence intervals for reoptimization threshold |
+| Does Bloom filter FPR adjustment work? | `true_containment ≈ (measured - FPR) / (1 - FPR)` |
+| Accuracy after merging across workers? | Sketches are mergeable but error may compound |
+
+**Comparison: Partial Hash Table vs Sketches**
+
+| Aspect | Partial Hash Table Probe | Sketch-Based |
+|--------|-------------------------|--------------|
+| Timing | After partial build | Parallel with both sides |
+| Build ordering sensitivity | High (biased if sorted) | None (sketches are order-independent) |
+| Network overhead | None (local probe) | Sketch transmission |
+| Fanout accuracy | Exact for matched keys | Approximate (CMS error) |
+| Implementation complexity | Low | Medium |
+
+**Recommendation:** Start with partial hash table probe (Signal 3) for simplicity. Investigate sketch-based approach as enhancement for cases where build ordering causes bias or earlier estimates are valuable.
+
 #### Signal 4: Actual Output (During Probe, Exact)
 
 As the join executes, track actual output rows:
@@ -1847,6 +1955,36 @@ The section boundary approach naturally provides "downstream-only" reoptimizatio
 - Single large file: May not have progress until near completion
 
 **Recommendation**: Use split progress when available, byte progress as fallback, disable early detection when neither available.
+
+### 11.7 Sketch-Based Selectivity Estimation
+
+**Question**: Can approximate data structures (sketches) provide accurate early estimates of containment and fanout without waiting for build completion?
+
+**Motivation**: The current design waits for hash table completion before measuring selectivity via buffer probing. This delays reoptimization decisions. Sketches could enable parallel statistics collection from both sides.
+
+**Candidate Data Structures**:
+
+| Structure | Purpose | Pros | Cons |
+|-----------|---------|------|------|
+| Bloom Filter | Key presence (containment) | Fast, compact, mergeable | False positives inflate estimate |
+| Count-Min Sketch | Key frequency (fanout) | Mergeable, streaming | Overestimates frequencies |
+| Theta Sketch | Set intersection | Direct intersection estimate | No duplicate tracking (no fanout) |
+| HyperLogLog | NDV estimation | Very compact, mergeable | Already used for NDV |
+
+**Research Tasks**:
+1. Prototype Bloom + Count-Min Sketch approach
+2. Measure estimation error vs hash table probe ground truth
+3. Determine minimum sample sizes for acceptable accuracy
+4. Evaluate Theta Sketch for containment-only estimation
+5. Test accuracy after merging sketches from multiple workers
+
+**Success Criteria**:
+- Containment estimate within 20% of true value
+- Fanout estimate within 30% of true value
+- Sketch size < 1MB per worker
+- End-to-end latency reduction vs waiting for build
+
+**Recommendation**: Investigate as Phase 5+ enhancement. The partial hash table probe (Signal 3) is simpler and may be sufficient for most cases.
 
 ---
 
