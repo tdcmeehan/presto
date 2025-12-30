@@ -989,8 +989,11 @@ Adaptive exchange buffers can grow large when upstream stages produce more data 
 
 The Velox spilling framework (`velox/exec/Spiller.h`) supports:
 - Hash Aggregation, Order By, Hash Join, TableWriter, RowNumber, TopNRowNumber, Window
+- **LocalMerge/MergeExchange** - Added in 2025, uses `SpillMerger` for async spill merge (PR #13337)
+- **OutputBuffer** - PageSpill support added (PR #13305)
+- **Local Exchange** - Buffering support added (PR #13234)
 
-The Exchange operator does **not** currently support spilling in core Velox. For adaptive exchanges, we will extend the operator to integrate with the spilling framework.
+Recent Velox work (May-June 2025) has added spilling infrastructure for exchange-related operators. The adaptive exchange can leverage this existing infrastructure.
 
 **Adaptive Exchange Spilling Design:**
 
