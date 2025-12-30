@@ -1108,262 +1108,193 @@ runtimeBuilder.add(new IterativeOptimizer(
 
 `RuntimeReorderJoinSides` compares output sizes and swaps join sides if beneficial. This works immediately with AEF once we feed stats into `FragmentStatsProvider`.
 
-### 8.5 Plan Propagation Mechanics
+### 8.5 Adaptive Exchanges as Section Boundaries
 
-A critical difference between materialized and streaming exchanges is when reoptimization occurs relative to task scheduling.
+A key architectural insight simplifies the entire plan propagation problem: **treat adaptive exchanges as section boundaries**, just like materialized exchanges.
 
-**Materialized Exchanges (Current)**:
-- `isReadyForExecution()` returns `true` only when child sections are `FINISHED`
-- `tryCostBasedOptimize()` runs BEFORE any tasks are scheduled for the section
-- `updateStageExecutions()` creates fresh stage executions with no running tasks
-- No tasks to cancel, no shuffle links to update
+#### 8.5.1 The Section Model
 
-**Streaming Exchanges (AEF)**:
-- Stages may already be RUNNING when reoptimization is triggered
-- Need to handle running tasks, in-flight data, and existing shuffle links
-
-#### 8.5.1 Key Infrastructure Components
-
-From the existing codebase:
+Presto already has the concept of **Sections** (see `StreamingPlanSection`):
 
 ```java
-// StageLinkage - manages exchange connections between stages
-public class StageLinkage {
-    void processScheduleResults(StageExecutionState newState, Set<RemoteTask> newTasks) {
-        // Notify parent of new tasks (for shuffle links)
-        parent.addExchangeLocations(currentStageFragmentId, newTasks, noMoreTasks);
-
-        // Update child output buffers for new consuming tasks
-        for (OutputBufferManager child : childOutputBufferManagers) {
-            child.addOutputBuffers(newOutputBuffers, noMoreTasks);
+// Current section extraction - splits at materialized exchanges
+public static StreamingPlanSection extractStreamingSections(SubPlan subPlan) {
+    // Children not in streamingFragmentIds become separate sections
+    for (SubPlan child : subPlan.getChildren()) {
+        if (streamingFragmentIds.contains(child.getFragment().getId())) {
+            streamingSources.add(...);  // Same section, streaming
+        } else {
+            materializedExchangeChildren.add(child);  // Different section
         }
     }
 }
 
-// SqlStageExecution - how shuffle links are established
-void addExchangeLocations(PlanFragmentId fragmentId, Set<RemoteTask> sourceTasks, ...) {
-    for (RemoteTask task : getAllTasks()) {
-        for (RemoteTask sourceTask : sourceTasks) {
-            // Create RemoteSplit pointing to source task's output buffer
-            newSplits.put(remoteSource.getId(),
-                createRemoteSplitFor(task.getTaskId(),
-                    sourceTask.getRemoteTaskLocation(),
-                    sourceTask.getTaskId()));
+// Section scheduling - waits for child sections before starting
+private boolean isReadyForExecution(StreamingPlanSection section) {
+    for (StreamingPlanSection child : section.getChildren()) {
+        if (rootStageExecution.getState() != FINISHED) {
+            return false;  // Child section not complete
         }
-        task.addSplits(newSplits.build());
+    }
+    return true;  // All children done, can schedule this section
+}
+```
+
+**Key insight**: Materialized exchange sections work seamlessly with reoptimization because `tryCostBasedOptimize()` runs BEFORE scheduling. No running tasks, no complexity.
+
+#### 8.5.2 Adaptive Exchanges as Section Boundaries
+
+Instead of complex hold/release protocols with running tasks, we treat adaptive exchanges like materialized exchanges for scheduling purposes:
+
+```java
+// Extended Scope enum
+public enum Scope {
+    LOCAL(false),
+    REMOTE_STREAMING(true),
+    REMOTE_MATERIALIZED(true),
+    REMOTE_ADAPTIVE(true),     // NEW: creates section boundary like materialized
+}
+```
+
+**Modified section extraction:**
+```java
+// extractStreamingSections treats REMOTE_ADAPTIVE like REMOTE_MATERIALIZED
+for (SubPlan child : subPlan.getChildren()) {
+    ExchangeNode.Scope scope = getExchangeScope(child);
+    if (scope == REMOTE_STREAMING) {
+        streamingSources.add(...);  // Same section
+    } else {
+        // REMOTE_MATERIALIZED or REMOTE_ADAPTIVE -> separate section
+        sectionBoundaryChildren.add(child);
     }
 }
-
-// How RemoteSplits work
-private static Split createRemoteSplitFor(TaskId taskId, URI remoteSourceTaskLocation, ...) {
-    // Points to: <remoteSourceTaskLocation>/results/<taskId>
-    String splitLocation = remoteSourceTaskLocation.toASCIIString() + "/results/" + taskId.getId();
-    return new Split(REMOTE_CONNECTOR_ID, new RemoteSplit(new Location(splitLocation), ...));
-}
 ```
 
-#### 8.5.2 Reoptimization Scenarios
-
-When reoptimization occurs with streaming exchanges:
-
-**Scenario 1: Join Side Swap (RuntimeReorderJoinSides)**
-
-```
-Before:  Probe(A) --shuffle--> Join <--shuffle-- Build(B)
-After:   Probe(B) --shuffle--> Join <--shuffle-- Build(A)
-```
-
-Impact:
-- **Upstream stages (A, B)**: Continue running unchanged
-- **Join stage**: Needs new fragment with swapped join
-- **Shuffle links**: Exchange operators in join stage need to read from opposite upstream tasks
-
-**Scenario 2: Distribution Change (RuntimeSwitchJoinDistribution)**
-
-```
-Before:  A --partitioned shuffle--> Join <--partitioned shuffle-- B
-After:   A --partitioned shuffle--> Join <--broadcast-- B (B is small)
-```
-
-Impact:
-- **Upstream stage A**: Continue unchanged
-- **Upstream stage B**: May need different output buffering (broadcast vs partitioned)
-- **Join stage**: New fragment, different parallelism
-
-**Scenario 3: Parallelism Adjustment (RuntimeAdjustParallelism)**
-
-```
-Before:  Source --shuffle(100 partitions)--> Aggregate
-After:   Source --shuffle(10 partitions)--> Aggregate (data much smaller than expected)
-```
-
-Impact:
-- **Source stage**: Continue running, but output buffers change
-- **Aggregate stage**: Fewer tasks, different node assignment
-
-#### 8.5.3 Plan Propagation Protocol
-
-The protocol has three phases:
-
-**Phase 1: Hold and Drain**
+**Modified readiness check:**
 ```java
-// Coordinator sends hold to adaptive exchanges in affected stages
-void initiateReoptimization(StreamingPlanSection section) {
-    Set<PlanNodeId> adaptiveExchanges = findAdaptiveExchanges(section);
-    for (PlanNodeId exchangeId : adaptiveExchanges) {
-        sendHold(exchangeId);  // Via TaskInput
+private boolean isReadyForExecution(StreamingPlanSection section) {
+    for (StreamingPlanSection child : section.getChildren()) {
+        if (isAdaptiveSection(child)) {
+            // Adaptive: ready when buffer filled and stats collected
+            if (!adaptiveStatsReady(child)) {
+                return false;
+            }
+        } else {
+            // Materialized: ready when fully finished
+            if (rootStageExecution.getState() != FINISHED) {
+                return false;
+            }
+        }
     }
-
-    // Wait for hold acknowledgment
-    // Exchanges stop accepting new data, drain in-flight pages
-    waitForHoldAcknowledgment(adaptiveExchanges);
+    return true;
 }
 ```
 
-**Phase 2: Apply Plan Changes**
+#### 8.5.3 Why This Simplifies Everything
+
+| Aspect | Hold/Release Approach | Section Boundary Approach |
+|--------|----------------------|--------------------------|
+| Running tasks to cancel | Yes, complex | No, section not started |
+| Shuffle link rewiring | Yes, while running | No, fresh start |
+| Data consistency | Complex protocol | Trivial (data buffered) |
+| Code changes | Significant | Minimal |
+| Reuse of existing infra | Partial | Complete |
+
+**The section boundary approach means:**
+
+1. **No running tasks in downstream section** - it hasn't started yet
+2. **`tryCostBasedOptimize()` works unchanged** - runs before scheduling
+3. **`updateStageExecutions()` works unchanged** - creates fresh executions
+4. **Shuffle links established normally** - via existing `StageLinkage`
+
+#### 8.5.4 Execution Flow
+
+```
+Timeline with Section Boundaries:
+
+1. [Section 1 executes]
+   - Source stages run, produce data
+   - Adaptive exchange buffers first N rows
+   - Stats reported via TaskOutput
+
+2. [Section 1 signals STATS_READY]
+   - Not FINISHED (still has buffered + incoming data)
+   - But stats are available for optimization
+
+3. [Coordinator checks isReadyForExecution(Section 2)]
+   - Child section (Section 1) is STATS_READY
+   - Returns true for adaptive sections
+
+4. [tryCostBasedOptimize(Section 2)]
+   - Existing method, no changes
+   - Uses stats from FragmentStatsProvider
+   - May swap join sides, change distribution, etc.
+
+5. [Schedule Section 2]
+   - Fresh stage executions created
+   - Shuffle links wired to Section 1 tasks
+   - Section 1 releases buffer, streams remaining data
+```
+
+#### 8.5.5 Comparison with Materialized Exchanges
+
+| Aspect | Materialized | Adaptive |
+|--------|-------------|----------|
+| Section boundary | Yes | Yes |
+| Wait condition | FINISHED | STATS_READY |
+| Data storage | Full materialization to temp table | Buffer first N rows in memory |
+| Memory usage | Bounded by temp table | Bounded by buffer size config |
+| Latency | Wait for all data | Wait for buffer fill only |
+| Streaming preserved | No (stage-based) | Yes (after buffer) |
+
+**Key difference**: Materialized exchanges wait for ALL data and write to storage. Adaptive exchanges only buffer enough for statistics, then stream.
+
+#### 8.5.6 Plan Propagation is Trivial
+
+Because the downstream section hasn't started:
+
 ```java
-void applyPlanChanges(Map<PlanFragment, PlanFragment> oldToNewFragment) {
-    // 1. Update coordinator's view of the plan
+// After optimization, same flow as materialized exchanges
+StreamingPlanSection optimizedSection = tryCostBasedOptimize(section);
+
+if (planChanged) {
+    // Update plan (coordinator view)
     updatePlan(oldToNewFragment);
 
-    // 2. For each changed stage, cancel old tasks
-    for (PlanFragment oldFragment : oldToNewFragment.keySet()) {
-        StageExecutionAndScheduler oldExecution = stageExecutions.get(getStageId(oldFragment.getId()));
-        oldExecution.getStageExecution().cancel();  // Graceful cancel
-    }
+    // Create stage executions with new fragments
+    updateStageExecutions(section, oldToNewFragment);
+}
 
-    // 3. Create new stage executions (existing infrastructure)
-    StreamingPlanSection newSection = rebuildSection(section, oldToNewFragment);
-    SectionExecution newExecution = sectionExecutionFactory.createSectionExecutions(
-        session, newSection, ...);
+// Schedule normally - shuffle links established via StageLinkage
+scheduleSection(optimizedSection);
+```
 
-    // 4. Update stageExecutions map
-    stageExecutions.putAll(newExecution.getSectionStages()...);
+No special handling for:
+- Cancelling running tasks (none exist)
+- Rewiring shuffle links (fresh setup)
+- Draining in-flight data (buffered at exchange)
+- Output buffer management (normal flow)
+
+#### 8.5.7 Adaptive Section States
+
+```java
+enum AdaptiveSectionState {
+    EXECUTING,      // Section running, buffer filling
+    STATS_READY,    // Buffer full, stats reported, awaiting downstream
+    STREAMING,      // Downstream scheduled, releasing buffer + streaming
+    FINISHED        // All data sent
 }
 ```
 
-**Phase 3: Establish New Shuffle Links**
+The coordinator tracks this state and uses it in `isReadyForExecution()`:
+
 ```java
-void establishShuffleLinks(SectionExecution newExecution) {
-    for (StageExecutionAndScheduler stageInfo : newExecution.getSectionStages()) {
-        SqlStageExecution stageExecution = stageInfo.getStageExecution();
-
-        // Find upstream stages (unchanged, still running)
-        for (RemoteSourceNode remoteSource : stageExecution.getFragment().getRemoteSourceNodes()) {
-            PlanFragmentId upstreamFragmentId = remoteSource.getSourceFragmentIds().get(0);
-            SqlStageExecution upstreamStage = getStageExecution(upstreamFragmentId);
-
-            // Get existing tasks from upstream (already running)
-            Set<RemoteTask> upstreamTasks = upstreamStage.getAllTasks();
-
-            // Add exchange locations for new consuming tasks
-            stageExecution.addExchangeLocations(upstreamFragmentId, upstreamTasks, /*noMore=*/true);
-        }
-    }
-
-    // Release holds - exchanges resume flowing data to new tasks
-    sendRelease(adaptiveExchanges);
+boolean adaptiveStatsReady(StreamingPlanSection section) {
+    return getAdaptiveSectionState(section) == STATS_READY
+        || getAdaptiveSectionState(section) == STREAMING
+        || getAdaptiveSectionState(section) == FINISHED;
 }
 ```
-
-#### 8.5.4 Handling Unchanged Upstream Stages
-
-When reoptimization changes a consuming stage but not its producers:
-
-```
-Scenario: Join side swap, but Source stages A and B are unchanged
-
-Before:
-  Source_A (tasks: a1, a2, a3) --shuffle--> [old Join tasks: j1, j2] <--shuffle-- Source_B (tasks: b1, b2)
-
-After optimization (join swapped):
-  Source_A (tasks: a1, a2, a3) --shuffle--> [new Join tasks: j1', j2'] <--shuffle-- Source_B (tasks: b1, b2)
-                                  ^                                       ^
-                                  |                                       |
-                          RemoteSplits point to same a1,a2,a3 but different exchange config
-```
-
-The key insight is that `addExchangeLocations()` is designed to handle incremental updates:
-
-1. New join tasks (j1', j2') are created with the swapped plan fragment
-2. `addExchangeLocations()` is called with existing upstream tasks (a1,a2,a3 and b1,b2)
-3. Each new join task gets `RemoteSplit` objects pointing to ALL upstream task buffers
-4. But the join operator now reads probe from the opposite side
-
-```java
-// In new join task j1':
-// Before swap: Probe reads from Source_A buffers, Build reads from Source_B buffers
-// After swap:  Probe reads from Source_B buffers, Build reads from Source_A buffers
-//
-// The RemoteSplits are the same - what changes is which RemoteSourceNode
-// each join input (probe vs build) is connected to.
-```
-
-#### 8.5.5 Handling Output Buffers in Upstream Stages
-
-When creating new consuming tasks, upstream stages need to know about them:
-
-```java
-// In StageLinkage.processScheduleResults()
-void processScheduleResults(StageExecutionState newState, Set<RemoteTask> newTasks) {
-    // ...
-    // Add output buffers to upstream stages for each new consumer
-    List<OutputBufferId> newOutputBuffers = newTasks.stream()
-        .map(task -> new OutputBufferId(task.getTaskId().getId()))
-        .collect(toImmutableList());
-
-    for (OutputBufferManager child : childOutputBufferManagers) {
-        child.addOutputBuffers(newOutputBuffers, noMoreTasks);
-    }
-}
-```
-
-For reoptimization, we need to:
-1. Add new output buffers to unchanged upstream stages
-2. Remove old output buffers (or let them drain naturally)
-
-```java
-// Extension for reoptimization
-void updateOutputBuffersForReoptimization(
-        SqlStageExecution upstreamStage,
-        Set<TaskId> oldConsumerTasks,
-        Set<TaskId> newConsumerTasks) {
-
-    // Old buffers: will drain and complete naturally as old tasks are cancelled
-    // New buffers: add for new consuming tasks
-    List<OutputBufferId> newBuffers = newConsumerTasks.stream()
-        .map(taskId -> new OutputBufferId(taskId.getId()))
-        .collect(toImmutableList());
-
-    upstreamStage.addOutputBuffers(newBuffers);
-}
-```
-
-#### 8.5.6 Data Consistency During Transition
-
-The hold/release protocol ensures data consistency:
-
-```
-Timeline:
-1. [Hold Signal]     Adaptive exchanges stop accepting new data
-2. [Drain]           In-flight pages are processed and buffered
-3. [Cancel Old]      Old tasks cancelled (buffers discarded)
-4. [Create New]      New tasks created with updated plan
-5. [Wire Shuffles]   New tasks connected to upstream buffers
-6. [Release Signal]  Exchanges resume, data flows to new tasks
-
-Critical invariant: No data is lost because:
-- Exchanges buffer until hold is acknowledged
-- Old tasks are cancelled AFTER new tasks are wired
-- Upstream tasks maintain data until new consumers are ready
-```
-
-**Edge case: Data already sent to old tasks**
-
-Data that was already read by old tasks before hold is NOT re-sent. This is acceptable because:
-1. The buffer sample (used for statistics) represents a small fraction of total data
-2. For correctness, we use "downstream-only" reoptimization (see Section 11.3)
-3. Future enhancement: checkpoint and replay for more aggressive reoptimization
 
 ---
 
@@ -1480,72 +1411,87 @@ void onExchangeStats(ExchangeStatsOutput stats) {
 **What Works After Phase 1:**
 - Earlier deviation detection (don't wait for full build)
 - Join side swapping based on exchange buffer stats
-- Still no hold/release (optimistic approach)
+- Stats feed into section readiness check (preparation for Phase 2)
 
-### Phase 2: Hold/Release Protocol
+### Phase 2: Section Boundary Integration
 
-**Goal**: Pause execution to allow plan changes before data flows past decision point.
+**Goal**: Integrate adaptive exchanges as section boundaries for clean reoptimization.
 
 **Changes:**
 
-1. **TaskInput for hold/release**:
+1. **Add REMOTE_ADAPTIVE scope**:
 ```java
-@JsonSubTypes({
-    @JsonSubTypes.Type(value = DynamicFilterInput.class, name = "dynamicFilter"),
-    @JsonSubTypes.Type(value = HoldSignalInput.class, name = "hold"),
-    @JsonSubTypes.Type(value = ReleaseSignalInput.class, name = "release"),
-    @JsonSubTypes.Type(value = PlanUpdateInput.class, name = "planUpdate")})
-public interface TaskInput { ... }
-
-public class HoldSignalInput implements TaskInput {
-    private final PlanNodeId exchangeId;
-    private final String reason;
-}
-
-public class ReleaseSignalInput implements TaskInput {
-    private final PlanNodeId exchangeId;
-    private final boolean continueAsPlanned;
+// ExchangeNode.java
+public enum Scope {
+    LOCAL(false),
+    REMOTE_STREAMING(true),
+    REMOTE_MATERIALIZED(true),
+    REMOTE_ADAPTIVE(true),     // NEW
 }
 ```
 
-2. **Adaptive exchange state machine**:
+2. **Modify section extraction**:
 ```java
-enum AdaptiveExchangeState {
-    BUFFERING,    // Collecting initial buffer
-    REPORTING,    // Sent stats, awaiting decision
-    HELD,         // Received hold, paused
-    FLOWING,      // Released, normal operation
+// StreamingPlanSection.java - treat REMOTE_ADAPTIVE as section boundary
+private static StreamingSubPlan extractStreamingSection(SubPlan subPlan, ...) {
+    for (SubPlan child : subPlan.getChildren()) {
+        ExchangeNode.Scope scope = getExchangeScope(subPlan.getFragment(), child.getFragment());
+        if (scope == REMOTE_STREAMING) {
+            streamingSources.add(extractStreamingSection(child, ...));
+        } else {
+            // REMOTE_MATERIALIZED or REMOTE_ADAPTIVE
+            sectionBoundaryChildren.add(child);
+        }
+    }
 }
 ```
 
-3. **Coordinator hold logic**:
+3. **Modify readiness check**:
 ```java
-void onExchangeStats(ExchangeStatsOutput stats) {
-    if (shouldWaitForMoreStats(stats)) {
-        sendHold(stats.getPlanNodeId());
-        pendingDecisions.add(stats.getPlanNodeId());
-    } else {
-        makeDecision(stats.getPlanNodeId());
+// SqlQueryScheduler.java
+private boolean isReadyForExecution(StreamingPlanSection section) {
+    for (StreamingPlanSection child : section.getChildren()) {
+        if (isAdaptiveSection(child)) {
+            // Adaptive: ready when stats collected (STATS_READY state)
+            if (!adaptiveStatsReady(child)) {
+                return false;
+            }
+        } else {
+            // Materialized: ready when FINISHED
+            if (getStageExecution(child).getState() != FINISHED) {
+                return false;
+            }
+        }
     }
+    return true;
+}
+```
+
+4. **Add adaptive section state tracking**:
+```java
+// New: track adaptive section state in SqlQueryScheduler
+private final Map<PlanFragmentId, AdaptiveSectionState> adaptiveSectionStates = new ConcurrentHashMap<>();
+
+enum AdaptiveSectionState {
+    EXECUTING,      // Buffer filling
+    STATS_READY,    // Stats reported, waiting for downstream
+    STREAMING,      // Downstream started, releasing buffer
+    FINISHED
 }
 
-void makeDecision(PlanNodeId exchangeId) {
-    // Reoptimize with current stats
-    StreamingPlanSection section = getSectionContaining(exchangeId);
-    StreamingPlanSection optimized = tryCostBasedOptimize(section);
-
-    if (planChanged(section, optimized)) {
-        // Send new plan fragment
-        sendPlanUpdate(exchangeId, getNewFragment(optimized));
-    }
-    sendRelease(exchangeId);
+void onAdaptiveStatsReported(PlanFragmentId fragmentId) {
+    adaptiveSectionStates.put(fragmentId, STATS_READY);
+    // Check if any downstream sections can now start
+    startScheduling();
 }
 ```
 
 **What Works After Phase 2:**
-- Guaranteed reoptimization before data flows downstream
-- Can change join sides with correct data routing
-- Foundation for more complex plan changes
+- Adaptive exchanges create natural synchronization points
+- Downstream sections wait for stats before scheduling
+- `tryCostBasedOptimize()` runs before any downstream tasks exist
+- No running tasks to cancel, no shuffle links to rewire
+- Existing infrastructure (StageLinkage, updateStageExecutions) works unchanged
 
 ### Phase 3: Additional Runtime Optimizer Rules
 
@@ -1699,27 +1645,29 @@ public class RuntimeReorderJoins implements Rule<JoinNode> {
 
 **Recommendation**: Start with first-N, add reservoir sampling as enhancement.
 
-### 11.2 Cascading Hold Deadlocks
+### 11.2 Section Scheduling Deadlocks
 
-**Question**: Could cascading holds cause deadlocks?
+**Question**: Could section dependencies cause deadlocks?
 
-**Analysis**:
-- Holds only cascade upstream
-- No cycles in data flow graph
-- Therefore, no deadlock possible
+**Analysis**: No, because:
+- Sections form a DAG (directed acyclic graph)
+- A section only waits for its child sections (data dependencies)
+- Child sections never wait for parent sections
+- Therefore, no circular wait is possible
 
-**Mitigation**: Implement timeout-based release as safety net.
+**Note**: The section-based approach eliminates the hold/release protocol complexity. Sections naturally wait for their inputs to be ready (STATS_READY for adaptive, FINISHED for materialized) without explicit coordination messages.
 
 ### 11.3 Partial Reoptimization Complexity
 
 **Question**: How to handle reoptimization when some operators have already executed?
 
-**Options**:
-1. **Downstream-only**: Only reoptimize operators that haven't started
-2. **Restart**: Cancel and restart affected subplans (expensive)
-3. **Incremental**: Keep completed work, reoptimize remainder
+**Resolution (Section-Based Approach)**: This complexity is largely eliminated by treating adaptive exchanges as section boundaries:
 
-**Recommendation**: Start with downstream-only, add restart for extreme deviations.
+1. **Downstream sections haven't started** - When reoptimization occurs, the consuming section is still in PLANNED state
+2. **Upstream sections continue unchanged** - Only the plan for the not-yet-scheduled section is modified
+3. **No restart needed** - Fresh scheduling of the optimized section
+
+The section boundary approach naturally provides "downstream-only" reoptimization without any special handling. The only consideration is that upstream sections (which have already started) cannot be reoptimized—but their stats are the input to optimization, so this is the correct behavior.
 
 ### 11.4 Multi-Query Interaction
 
