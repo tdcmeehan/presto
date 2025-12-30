@@ -375,19 +375,27 @@ An alternative to probing the partial hash table is to use **approximate data st
 ```
 Build Workers:                          Probe Workers:
   ┌─────────────────┐                    ┌─────────────────┐
-  │ Bloom Filter    │ ──────┐    ┌────── │ HyperLogLog     │
-  │ (key presence)  │       │    │       │ (probe NDV)     │
-  ├─────────────────┤       │    │       ├─────────────────┤
-  │ Count-Min Sketch│ ──┐   │    │   ┌── │ Key Sample      │
-  │ (key frequency) │   │   │    │   │   │ (reservoir)     │
-  └─────────────────┘   │   │    │   │   └─────────────────┘
-                        │   │    │   │
-                        v   v    v   v
+  │  HashBuild Op   │                    │ AdaptiveExchange│
+  │  ┌───────────┐  │                    │  ┌───────────┐  │
+  │  │Bloom Filt │  │ ──────┐    ┌────── │  │HyperLogLog│  │
+  │  │Count-Min  │  │       │    │       │  │Key Sample │  │
+  │  └───────────┘  │       │    │       │  └───────────┘  │
+  └─────────────────┘       │    │       └─────────────────┘
+          │                 │    │               │
+          │ TaskOutput      │    │   TaskOutput  │
+          v                 v    v               v
                     ┌─────────────────────┐
                     │    Coordinator      │
                     │  Merge & Estimate   │
                     └─────────────────────┘
 ```
+
+**Component Responsibilities:**
+
+| Component | Sketches Built | When Sent |
+|-----------|---------------|-----------|
+| Hash Build Operator | Bloom filter, Count-Min Sketch, HyperLogLog (build NDV) | Periodically during build, or at completion |
+| Adaptive Exchange | HyperLogLog (probe NDV), reservoir sample of key hashes | When buffer fills (with other buffer stats) |
 
 **Build Side Sketch:**
 
