@@ -408,10 +408,27 @@ struct BuildSideSketch {
 ```cpp
 struct ProbeSideSketch {
     HyperLogLog distinctKeys;           // Probe NDV estimate
-    std::vector<uint64_t> keySample;    // Reservoir sample of key hashes
+    std::vector<SerializedKey> keySample;  // Reservoir sample of actual key values
     uint64_t totalRows;
 };
+
+// Alternative: use consistent hashing across all workers
+struct ProbeSideSketchHashed {
+    HyperLogLog distinctKeys;
+    std::vector<uint64_t> keyHashes;    // xxhash64 of serialized keys
+    uint64_t totalRows;
+};
+// Requires: Build side Bloom/CMS also built with xxhash64(serialize(key))
 ```
+
+**Key Representation Trade-off:**
+
+| Approach | Payload Size | Complexity | Accuracy |
+|----------|--------------|------------|----------|
+| Actual keys | Variable (depends on key type) | Low | Exact |
+| Consistent hashes | Fixed 8 bytes/key | Medium (hash consistency) | Slight collision risk |
+
+For composite or string keys, consistent hashing reduces payload significantly. For integer keys, sending actual values is simpler.
 
 **Coordinator Estimation:**
 
