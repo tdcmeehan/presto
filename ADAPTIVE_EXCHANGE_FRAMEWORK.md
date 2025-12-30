@@ -1027,87 +1027,379 @@ Axiom's approach:
 | Bushy plans | Yes | Limited (depends on cascade depth) |
 | Catches errors early | No (pilots run once) | Yes (build progress monitoring) |
 
+### 8.4 Building on Existing Infrastructure
+
+Presto already has runtime reoptimization infrastructure for materialized exchanges. AEF builds on this foundation rather than creating parallel systems.
+
+**Existing Components (in `SqlQueryScheduler`):**
+
+| Component | Current Use | AEF Use |
+|-----------|-------------|---------|
+| `FragmentStatsProvider` | Stores stats from completed materialized exchanges | Stores stats from `TaskOutput` |
+| `runtimePlanOptimizers` | List of optimizers to apply at runtime | Same, with additional rules |
+| `performRuntimeOptimizations()` | Applies optimizers to plan fragments | Same method, no changes |
+| `updateStageExecutions()` | Rebuilds stage executions after plan change | Same method, no changes |
+| `tryCostBasedOptimize()` | Entry point for runtime optimization | New trigger, same flow |
+
+**Current Trigger (Materialized Exchanges):**
+
+```java
+// SqlQueryScheduler.java - current flow
+private boolean isReadyForExecution(StreamingPlanSection section) {
+    for (StreamingPlanSection child : section.getChildren()) {
+        if (rootStageExecution.getState() != FINISHED) {
+            return false;  // Wait for materialized exchange to complete
+        }
+    }
+    return true;
+}
+
+// When ready, optimize and execute
+sectionsReadyForExecution()
+    .filter(this::isReadyForExecution)
+    .map(this::tryCostBasedOptimize)  // Apply runtimePlanOptimizers
+    ...
+```
+
+**New Trigger (Streaming with TaskOutput):**
+
+```java
+// New flow for streaming exchanges
+void onTaskOutputReceived(TaskId taskId, TaskOutput output) {
+    if (output instanceof StatsOutput) {
+        StatsOutput stats = (StatsOutput) output;
+
+        // Feed stats into existing infrastructure
+        fragmentStatsProvider.putStats(
+            queryId,
+            stats.getPlanNodeId(),
+            convertToStatsEstimate(stats));
+
+        // Check if we should reoptimize
+        if (shouldTriggerReoptimization(stats)) {
+            // Use existing reoptimization flow
+            StreamingPlanSection section = getSectionFor(stats.getPlanNodeId());
+            tryCostBasedOptimize(section);
+        }
+    }
+}
+```
+
+**Key Insight: Same Reoptimization, Different Trigger**
+
+The reoptimization logic (`performRuntimeOptimizations`, `updateStageExecutions`) doesn't care whether stats came from:
+- A completed materialized exchange (current)
+- A `TaskOutput` from an adaptive exchange (AEF)
+
+We just need to:
+1. Feed `TaskOutput` stats into `FragmentStatsProvider`
+2. Provide a new trigger mechanism (stats received vs. section finished)
+3. Add hold/release coordination for streaming
+
+**Current Runtime Optimizer:**
+
+```java
+// PlanOptimizers.java - only one rule today
+runtimeBuilder.add(new IterativeOptimizer(
+    metadata, ruleStats, statsCalculator, costCalculator,
+    ImmutableList.of(),
+    ImmutableSet.of(new RuntimeReorderJoinSides(...))));  // Just join side swap
+```
+
+`RuntimeReorderJoinSides` compares output sizes and swaps join sides if beneficial. This works immediately with AEF once we feed stats into `FragmentStatsProvider`.
+
 ---
 
 ## 9. Implementation Roadmap
 
-### Phase 1: Foundation (4-6 weeks)
+AEF takes an incremental approach, starting with the existing infrastructure and progressively adding capabilities.
 
-1. **Adaptive Exchange Operator**
-    - Buffer management
-    - Statistics computation
-    - Basic state machine
+### Phase 0: Wire TaskOutput to Existing Infrastructure
 
-2. **Coordinator Integration**
-    - Buffer statistics reporting
-    - Decision response handling
-    - Basic deviation detection
+**Goal**: Get end-to-end reoptimization working with existing `RuntimeReorderJoinSides`.
 
-3. **Testing**
-    - Unit tests for buffer behavior
-    - Integration tests for statistics accuracy
-    - Simple reoptimization scenarios
+**Changes:**
 
-### Phase 2: Join Output Estimation (3-4 weeks)
+1. **TaskOutput stats types** (builds on DPP RFC infrastructure):
+```java
+@JsonSubTypes({
+    @JsonSubTypes.Type(value = DynamicFilterOutput.class, name = "dynamicFilter"),
+    @JsonSubTypes.Type(value = BuildStatsOutput.class, name = "buildStats"),
+    @JsonSubTypes.Type(value = ExchangeStatsOutput.class, name = "exchangeStats")})
+public interface TaskOutput { ... }
 
-4. **Build Progress Reporting**
-    - Progress tracking in HashBuildOperator
-    - Coordinator-side progress aggregation
-    - Early deviation detection
+public class BuildStatsOutput implements TaskOutput {
+    private final PlanNodeId planNodeId;
+    private final long rowCount;
+    private final long outputSizeBytes;
+    private final long distinctKeyCount;
+    // ...
+}
+```
 
-5. **Hash Table Probe Integration**
-    - Probe buffer through completed hash table
-    - Selectivity computation
-    - Extrapolation logic
+2. **Feed stats to FragmentStatsProvider**:
+```java
+// In TaskOutputDispatcher
+void dispatch(TaskOutput output) {
+    if (output instanceof BuildStatsOutput) {
+        BuildStatsOutput stats = (BuildStatsOutput) output;
+        PlanNodeStatsEstimate estimate = PlanNodeStatsEstimate.builder()
+            .setOutputRowCount(stats.getRowCount())
+            .setTotalSize(stats.getOutputSizeBytes())
+            .build();
+        fragmentStatsProvider.putStats(queryId, fragmentId, estimate);
+    }
+}
+```
 
-6. **Unified JoinOutputEstimator**
-    - Multiple signal integration
-    - Confidence-weighted decisions
-    - Single reoptimization trigger
+3. **Trigger reoptimization** when build completes (simpler than buffer-based):
+```java
+void onBuildComplete(PlanNodeId buildId) {
+    // Stats already in FragmentStatsProvider
+    StreamingPlanSection section = getSectionContaining(buildId);
+    section = tryCostBasedOptimize(section);  // Existing method!
 
-### Phase 3: Cascading Holds (4-6 weeks)
+    if (planChanged) {
+        updateStageExecutions(section, oldToNewFragment);  // Existing method!
+    }
+}
+```
 
-7. **Hold Signal Protocol**
-    - Worker-to-worker hold signals
-    - Coordinator hold tracking
-    - Release coordination
+**What Works After Phase 0:**
+- Join side swapping based on actual build size
+- Uses 100% existing reoptimization code path
+- No hold/release needed yet (decision at build completion)
 
-8. **Global Reoptimization**
-    - Full query reoptimization with actual stats
-    - Plan diff and migration
-    - Upstream exchange re-routing
+### Phase 1: Add Buffer-Based Statistics
 
-### Phase 4: Advanced Optimizations (4-6 weeks)
+**Goal**: Collect statistics from exchange buffers for earlier/better decisions.
 
-9. **Partition Coalescing**
-    - Key distribution analysis
-    - Dynamic partition count adjustment
+**Changes:**
 
-10. **Skew Detection and Handling**
-    - Hot key identification
-    - Partition splitting
-    - Build side replication
+1. **Adaptive exchange buffer** (new operator):
+```java
+class AdaptiveExchangeOperator {
+    private final int bufferSize;
+    private List<Page> buffer = new ArrayList<>();
+    private BufferStatistics stats;
 
-11. **Parallelism Adjustment**
-    - Task count optimization
-    - Memory allocation adjustment
+    void addInput(Page page) {
+        if (buffer.size() < bufferSize) {
+            buffer.add(page);
+            updateStats(page);
+        }
+        if (bufferFull() && !statsReported) {
+            reportStats();  // Send TaskOutput
+        }
+        // Continue flowing data (no hold yet)
+    }
+}
+```
 
-### Phase 5: Production Hardening (4-6 weeks)
+2. **ExchangeStatsOutput**:
+```java
+public class ExchangeStatsOutput implements TaskOutput {
+    private final PlanNodeId planNodeId;
+    private final long rowCount;
+    private final long outputSizeBytes;
+    private final Map<String, Long> keyFrequencies;  // For skew detection
+}
+```
 
-12. **Performance Optimization**
-    - Buffer memory efficiency
-    - Decision latency minimization
-    - Cascading hold overhead reduction
+3. **Deviation detection**:
+```java
+void onExchangeStats(ExchangeStatsOutput stats) {
+    PlanNodeStatsEstimate original = getOriginalEstimate(stats.getPlanNodeId());
+    PlanNodeStatsEstimate actual = convertToEstimate(stats);
 
-13. **Fault Tolerance**
-    - Buffer recovery on worker failure
-    - Decision timeout handling
-    - Graceful degradation
+    double deviation = actual.getOutputRowCount() / original.getOutputRowCount();
+    if (deviation > THRESHOLD || deviation < 1.0/THRESHOLD) {
+        fragmentStatsProvider.putStats(queryId, fragmentId, actual);
+        tryCostBasedOptimize(section);
+    }
+}
+```
 
-14. **Monitoring and Debugging**
-    - Telemetry
-    - Query plan visualization
-    - Diagnostic tools
+**What Works After Phase 1:**
+- Earlier deviation detection (don't wait for full build)
+- Join side swapping based on exchange buffer stats
+- Still no hold/release (optimistic approach)
+
+### Phase 2: Hold/Release Protocol
+
+**Goal**: Pause execution to allow plan changes before data flows past decision point.
+
+**Changes:**
+
+1. **TaskInput for hold/release**:
+```java
+@JsonSubTypes({
+    @JsonSubTypes.Type(value = DynamicFilterInput.class, name = "dynamicFilter"),
+    @JsonSubTypes.Type(value = HoldSignalInput.class, name = "hold"),
+    @JsonSubTypes.Type(value = ReleaseSignalInput.class, name = "release"),
+    @JsonSubTypes.Type(value = PlanUpdateInput.class, name = "planUpdate")})
+public interface TaskInput { ... }
+
+public class HoldSignalInput implements TaskInput {
+    private final PlanNodeId exchangeId;
+    private final String reason;
+}
+
+public class ReleaseSignalInput implements TaskInput {
+    private final PlanNodeId exchangeId;
+    private final boolean continueAsPlanned;
+}
+```
+
+2. **Adaptive exchange state machine**:
+```java
+enum AdaptiveExchangeState {
+    BUFFERING,    // Collecting initial buffer
+    REPORTING,    // Sent stats, awaiting decision
+    HELD,         // Received hold, paused
+    FLOWING,      // Released, normal operation
+}
+```
+
+3. **Coordinator hold logic**:
+```java
+void onExchangeStats(ExchangeStatsOutput stats) {
+    if (shouldWaitForMoreStats(stats)) {
+        sendHold(stats.getPlanNodeId());
+        pendingDecisions.add(stats.getPlanNodeId());
+    } else {
+        makeDecision(stats.getPlanNodeId());
+    }
+}
+
+void makeDecision(PlanNodeId exchangeId) {
+    // Reoptimize with current stats
+    StreamingPlanSection section = getSectionContaining(exchangeId);
+    StreamingPlanSection optimized = tryCostBasedOptimize(section);
+
+    if (planChanged(section, optimized)) {
+        // Send new plan fragment
+        sendPlanUpdate(exchangeId, getNewFragment(optimized));
+    }
+    sendRelease(exchangeId);
+}
+```
+
+**What Works After Phase 2:**
+- Guaranteed reoptimization before data flows downstream
+- Can change join sides with correct data routing
+- Foundation for more complex plan changes
+
+### Phase 3: Additional Runtime Optimizer Rules
+
+**Goal**: Add more rules to `runtimePlanOptimizers` for broader adaptation.
+
+**New Rules:**
+
+1. **RuntimeSwitchJoinDistribution**:
+```java
+// Switch PARTITIONED ↔ REPLICATED based on actual sizes
+public class RuntimeSwitchJoinDistribution implements Rule<JoinNode> {
+    public Result apply(JoinNode join, Captures captures, Context context) {
+        double buildSize = context.getStatsProvider().getStats(join.getRight())
+            .getOutputSizeInBytes();
+
+        if (join.getDistributionType() == PARTITIONED &&
+            buildSize < BROADCAST_THRESHOLD) {
+            // Switch to broadcast - smaller build fits in memory
+            return Result.ofPlanNode(withDistribution(join, REPLICATED));
+        }
+
+        if (join.getDistributionType() == REPLICATED &&
+            buildSize > BROADCAST_THRESHOLD * 2) {
+            // Switch to partitioned - build too large for broadcast
+            return Result.ofPlanNode(withDistribution(join, PARTITIONED));
+        }
+
+        return Result.empty();
+    }
+}
+```
+
+2. **RuntimeAdjustParallelism**:
+```java
+// Adjust task count based on actual data volume
+public class RuntimeAdjustParallelism implements Rule<ExchangeNode> {
+    public Result apply(ExchangeNode exchange, Captures captures, Context context) {
+        double actualSize = context.getStatsProvider().getStats(exchange.getSources().get(0))
+            .getOutputSizeInBytes();
+        double originalSize = originalEstimates.get(exchange.getId());
+
+        if (actualSize < originalSize / 10) {
+            // Much less data than expected - reduce parallelism
+            return Result.ofPlanNode(withReducedPartitions(exchange));
+        }
+
+        return Result.empty();
+    }
+}
+```
+
+3. **Register in PlanOptimizers**:
+```java
+// PlanOptimizers.java
+runtimeBuilder.add(new IterativeOptimizer(
+    metadata, ruleStats, statsCalculator, costCalculator,
+    ImmutableList.of(),
+    ImmutableSet.of(
+        new RuntimeReorderJoinSides(...),           // Existing
+        new RuntimeSwitchJoinDistribution(...),     // New
+        new RuntimeAdjustParallelism(...)           // New
+    )));
+```
+
+**What Works After Phase 3:**
+- Join distribution type adaptation
+- Parallelism adjustment
+- Multiple optimizations can fire together
+
+### Phase 4: Join Reordering
+
+**Goal**: Reorder joins across the plan based on actual statistics.
+
+**New Rule:**
+
+```java
+// More complex: reorder joins in a join graph
+public class RuntimeReorderJoins implements Rule<JoinNode> {
+    public Result apply(JoinNode join, Captures captures, Context context) {
+        // Build join graph from current position
+        JoinGraph graph = JoinGraph.buildFrom(join, context.getLookup());
+
+        // Get actual stats for all tables in graph
+        Map<PlanNodeId, PlanNodeStatsEstimate> actualStats =
+            graph.getNodes().stream()
+                .collect(toMap(PlanNode::getId,
+                    node -> context.getStatsProvider().getStats(node)));
+
+        // Greedy reordering with actual stats
+        List<PlanNode> newOrder = greedyJoinOrder(graph, actualStats);
+
+        if (!newOrder.equals(graph.getOriginalOrder())) {
+            return Result.ofPlanNode(buildJoinTree(newOrder, graph.getEdges()));
+        }
+
+        return Result.empty();
+    }
+}
+```
+
+**What Works After Phase 4:**
+- Full join reordering based on actual cardinalities
+- Can fix severe mis-estimates in complex queries
+
+### Phase 5: Advanced Features
+
+**Goal**: Skew handling, partition coalescing, memory optimization.
+
+1. **Skew detection and handling**
+2. **Partition coalescing**
+3. **Dynamic memory allocation**
 
 ---
 
