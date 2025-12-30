@@ -1108,6 +1108,263 @@ runtimeBuilder.add(new IterativeOptimizer(
 
 `RuntimeReorderJoinSides` compares output sizes and swaps join sides if beneficial. This works immediately with AEF once we feed stats into `FragmentStatsProvider`.
 
+### 8.5 Plan Propagation Mechanics
+
+A critical difference between materialized and streaming exchanges is when reoptimization occurs relative to task scheduling.
+
+**Materialized Exchanges (Current)**:
+- `isReadyForExecution()` returns `true` only when child sections are `FINISHED`
+- `tryCostBasedOptimize()` runs BEFORE any tasks are scheduled for the section
+- `updateStageExecutions()` creates fresh stage executions with no running tasks
+- No tasks to cancel, no shuffle links to update
+
+**Streaming Exchanges (AEF)**:
+- Stages may already be RUNNING when reoptimization is triggered
+- Need to handle running tasks, in-flight data, and existing shuffle links
+
+#### 8.5.1 Key Infrastructure Components
+
+From the existing codebase:
+
+```java
+// StageLinkage - manages exchange connections between stages
+public class StageLinkage {
+    void processScheduleResults(StageExecutionState newState, Set<RemoteTask> newTasks) {
+        // Notify parent of new tasks (for shuffle links)
+        parent.addExchangeLocations(currentStageFragmentId, newTasks, noMoreTasks);
+
+        // Update child output buffers for new consuming tasks
+        for (OutputBufferManager child : childOutputBufferManagers) {
+            child.addOutputBuffers(newOutputBuffers, noMoreTasks);
+        }
+    }
+}
+
+// SqlStageExecution - how shuffle links are established
+void addExchangeLocations(PlanFragmentId fragmentId, Set<RemoteTask> sourceTasks, ...) {
+    for (RemoteTask task : getAllTasks()) {
+        for (RemoteTask sourceTask : sourceTasks) {
+            // Create RemoteSplit pointing to source task's output buffer
+            newSplits.put(remoteSource.getId(),
+                createRemoteSplitFor(task.getTaskId(),
+                    sourceTask.getRemoteTaskLocation(),
+                    sourceTask.getTaskId()));
+        }
+        task.addSplits(newSplits.build());
+    }
+}
+
+// How RemoteSplits work
+private static Split createRemoteSplitFor(TaskId taskId, URI remoteSourceTaskLocation, ...) {
+    // Points to: <remoteSourceTaskLocation>/results/<taskId>
+    String splitLocation = remoteSourceTaskLocation.toASCIIString() + "/results/" + taskId.getId();
+    return new Split(REMOTE_CONNECTOR_ID, new RemoteSplit(new Location(splitLocation), ...));
+}
+```
+
+#### 8.5.2 Reoptimization Scenarios
+
+When reoptimization occurs with streaming exchanges:
+
+**Scenario 1: Join Side Swap (RuntimeReorderJoinSides)**
+
+```
+Before:  Probe(A) --shuffle--> Join <--shuffle-- Build(B)
+After:   Probe(B) --shuffle--> Join <--shuffle-- Build(A)
+```
+
+Impact:
+- **Upstream stages (A, B)**: Continue running unchanged
+- **Join stage**: Needs new fragment with swapped join
+- **Shuffle links**: Exchange operators in join stage need to read from opposite upstream tasks
+
+**Scenario 2: Distribution Change (RuntimeSwitchJoinDistribution)**
+
+```
+Before:  A --partitioned shuffle--> Join <--partitioned shuffle-- B
+After:   A --partitioned shuffle--> Join <--broadcast-- B (B is small)
+```
+
+Impact:
+- **Upstream stage A**: Continue unchanged
+- **Upstream stage B**: May need different output buffering (broadcast vs partitioned)
+- **Join stage**: New fragment, different parallelism
+
+**Scenario 3: Parallelism Adjustment (RuntimeAdjustParallelism)**
+
+```
+Before:  Source --shuffle(100 partitions)--> Aggregate
+After:   Source --shuffle(10 partitions)--> Aggregate (data much smaller than expected)
+```
+
+Impact:
+- **Source stage**: Continue running, but output buffers change
+- **Aggregate stage**: Fewer tasks, different node assignment
+
+#### 8.5.3 Plan Propagation Protocol
+
+The protocol has three phases:
+
+**Phase 1: Hold and Drain**
+```java
+// Coordinator sends hold to adaptive exchanges in affected stages
+void initiateReoptimization(StreamingPlanSection section) {
+    Set<PlanNodeId> adaptiveExchanges = findAdaptiveExchanges(section);
+    for (PlanNodeId exchangeId : adaptiveExchanges) {
+        sendHold(exchangeId);  // Via TaskInput
+    }
+
+    // Wait for hold acknowledgment
+    // Exchanges stop accepting new data, drain in-flight pages
+    waitForHoldAcknowledgment(adaptiveExchanges);
+}
+```
+
+**Phase 2: Apply Plan Changes**
+```java
+void applyPlanChanges(Map<PlanFragment, PlanFragment> oldToNewFragment) {
+    // 1. Update coordinator's view of the plan
+    updatePlan(oldToNewFragment);
+
+    // 2. For each changed stage, cancel old tasks
+    for (PlanFragment oldFragment : oldToNewFragment.keySet()) {
+        StageExecutionAndScheduler oldExecution = stageExecutions.get(getStageId(oldFragment.getId()));
+        oldExecution.getStageExecution().cancel();  // Graceful cancel
+    }
+
+    // 3. Create new stage executions (existing infrastructure)
+    StreamingPlanSection newSection = rebuildSection(section, oldToNewFragment);
+    SectionExecution newExecution = sectionExecutionFactory.createSectionExecutions(
+        session, newSection, ...);
+
+    // 4. Update stageExecutions map
+    stageExecutions.putAll(newExecution.getSectionStages()...);
+}
+```
+
+**Phase 3: Establish New Shuffle Links**
+```java
+void establishShuffleLinks(SectionExecution newExecution) {
+    for (StageExecutionAndScheduler stageInfo : newExecution.getSectionStages()) {
+        SqlStageExecution stageExecution = stageInfo.getStageExecution();
+
+        // Find upstream stages (unchanged, still running)
+        for (RemoteSourceNode remoteSource : stageExecution.getFragment().getRemoteSourceNodes()) {
+            PlanFragmentId upstreamFragmentId = remoteSource.getSourceFragmentIds().get(0);
+            SqlStageExecution upstreamStage = getStageExecution(upstreamFragmentId);
+
+            // Get existing tasks from upstream (already running)
+            Set<RemoteTask> upstreamTasks = upstreamStage.getAllTasks();
+
+            // Add exchange locations for new consuming tasks
+            stageExecution.addExchangeLocations(upstreamFragmentId, upstreamTasks, /*noMore=*/true);
+        }
+    }
+
+    // Release holds - exchanges resume flowing data to new tasks
+    sendRelease(adaptiveExchanges);
+}
+```
+
+#### 8.5.4 Handling Unchanged Upstream Stages
+
+When reoptimization changes a consuming stage but not its producers:
+
+```
+Scenario: Join side swap, but Source stages A and B are unchanged
+
+Before:
+  Source_A (tasks: a1, a2, a3) --shuffle--> [old Join tasks: j1, j2] <--shuffle-- Source_B (tasks: b1, b2)
+
+After optimization (join swapped):
+  Source_A (tasks: a1, a2, a3) --shuffle--> [new Join tasks: j1', j2'] <--shuffle-- Source_B (tasks: b1, b2)
+                                  ^                                       ^
+                                  |                                       |
+                          RemoteSplits point to same a1,a2,a3 but different exchange config
+```
+
+The key insight is that `addExchangeLocations()` is designed to handle incremental updates:
+
+1. New join tasks (j1', j2') are created with the swapped plan fragment
+2. `addExchangeLocations()` is called with existing upstream tasks (a1,a2,a3 and b1,b2)
+3. Each new join task gets `RemoteSplit` objects pointing to ALL upstream task buffers
+4. But the join operator now reads probe from the opposite side
+
+```java
+// In new join task j1':
+// Before swap: Probe reads from Source_A buffers, Build reads from Source_B buffers
+// After swap:  Probe reads from Source_B buffers, Build reads from Source_A buffers
+//
+// The RemoteSplits are the same - what changes is which RemoteSourceNode
+// each join input (probe vs build) is connected to.
+```
+
+#### 8.5.5 Handling Output Buffers in Upstream Stages
+
+When creating new consuming tasks, upstream stages need to know about them:
+
+```java
+// In StageLinkage.processScheduleResults()
+void processScheduleResults(StageExecutionState newState, Set<RemoteTask> newTasks) {
+    // ...
+    // Add output buffers to upstream stages for each new consumer
+    List<OutputBufferId> newOutputBuffers = newTasks.stream()
+        .map(task -> new OutputBufferId(task.getTaskId().getId()))
+        .collect(toImmutableList());
+
+    for (OutputBufferManager child : childOutputBufferManagers) {
+        child.addOutputBuffers(newOutputBuffers, noMoreTasks);
+    }
+}
+```
+
+For reoptimization, we need to:
+1. Add new output buffers to unchanged upstream stages
+2. Remove old output buffers (or let them drain naturally)
+
+```java
+// Extension for reoptimization
+void updateOutputBuffersForReoptimization(
+        SqlStageExecution upstreamStage,
+        Set<TaskId> oldConsumerTasks,
+        Set<TaskId> newConsumerTasks) {
+
+    // Old buffers: will drain and complete naturally as old tasks are cancelled
+    // New buffers: add for new consuming tasks
+    List<OutputBufferId> newBuffers = newConsumerTasks.stream()
+        .map(taskId -> new OutputBufferId(taskId.getId()))
+        .collect(toImmutableList());
+
+    upstreamStage.addOutputBuffers(newBuffers);
+}
+```
+
+#### 8.5.6 Data Consistency During Transition
+
+The hold/release protocol ensures data consistency:
+
+```
+Timeline:
+1. [Hold Signal]     Adaptive exchanges stop accepting new data
+2. [Drain]           In-flight pages are processed and buffered
+3. [Cancel Old]      Old tasks cancelled (buffers discarded)
+4. [Create New]      New tasks created with updated plan
+5. [Wire Shuffles]   New tasks connected to upstream buffers
+6. [Release Signal]  Exchanges resume, data flows to new tasks
+
+Critical invariant: No data is lost because:
+- Exchanges buffer until hold is acknowledged
+- Old tasks are cancelled AFTER new tasks are wired
+- Upstream tasks maintain data until new consumers are ready
+```
+
+**Edge case: Data already sent to old tasks**
+
+Data that was already read by old tasks before hold is NOT re-sent. This is acceptable because:
+1. The buffer sample (used for statistics) represents a small fraction of total data
+2. For correctness, we use "downstream-only" reoptimization (see Section 11.3)
+3. Future enhancement: checkpoint and replay for more aggressive reoptimization
+
 ---
 
 ## 9. Implementation Roadmap
