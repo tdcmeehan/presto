@@ -53,7 +53,7 @@ During **query planning**, `AddDynamicFilterRule` (a new optimizer in presto-mai
 
 During **build-side execution**, the `HashBuild` operator collects distinct join key values while constructing the hash table. If cardinality stays below a configurable limit (default 10K), it creates a `TupleDomain` with discrete values for perfect filtering. Otherwise, it falls back to a range (min/max only). Upon completion, the filter is stored in the task's outputs collection and `outputsVersion` in `TaskStatus` is incremented.
 
-The **coordinator collects outputs** via `TaskOutputDispatcher`, a new component that detects version changes in `TaskStatus` during the existing polling cycle. It then long-polls the worker's `/v1/task/{taskId}/outputs/{version}` endpoint to fetch new outputs incrementally and routes them to appropriate handlers (e.g., `LocalDynamicFilter` for dynamic filters). The version-based protocol handles multiple operators in the same task producing outputs at different times. This generalized Task Outputs infrastructure is designed to support future adaptive query execution features (build progress, buffer statistics) using the same collection mechanism.
+The **coordinator collects outputs** via `TaskOutputDispatcher`, a new component that detects version changes in `TaskStatus` during the existing polling cycle. It then long-polls the worker's `/v1/task/{taskId}/outputs/{version}` endpoint to fetch new outputs incrementally and routes them to appropriate handlers (e.g., `LocalDynamicFilter` for dynamic filters). The version-based protocol handles multiple operators in the same task producing outputs at different times.
 
 For **filter merging**, the coordinator uses the existing `LocalDynamicFilter` to accumulate partial filters from multiple build-side workers (for partitioned joins). It merges using `TupleDomain.columnWiseUnion()` with UNION semantics: since each worker sees a disjoint subset of build data (hash-partitioned), valid join keys are those seen by ANY worker, so discrete values become set unions and ranges expand to cover all workers' min/max bounds. For broadcast joins with a single build worker, the filter is immediately complete.
 
@@ -100,7 +100,7 @@ This ensures only joins explicitly marked by the optimizer produce filters for c
 
 1. **Filter extraction** (C++): `HashBuild` completes the hash table and calls `joinBridge_->setHashTable()` to hand it to `HashProbe`. If the join has registered dynamic filter IDs, we call `table_->hashers()` to get the `VectorHasher` objects for join key columns. For low-cardinality keys, `VectorHasher::getFilter()` returns a `BigintValues` filter with discrete values. For high-cardinality keys (where VectorHasher overflows), we build a range filter from the tracked min/max. These are converted to a `TupleDomain` JSON representation.
 
-2. **Storage in PrestoTask** (C++): The filter is wrapped in a `TaskOutput` structure (with `type: "dynamicFilter"`, `planNodeId`, and payload) and stored in the `outputs_` map in `PrestoTask`. We atomically increment `outputsVersion` in the task's status. This requires adding a callback from Velox's `Task` to Presto's `PrestoTask` when outputs are ready. The same `outputs_` map and callback mechanism can be reused for future output types (e.g., build progress, buffer statistics for adaptive query execution).
+2. **Storage in PrestoTask** (C++): The filter is wrapped in a `TaskOutput` structure (with `type: "dynamicFilter"`, `planNodeId`, and payload) and stored in the `outputs_` map in `PrestoTask`. We atomically increment `outputsVersion` in the task's status. This requires adding a callback from Velox's `Task` to Presto's `PrestoTask` when outputs are ready.
 
 3. **Version detection** (Java): The coordinator's `TaskInfoFetcher` already polls `TaskStatus` periodically. We add an `outputsVersion` field to `TaskStatus`. When the coordinator detects a version change, it knows new outputs are available.
 
@@ -134,9 +134,8 @@ The coordinator collects task outputs through an extension to `HttpRemoteTask`. 
 
 A new `TaskOutputDispatcher` component routes each output to the appropriate handler based on its `type`:
 - `dynamicFilter` → `LocalDynamicFilter` (created by `SqlQueryScheduler` for each distributed dynamic filter)
-- Future types (e.g., `buildProgress`, `bufferStats`) → corresponding adaptive execution handlers
 
-The version-based protocol handles multiple operators in the same task producing outputs at different times, allowing incremental collection without re-fetching. This design allows the same infrastructure to support both dynamic filtering and future adaptive query execution features.
+The version-based protocol handles multiple operators in the same task producing outputs at different times, allowing incremental collection without re-fetching.
 
 #### 2.5 Filter Merging
 
@@ -274,10 +273,10 @@ A new `DynamicFilter` class is passed to `ConnectorSplitManager.getSplits()`. Fo
 
 **Task Outputs Infrastructure:**
 
-This RFC introduces a generalized **Task Outputs** infrastructure for collecting operator-produced data on the coordinator. While this RFC uses it for dynamic filters, the infrastructure is designed to support future use cases such as adaptive query execution (build progress reporting, buffer statistics, join selectivity measurements).
+This RFC introduces a **Task Outputs** infrastructure for collecting operator-produced data on the coordinator.
 
 Each output has:
-- **type**: Identifies the output kind (e.g., `dynamicFilter`, and in the future: `buildProgress`, `bufferStats`, `probeStats`)
+- **type**: Identifies the output kind (e.g., `dynamicFilter`)
 - **planNodeId**: The operator that produced this output
 - **payload**: Type-specific data
 
@@ -313,34 +312,6 @@ Response 404 Not Found:
 ```
 
 The endpoint returns all outputs with version > `n`. The coordinator tracks the last fetched version per task and requests incrementally.
-
-**Extensibility for Adaptive Query Execution:**
-
-The Task Outputs infrastructure is designed to support additional output types for adaptive query execution. Future output types may include:
-
-| Type | Source | Payload | Use Case |
-|------|--------|---------|----------|
-| `dynamicFilter` | HashBuild | TupleDomain | Partition/file pruning (this RFC) |
-| `buildProgress` | HashBuild | rowCount, projectedTotal, NDV, fractionComplete | Early cardinality deviation detection |
-| `bufferStats` | Exchange | rowCount, distinctKeys, skewFactor | Adaptive exchange decisions |
-| `probeStats` | Exchange | containment, fanout, selectivity | Join output estimation |
-
-Example future `buildProgress` output:
-```json
-{
-  "type": "buildProgress",
-  "planNodeId": "hash_build_1",
-  "payload": {
-    "rowsProcessed": 50000,
-    "projectedTotal": 100000,
-    "distinctKeyCount": 45000,
-    "memoryBytes": 8388608,
-    "fractionComplete": 0.5
-  }
-}
-```
-
-The coordinator-side collection mechanism (`outputsVersion` polling, incremental fetch) and worker-side storage (`outputs_` map in `PrestoTask`) are designed to handle multiple output types without modification.
 
 **No breaking changes**: The new SPI method has a default implementation.
 
