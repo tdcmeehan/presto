@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: December 2024
-**Version**: 0.2
+**Version**: 0.3
 **Runtime**: Velox (C++) only
 
 ---
@@ -1988,7 +1988,128 @@ The section boundary approach naturally provides "downstream-only" reoptimizatio
 
 ---
 
-## 12. Appendix A: Glossary
+## 12. Related Work
+
+Adaptive query processing has a rich history in database research. This section positions AEF relative to prior work and identifies what is novel in this design.
+
+### 12.1 Foundational Work
+
+**Mid-Query Reoptimization (Kabra & DeWitt, SIGMOD 1998)**
+
+The seminal work on runtime plan adaptation. Key ideas:
+- Collect statistics at **blocking operators** (sort, hash build)
+- Compare observed cardinalities to optimizer estimates
+- Reoptimize the "remainder" of the query if deviation exceeds threshold
+
+*Limitation*: Only triggers at natural materialization points (blocking operators). Does not work for pipelined execution where no blocking operators exist.
+
+*AEF relationship*: We adopt the reoptimization-on-deviation approach but use **streaming exchanges** as checkpoint points rather than blocking operators.
+
+**Progressive Optimization (Markl et al., SIGMOD 2004)**
+
+Extended mid-query reoptimization with explicit checkpoint operators:
+- INSERT `CHECK` operators into the plan at strategic points
+- Compare estimated vs actual cardinalities at checkpoints
+- Trigger reoptimization if pre-computed threshold exceeded
+
+*Limitation*: Checkpoints still placed at blocking operators. Requires pre-computing "switchable" alternative plans.
+
+*AEF relationship*: Similar checkpoint concept, but checkpoints are at exchanges (natural distribution boundaries) rather than blocking operators.
+
+**Eddies (Avnur & Hellerstein, SIGMOD 2000)**
+
+Continuously adaptive query processing:
+- Route each tuple through operators dynamically
+- Use "lottery scheduling" to adapt operator ordering per-tuple
+- "Moments of symmetry" allow reordering at specific points
+
+*Limitation*: Per-tuple routing overhead. Complex implementation. Designed for single-node streaming, not distributed batch.
+
+*AEF relationship*: Fundamentally different approach. AEF uses batch-based adaptation (buffer first N rows, decide once) rather than per-tuple adaptation.
+
+**Adaptive Join Reordering (Li et al., ICDE 2007)**
+
+Extended Eddies for distributed indexed joins:
+- Dynamically reorder joins based on observed selectivities
+- Use "moments of symmetry" to identify safe reordering points
+
+*AEF relationship*: Similar goal (runtime join reordering) but different mechanism. AEF reorders via plan replacement at section boundaries rather than per-tuple routing.
+
+### 12.2 Commercial Systems
+
+**Spark Adaptive Query Execution**
+
+Stage-based adaptation:
+- Full materialization at shuffle boundaries (query stages)
+- Collect statistics from materialized shuffle files
+- Reoptimize before starting next stage
+
+Capabilities: Partition coalescing, join strategy switching, skew handling.
+Limitation: **No join reordering**. Full materialization adds latency.
+
+*AEF relationship*: AEF provides similar capabilities plus join reordering. Uses buffer-then-stream rather than full materialization, preserving Presto's streaming model.
+
+**Oracle Adaptive Plans (12c+)**
+
+Single-operator adaptation:
+- Statistics collector buffers rows at decision points
+- Choose between pre-computed alternatives (e.g., hash join vs nested loops)
+- Buffering disabled after decision made
+
+*Limitation*: Scope limited to single operator decisions. Not full query reoptimization.
+
+*AEF relationship*: AEF extends the buffering concept to full query scope. Uses buffer statistics to trigger plan-wide reoptimization, not just local operator choice.
+
+**SQL Server Adaptive Joins**
+
+Deferred join method selection:
+- Defer hash join vs nested loops choice until first input scanned
+- Use threshold-based switching within single cached plan
+
+*Limitation*: Single join decision only. No broader plan adaptation.
+
+*AEF relationship*: AEF subsumes this capability (join strategy switching is one possible adaptation) while enabling broader optimizations.
+
+### 12.3 What Is Novel in AEF
+
+AEF combines existing concepts in a novel way:
+
+| Concept | Origin | AEF Application |
+|---------|--------|-----------------|
+| Reoptimization on deviation | Kabra & DeWitt | Core decision logic |
+| Checkpoint-based statistics | Progressive Optimization | Exchanges as checkpoints |
+| Buffering for decision | Oracle Adaptive Plans | Buffer first N rows at exchange |
+| Section-based scheduling | Presto internals | Treat adaptive exchanges as section boundaries |
+
+**The specific novelty:**
+
+1. **Exchange as checkpoint**: Using the streaming exchange operator as the buffering/checkpoint point—not blocking operators like hash build or sort. This works with pipelined execution.
+
+2. **Buffer-then-stream**: Unlike Spark AQE's full materialization, AEF buffers only the first N rows, collects statistics, then continues streaming. Minimal latency impact.
+
+3. **Hash table probing for selectivity**: Directly measuring containment (fraction of probe keys in build) and fanout (average matches per key) by probing the buffer through the hash table. This captures correlations that NDV-based estimation misses.
+
+4. **Full query reoptimization scope**: Unlike Oracle (single operator) or SQL Server (single join), AEF can reoptimize the entire remaining plan including join reordering.
+
+5. **Section boundary integration**: Treating adaptive exchanges as section boundaries eliminates the complexity of cancelling running tasks or rewiring shuffle links—the downstream section simply hasn't started yet.
+
+**In summary**: AEF's contribution is the synthesis of buffering-based statistics collection (Oracle), checkpoint-triggered reoptimization (Kabra/Markl), and streaming execution (Presto's model) into a unified framework that enables full-scope adaptation including join reordering.
+
+### 12.4 References
+
+1. N. Kabra and D. DeWitt. "Efficient Mid-Query Re-Optimization of Sub-Optimal Query Execution Plans." SIGMOD 1998.
+
+2. V. Markl, V. Raman, D. Simmen, G. Lohman, H. Pirahesh, M. Cilimdzic. "Robust Query Processing through Progressive Optimization." SIGMOD 2004.
+
+3. R. Avnur and J. Hellerstein. "Eddies: Continuously Adaptive Query Processing." SIGMOD 2000.
+
+4. Q. Li, M. Shao, V. Markl, K. Beyer, L. Colby, G. Lohman. "Adaptively Reordering Joins during Query Execution." ICDE 2007.
+
+5. A. Deshpande, Z. Ives, V. Raman. "Adaptive Query Processing." Foundations and Trends in Databases, 2007.
+
+---
+
+## 13. Appendix A: Glossary
 
 | Term | Definition |
 |------|------------|
@@ -2050,5 +2171,5 @@ Metrics to track:
 
 ---
 
-*Document Version: 0.2*
+*Document Version: 0.3*
 *Last Updated: December 2024*
