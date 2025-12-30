@@ -59,7 +59,7 @@ For **filter merging**, the coordinator uses the existing `LocalDynamicFilter` t
 
 During **split scheduling**, the scheduler analyzes the table layout's `getColumnsWithRangeStatistics()` and `getStreamPartitioningColumns()` along with the build/probe cardinality ratio to compute a recommended wait duration. The connector receives a `DynamicFilter` object containing the columns covered, the constraint future, and this wait hint—allowing it to wait upfront, start immediately, or use a hybrid approach.
 
-**Filter application** happens at four levels. The connector's split source (e.g., `HiveSplitSource`, `IcebergSplitSource`) uses the filter to prune partitions and files during split generation by testing partition/file statistics against the filter's range or discrete values. For the remaining levels—row-group and row-level filtering—the coordinator pushes the completed merged filter to probe-side workers via HTTP (Phase 2). Velox's `ParquetReader` then prunes row groups and applies row-level filtering using type-specific filters: `BigintValuesUsingHashTable`/`BigintRange` for integers, `BytesValues`/`BytesRange` for strings, `DoubleRange`/`FloatRange` for floating point, and `TimestampRange` for timestamps.
+**Filter application** happens at four levels. The connector's split source (e.g., `HiveSplitSource`, `IcebergSplitSource`) uses the filter to prune partitions and files during split generation by testing partition/file statistics against the filter's range or discrete values. For the remaining levels—row-group and row-level filtering—the coordinator distributes the completed merged filter to probe-side workers via `TaskUpdateRequest` (Phase 2). Velox's `ParquetReader` then prunes row groups and applies row-level filtering using type-specific filters: `BigintValuesUsingHashTable`/`BigintRange` for integers, `BytesValues`/`BytesRange` for strings, `DoubleRange`/`FloatRange` for floating point, and `TimestampRange` for timestamps.
 
 ![Dynamic Partition Pruning Flow](RFC-0022/RFC-0022-dynamic-filtering-diagram.png)
 
@@ -164,35 +164,32 @@ Filters are applied during split generation on the coordinator. The connector re
 
 **Phase 2: Worker-side (row-group/row-level filtering)**
 
-The coordinator pushes the merged filter to probe-side workers via a new endpoint:
+The coordinator distributes merged filters to probe-side workers via `TaskUpdateRequest`. When `LocalDynamicFilter` completes, `HttpRemoteTask` includes a `DynamicFilterInput` in the next task update:
 
+```java
+TaskUpdateRequest request = new TaskUpdateRequest(
+    session,
+    extraCredentials,
+    fragment,
+    sources,
+    outputIds,
+    tableWriteInfo,
+    ImmutableList.of(new DynamicFilterInput(planNodeId, filterId, tupleDomain))  // inputs
+);
 ```
-POST /v1/task/{taskId}/inputs/filter/{filterId}
-
-Body:
-{
-  "complete": true,
-  "filterType": "tupleDomain",
-  "tupleDomain": { "columnDomains": { ... } }
-}
-
-Response 200 OK
-Response 404 Not Found (task does not exist)
-```
-
-The `complete` field indicates this is a fully merged filter safe for pruning. Workers reject filters where `complete: false`.
 
 **Coordinator-side flow:**
 
 1. `LocalDynamicFilter` completes with merged filter
 2. Coordinator identifies probe-side tasks whose plan contains a `TableScanNode` referencing this filter ID
-3. Coordinator calls the endpoint on each probe-side worker
+3. `HttpRemoteTask` includes `DynamicFilterInput` in the next `TaskUpdateRequest`
 
 **Worker-side flow:**
 
-1. `PrestoTask` receives filter, verifies `complete: true`, stores in task-level map
-2. Calls `veloxTask->addDynamicFilter(filterId, filter)` to inject into Velox
-3. Velox's `TableScan` (which registered interest in this filter ID during plan conversion) applies filter at two levels:
+1. `PrestoTask` receives `TaskUpdateRequest`, extracts `TaskInput` list
+2. `TaskInputDispatcher` routes `DynamicFilterInput` to the handler
+3. Handler calls `veloxTask->addDynamicFilter(filterId, filter)` to inject into Velox
+4. Velox's `TableScan` (which registered interest in this filter ID during plan conversion) applies filter at two levels:
     - **Row-group pruning**: `ParquetReader` tests row group statistics against the filter's range
     - **Row-level filtering**: Values tested against type-specific Velox filters (hash lookup for discrete values, range comparison for min/max)
 
@@ -270,15 +267,33 @@ A new `DynamicFilter` class is passed to `ConnectorSplitManager.getSplits()`. Fo
 
 - Add `outputsVersion` field to `TaskStatus` (incremented when any collected output is ready)
 - Add HTTP endpoint `GET /v1/task/{taskId}/outputs/{version}` in C++ workers
+- Add `List<TaskInput> inputs` field to `TaskUpdateRequest` for coordinator → worker messages
 
-**Task Outputs Infrastructure:**
+**Task Outputs (worker → coordinator):**
 
-This RFC introduces a **Task Outputs** infrastructure for collecting operator-produced data on the coordinator.
+Following the `OperatorInfo` pattern, we introduce a polymorphic `TaskOutput` interface:
 
-Each output has:
-- **type**: Identifies the output kind (e.g., `dynamicFilter`)
-- **planNodeId**: The operator that produced this output
-- **payload**: Type-specific data
+```java
+@JsonTypeInfo(
+        use = JsonTypeInfo.Id.NAME,
+        include = JsonTypeInfo.As.PROPERTY,
+        property = "@type")
+@JsonSubTypes({
+        @JsonSubTypes.Type(value = DynamicFilterOutput.class, name = "dynamicFilter")})
+public interface TaskOutput
+{
+    PlanNodeId getPlanNodeId();
+}
+
+public class DynamicFilterOutput
+        implements TaskOutput
+{
+    private final PlanNodeId planNodeId;
+    private final DynamicFilterId filterId;
+    private final TupleDomain<ColumnHandle> tupleDomain;
+    // constructor, getters...
+}
+```
 
 **HTTP Endpoint Specification:**
 
@@ -293,13 +308,10 @@ Response 200 OK:
   "version": 3,
   "outputs": [
     {
-      "type": "dynamicFilter",
+      "@type": "dynamicFilter",
       "planNodeId": "hash_build_1",
       "filterId": "df_1",
-      "payload": {
-        "filterType": "tupleDomain",
-        "tupleDomain": { "columnDomains": { ... } }
-      }
+      "tupleDomain": { "columnDomains": { ... } }
     }
   ]
 }
@@ -313,7 +325,46 @@ Response 404 Not Found:
 
 The endpoint returns all outputs with version > `n`. The coordinator tracks the last fetched version per task and requests incrementally.
 
-**No breaking changes**: The new SPI method has a default implementation.
+**Task Inputs (coordinator → worker):**
+
+For distributing filters to probe-side workers (Phase 2), we add a `TaskInput` interface and include inputs in `TaskUpdateRequest`:
+
+```java
+@JsonTypeInfo(
+        use = JsonTypeInfo.Id.NAME,
+        include = JsonTypeInfo.As.PROPERTY,
+        property = "@type")
+@JsonSubTypes({
+        @JsonSubTypes.Type(value = DynamicFilterInput.class, name = "dynamicFilter")})
+public interface TaskInput
+{
+    PlanNodeId getPlanNodeId();
+}
+
+public class DynamicFilterInput
+        implements TaskInput
+{
+    private final PlanNodeId planNodeId;
+    private final DynamicFilterId filterId;
+    private final TupleDomain<ColumnHandle> tupleDomain;
+    // constructor, getters...
+}
+```
+
+`TaskUpdateRequest` is extended with an optional inputs field:
+
+```java
+@ThriftStruct
+public class TaskUpdateRequest
+{
+    // existing fields...
+    private final List<TaskInput> inputs;  // New field
+}
+```
+
+The coordinator includes merged filters in `TaskUpdateRequest` when updating probe-side tasks. Workers route inputs to handlers via `TaskInputDispatcher` (e.g., `DynamicFilterInput` is passed to Velox's `Task::addDynamicFilter()`).
+
+**No breaking changes**: The new SPI method has a default implementation, and `inputs` defaults to empty list.
 
 ### 4. User-Facing Configuration and Metrics
 
