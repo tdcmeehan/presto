@@ -370,122 +370,147 @@ Caveats:
 
 An alternative to probing the partial hash table is to use **approximate data structures** that can be built incrementally and merged across workers. This enables parallel statistics collection without waiting for build completion.
 
-**Proposed Architecture:**
+##### Sample-to-Sample Estimation
+
+The key insight is that **both sides can independently collect row samples**, and the coordinator can estimate join selectivity by matching these samples with a statistical correction.
+
+**Why row sampling (not distinct key sampling):**
 
 ```
-Build Workers:                          Probe Workers:
-  ┌─────────────────┐                    ┌─────────────────┐
-  │  HashBuild Op   │                    │ AdaptiveExchange│
-  │  ┌───────────┐  │                    │  ┌───────────┐  │
-  │  │Bloom Filt │  │ ──────┐    ┌────── │  │HyperLogLog│  │
-  │  │Count-Min  │  │       │    │       │  │Key Sample │  │
-  │  └───────────┘  │       │    │       │  └───────────┘  │
-  └─────────────────┘       │    │       └─────────────────┘
-          │                 │    │               │
-          │ TaskOutput      │    │   TaskOutput  │
-          v                 v    v               v
-                    ┌─────────────────────┐
-                    │    Coordinator      │
-                    │  Merge & Estimate   │
-                    └─────────────────────┘
+Fact table: 1B rows
+  - "BigCorp" key: 900M rows (90%)
+  - 100K other keys: 100M rows (10%)
+
+Distinct key sample: BigCorp is 1 out of 100K keys (0.001%)
+Row sample: BigCorp appears in ~90% of samples
+
+Row sampling naturally captures frequency-weighted behavior.
+```
+
+**Unified Sketch Structure (both sides):**
+
+```cpp
+struct JoinSketch {
+    std::unordered_set<uint64_t> keyHashes;  // Reservoir sample of ROW keys
+    HyperLogLog distinctKeys;                 // NDV estimate
+    uint64_t totalRows;                       // For fanout calculation
+
+    double sampleRate() const {
+        return (double)keyHashes.size() / distinctKeys.estimate();
+    }
+};
+
+// Built by: HashBuild operator (build side), AdaptiveExchange (probe side)
+// Sent via: TaskOutput to coordinator
+// Size: ~100KB per table (10K samples × 8 bytes + 12KB HLL)
 ```
 
 **Component Responsibilities:**
 
 | Component | Sketches Built | When Sent |
 |-----------|---------------|-----------|
-| Hash Build Operator | Bloom filter, Count-Min Sketch, HyperLogLog (build NDV) | Periodically during build, or at completion |
-| Adaptive Exchange | HyperLogLog (probe NDV), reservoir sample of key hashes | When buffer fills (with other buffer stats) |
-
-**Build Side Sketch:**
-
-```cpp
-struct BuildSideSketch {
-    BloomFilter keyPresence;      // For containment: "is key present?"
-    CountMinSketch keyFrequency;  // For fanout: "how many rows per key?"
-    HyperLogLog distinctKeys;     // Build NDV estimate
-    uint64_t totalRows;
-};
-
-// Streamable: can send partial sketches during build
-// Mergeable: coordinator combines sketches from all build workers
-```
-
-**Probe Side Sketch:**
-
-```cpp
-struct ProbeSideSketch {
-    HyperLogLog distinctKeys;           // Probe NDV estimate
-    std::vector<uint64_t> keyHashes;    // Reservoir sample of key hashes
-    uint64_t totalRows;
-};
-
-// All workers use consistent hash: xxhash64(serialize(key))
-// Build side: Bloom/CMS built with same hash
-// Probe side: sample hashes sent to coordinator
-// Fixed 8 bytes per sampled key, regardless of key type
-```
+| Hash Build Operator | JoinSketch for build-side keys | Periodically during build, or at completion |
+| Adaptive Exchange | JoinSketch for probe-side keys | When buffer fills (with other buffer stats) |
 
 **Coordinator Estimation:**
 
 ```cpp
-EstimateResult estimateFromSketches(BuildSideSketch& build, ProbeSideSketch& probe) {
-    uint64_t keysFound = 0;
-    uint64_t totalFanout = 0;
+struct JoinEstimate {
+    double containment;      // Fraction of probe keys in build
+    double buildFanout;      // Avg build rows per matching key
+    double probeFanout;      // Avg probe rows per matching key (for reverse direction)
+};
 
-    for (auto& keyHash : probe.keySample) {
-        if (build.keyPresence.mayContain(keyHash)) {
-            keysFound++;
-            totalFanout += build.keyFrequency.estimate(keyHash);
+JoinEstimate estimateFromSamples(JoinSketch& build, JoinSketch& probe) {
+    // Count matches between samples
+    uint64_t matches = 0;
+    for (auto& keyHash : probe.keyHashes) {
+        if (build.keyHashes.count(keyHash)) {
+            matches++;
         }
     }
 
-    double rawContainment = (double)keysFound / probe.keySample.size();
-    double containment = adjustForBloomFPR(rawContainment, build.keyPresence.fpr());
-    double fanout = keysFound > 0 ? (double)totalFanout / keysFound : 0;
+    // Raw match rate (underestimates due to sampling)
+    double sampleMatchRate = (double)matches / probe.keyHashes.size();
 
-    return {containment, fanout, computeConfidenceInterval(...)};
+    // Correction: P(match | key in build) = buildSampleRate
+    // So: trueContainment = sampleMatchRate / buildSampleRate
+    double containment = std::min(1.0, sampleMatchRate / build.sampleRate());
+
+    // Fanout from row count / NDV (both directions for join reordering)
+    double buildFanout = (double)build.totalRows / build.distinctKeys.estimate();
+    double probeFanout = (double)probe.totalRows / probe.distinctKeys.estimate();
+
+    return {containment, buildFanout, probeFanout};
+}
+
+// Join output estimate
+double estimateJoinOutput(JoinSketch& build, JoinSketch& probe) {
+    auto est = estimateFromSamples(build, probe);
+    return probe.totalRows * est.containment * est.buildFanout;
 }
 ```
 
-**Alternative: Theta Sketch for Set Intersection**
+**Example with correction:**
 
-[Apache DataSketches Theta Sketches](https://datasketches.apache.org/docs/Theta/ThetaSketchFramework.html) support set intersection directly:
+```
+Build: 1M distinct keys, 10K sample → sampleRate = 1%
+Probe: 10K row sample
+True containment: 90%
 
-```cpp
-// Both sides send Theta Sketches of their key sets
-ThetaSketch buildKeys = ...;   // Mergeable across build workers
-ThetaSketch probeKeys = ...;   // Mergeable across probe workers
+Without correction:
+  Matches found: 10K × 90% × 1% = 90
+  Raw match rate: 90 / 10K = 0.9%  ✗ Wrong!
 
-// Coordinator computes intersection estimate
-ThetaSketch intersection = ThetaIntersection(buildKeys, probeKeys);
-double containment = intersection.estimate() / probeKeys.estimate();
-
-// Limitation: Theta Sketch doesn't track duplicates, so no fanout estimate
-// Would need Count-Min Sketch or similar for fanout
+With correction:
+  Corrected: 0.9% / 1% = 90%  ✓ Correct!
 ```
 
-**Research Questions:**
+##### Bidirectional Fanout for Join Reordering
+
+Following Axiom's approach, we compute fanout in **both directions** to enable full join graph exploration:
+
+```cpp
+// For join A ⋈ B, we need:
+double aToB_Fanout = buildFanout;   // B rows per matching A row
+double bToA_Fanout = probeFanout;   // A rows per matching B row
+
+// This allows evaluating both orderings:
+// A as probe, B as build: |output| = |A| × containment(A→B) × fanout(B)
+// B as probe, A as build: |output| = |B| × containment(B→A) × fanout(A)
+```
+
+##### Size Analysis
+
+| Component | Size | Notes |
+|-----------|------|-------|
+| Key sample (10K keys) | 80KB | 10K × 8 bytes |
+| HyperLogLog | 12KB | Standard precision |
+| Row count | 8 bytes | |
+| **Total per table** | **~95KB** | Bounded, regardless of table size |
+
+For a 5-table join: ~500KB total sketch overhead.
+
+##### Comparison with Bloom Filter Approach
+
+| Aspect | Bloom + Probe Sample | Sample-to-Sample |
+|--------|---------------------|------------------|
+| Build side size | O(build NDV) — unbounded | O(sample size) — bounded |
+| Probe side size | O(sample size) | O(sample size) |
+| Large build tables | ✗ Bloom too big | ✓ Works |
+| Statistical accuracy | Higher | Lower (needs correction) |
+| Implementation | More complex | Simpler |
+
+##### Research Questions
 
 | Question | Notes |
 |----------|-------|
-| What's the right sketch for fanout? | Count-Min Sketch overestimates; need error bounds |
-| What sample size for probe keys? | Trade-off between accuracy and network overhead |
-| How to bound estimation error? | Need confidence intervals for reoptimization threshold |
-| Does Bloom filter FPR adjustment work? | `true_containment ≈ (measured - FPR) / (1 - FPR)` |
-| Accuracy after merging across workers? | Sketches are mergeable but error may compound |
+| Minimum sample size? | Need enough matches for statistical power |
+| Variance of corrected estimate? | Depends on sample rates and true containment |
+| Confidence intervals? | For reoptimization threshold decisions |
+| Sample merging across workers? | Union of samples, HLL merge |
 
-**Comparison: Partial Hash Table vs Sketches**
-
-| Aspect | Partial Hash Table Probe | Sketch-Based |
-|--------|-------------------------|--------------|
-| Timing | After partial build | Parallel with both sides |
-| Build ordering sensitivity | High (biased if sorted) | None (sketches are order-independent) |
-| Network overhead | None (local probe) | Sketch transmission |
-| Fanout accuracy | Exact for matched keys | Approximate (CMS error) |
-| Implementation complexity | Low | Medium |
-
-**Recommendation:** Start with partial hash table probe (Signal 3) for simplicity. Investigate sketch-based approach as enhancement for cases where build ordering causes bias or earlier estimates are valuable.
+**Recommendation:** Sample-to-sample with correction is the preferred approach due to bounded size. Prototype and validate accuracy against hash table probe ground truth.
 
 #### Signal 4: Actual Output (During Probe, Exact)
 
@@ -1969,35 +1994,49 @@ The section boundary approach naturally provides "downstream-only" reoptimizatio
 
 **Recommendation**: Use split progress when available, byte progress as fallback, disable early detection when neither available.
 
-### 11.7 Sketch-Based Selectivity Estimation
+### 11.7 Sample-to-Sample Join Estimation
 
-**Question**: Can approximate data structures (sketches) provide accurate early estimates of containment and fanout without waiting for build completion?
+**Question**: Can we accurately estimate join selectivity using only row samples from both sides, without building a complete hash table or Bloom filter?
 
-**Motivation**: The current design waits for hash table completion before measuring selectivity via buffer probing. This delays reoptimization decisions. Sketches could enable parallel statistics collection from both sides.
+**Proposed Approach**: Sample-to-sample matching with statistical correction (see Signal 3b).
 
-**Candidate Data Structures**:
-
-| Structure | Purpose | Pros | Cons |
-|-----------|---------|------|------|
-| Bloom Filter | Key presence (containment) | Fast, compact, mergeable | False positives inflate estimate |
-| Count-Min Sketch | Key frequency (fanout) | Mergeable, streaming | Overestimates frequencies |
-| Theta Sketch | Set intersection | Direct intersection estimate | No duplicate tracking (no fanout) |
-| HyperLogLog | NDV estimation | Very compact, mergeable | Already used for NDV |
+**Key Insights**:
+1. **Row sampling** (not distinct keys) naturally captures frequency-weighted behavior for skewed data
+2. **Sample rate correction** recovers true containment: `containment = matchRate / buildSampleRate`
+3. **Bidirectional fanout** from HLL ratio enables full join graph exploration
+4. **Bounded size** (~100KB per table) regardless of cardinality
 
 **Research Tasks**:
-1. Prototype Bloom + Count-Min Sketch approach
-2. Measure estimation error vs hash table probe ground truth
-3. Determine minimum sample sizes for acceptable accuracy
-4. Evaluate Theta Sketch for containment-only estimation
-5. Test accuracy after merging sketches from multiple workers
+1. Prototype sample-to-sample estimation
+2. Validate correction formula against hash table probe ground truth
+3. Determine minimum sample sizes for statistical power (target: 95% confidence within ±20%)
+4. Test variance across different containment levels (low, medium, high)
+5. Validate for skewed distributions (Zipf, power-law)
+
+**Statistical Analysis Needed**:
+
+```
+Given:
+  - Build sample rate: r_b = sampleSize / buildNDV
+  - Probe sample size: n_p
+  - True containment: C
+
+Expected matches: E[matches] = n_p × C × r_b
+Variance: Var[matches] ≈ n_p × C × r_b × (1 - C × r_b)
+
+For 95% CI within ±20% of true containment:
+  Need: 1.96 × sqrt(Var) / E[matches] < 0.2
+  Implies: n_p × r_b > ~100 matches expected
+```
 
 **Success Criteria**:
-- Containment estimate within 20% of true value
+- Containment estimate within 20% of true value for C > 10%
+- Correctly identifies "low containment" (< 10%) vs "high containment" (> 50%)
 - Fanout estimate within 30% of true value
-- Sketch size < 1MB per worker
-- End-to-end latency reduction vs waiting for build
+- Total sketch size < 200KB per table
+- Works for tables from 10K to 10B rows
 
-**Recommendation**: Investigate as Phase 5+ enhancement. The partial hash table probe (Signal 3) is simpler and may be sufficient for most cases.
+**Recommendation**: This is the preferred approach for early estimation. Prototype in Phase 1 and validate before removing hash table probe fallback.
 
 ---
 
