@@ -216,22 +216,28 @@ Section boundary ensures:
 
 The buffer is replayed through N alternative plans (small sample), execution time measured, and the winning plan used for the full query.
 
-#### Capability 3: Speculative Execution
+#### Capability 3: Speculative Execution (Tail Latency Reduction)
 
-Start with the original plan optimistically, but buffer enables rollback:
+The buffer enables straggler mitigation without re-reading from source:
 
 ```
-Timeline:
-  T=0:   Start execution with optimizer's plan
-  T=10ms: Buffer fills, stats collected
-  T=15ms: Deviation detected! Plan would be wrong.
-  T=16ms: Section boundary not yet crossed → switch to reoptimized plan
+Normal execution:
+  Buffer → Worker-1 (processing...)
+                ↓
+           Taking too long (straggler detected)
 
-Without buffer:
-  T=16ms: Downstream already processing → complex cancellation
+Speculative execution:
+  Buffer → Worker-1 (still processing...)
+       ↘→ Worker-2 (speculative copy)
+                ↓
+           Worker-2 finishes first → use its result, cancel Worker-1
 ```
 
-The buffer provides a **point of no return** that can be deferred until statistics confirm the plan is acceptable.
+The buffer provides **replay capability** for speculative task launch:
+- No need to re-read source data (already buffered)
+- Section boundary means downstream not yet committed
+- First completion wins, cancel stragglers
+- Reduces P99 latency without wasting source I/O
 
 #### Capability 4: Fault Tolerance
 
