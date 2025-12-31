@@ -519,6 +519,16 @@ Row sample: BigCorp appears in ~90% of samples
 Row sampling naturally captures frequency-weighted behavior.
 ```
 
+**Statistical Assumptions:**
+
+| Assumption | Required? | Notes |
+|------------|-----------|-------|
+| Uniform key distribution | **No** | Row sampling captures skew (heavy hitters appear proportionally) |
+| Filter-key independence | **No** | Sample taken post-filter captures correlations |
+| **Sample representativeness** | **Yes** | Sample must represent full stream |
+
+The third assumption is the critical one. First-N sampling fails when data is ordered by join key (e.g., time-partitioned tables). See Section 11.1 for the **split-level sampling** solution: the connector provides stratified sample splits via the `SplitSource` SPI.
+
 **Unified Sketch Structure (both sides):**
 
 ```cpp
@@ -2118,13 +2128,115 @@ public class RuntimeReorderJoins implements Rule<JoinNode> {
 
 **Question**: First N rows may not be representative of full data.
 
-**Options**:
-1. **First-N sampling**: Simple, but biased if data is sorted
-2. **Reservoir sampling**: Unbiased, but requires seeing more data
-3. **Stratified sampling**: Sample from each partition, more representative
-4. **Progressive refinement**: Start with first-N, refine if deviation detected later
+**Problem**: Sample-to-sample estimation does NOT assume uniform key distribution or filter-key independence (row sampling captures both). However, it DOES assume the sample is representative of the full stream. First-N sampling fails when data is ordered:
 
-**Recommendation**: Start with first-N, add reservoir sampling as enhancement.
+```
+Time-partitioned fact table, join on customer_id:
+  Partition 2024-01: customers A-M dominate (seasonal patterns)
+  Partition 2024-06: customers N-Z dominate (seasonal patterns)
+
+First-N sample: only sees January data → biased containment estimate
+```
+
+**Options**:
+1. **First-N sampling**: Simple, but biased if data is sorted by join key
+2. **Reservoir sampling**: Unbiased for single stream, but requires seeing more data before deciding
+3. **Stratified sampling at exchange**: Sample from each upstream partition
+4. **Connector-level sampling via SplitSource SPI**: Connector provides representative sample splits
+
+**Recommended Approach: Split-Level Sampling**
+
+The connector knows the data layout and can provide statistically superior samples. Extend the `SplitSource` SPI:
+
+```java
+interface SplitSource {
+    // Existing
+    SplitBatch getNextBatch(Lifespan lifespan, int maxSize);
+
+    // New: request a representative sample
+    default Optional<SampleBatch> getSampleSplits(SampleRequest request) {
+        return Optional.empty();  // Default: connector doesn't support
+    }
+}
+
+class SampleRequest {
+    int targetRows;              // How many sample rows needed
+    int maxSplits;               // Max splits to use for sample
+    List<ColumnHandle> keyColumns; // Join keys (for stratification)
+}
+
+class SampleBatch {
+    List<Split> sampleSplits;              // Splits to schedule first
+    TupleDomain<ColumnHandle> coverage;    // What domain these cover
+    double estimatedCoverageRatio;         // Fraction of data represented
+}
+```
+
+**Connector Implementations:**
+
+```java
+// Hive: stratified by partition
+class HiveSplitSource {
+    Optional<SampleBatch> getSampleSplits(SampleRequest request) {
+        int splitsPerPartition = request.maxSplits / partitions.size();
+        List<Split> sample = partitions.stream()
+            .flatMap(p -> pickRandomSplits(p, splitsPerPartition).stream())
+            .collect(toList());
+
+        return Optional.of(new SampleBatch(
+            sample,
+            TupleDomain.all(),  // Samples span full partition range
+            (double) sample.size() / totalSplitCount
+        ));
+    }
+}
+
+// Iceberg: use file-level statistics for diversity
+class IcebergSplitSource {
+    Optional<SampleBatch> getSampleSplits(SampleRequest request) {
+        // Pick files that cover the join key range using min/max stats
+        List<DataFile> files = pickDiverseByKeyRange(
+            allFiles,
+            request.keyColumns,
+            request.maxSplits
+        );
+
+        return Optional.of(new SampleBatch(
+            toSplits(files),
+            computeCoveredDomain(files),  // Actual key range covered
+            estimateCoverage(files)
+        ));
+    }
+}
+```
+
+**Integration with AEF:**
+
+```
+Phase 1: Coordinator requests sample splits from SplitSource
+         ↓
+  Sample splits scheduled → workers execute → buffer fills
+         ↓
+  Statistics collected (stratified across partitions!)
+         ↓
+  Reoptimization decision made
+         ↓
+Phase 2: Complement splits scheduled (remaining data)
+         ↓
+  Streaming execution continues with optimized plan
+```
+
+**Comparison:**
+
+| Aspect | First-N Streaming | Split-Level Sampling |
+|--------|-------------------|---------------------|
+| Representativeness | Depends on data ordering | Guaranteed (stratified) |
+| Partition coverage | May only see first partitions | Samples from all partitions |
+| Connector knowledge | None | Uses file/partition metadata |
+| Key range coverage | Random | Can ensure diversity via stats |
+| Implementation | Exchange operator | SplitSource SPI extension |
+
+**Fallback**: When connector doesn't support `getSampleSplits()`, fall back to first-N with reservoir sampling enhancement.
 
 ### 11.2 Section Scheduling Deadlocks
 
