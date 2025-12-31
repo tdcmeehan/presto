@@ -150,7 +150,139 @@ Result: Entire pipeline pauses at a consistent point
 
 This creates a **global synchronization point** without full materialization.
 
-### 3.3 Join Output Estimation
+### 3.3 Architectural Primitive: Buffer + Section Boundary
+
+The combination of **buffering at exchanges** and **section boundaries** forms an architectural primitive that enables multiple adaptive execution strategies beyond join reordering.
+
+#### Why This Is a Primitive
+
+```
+Traditional streaming:  Source → Exchange → Consumer
+                              (data flows immediately)
+
+With adaptive exchange: Source → [Buffer] → SECTION BOUNDARY → Consumer
+                              ↓
+                         Coordinator
+                         (decision point)
+```
+
+The key insight: **the buffer creates a replay capability, and the section boundary creates a clean decision point before downstream execution begins**. Together, these enable:
+
+1. **Observation without commitment** — collect statistics before deciding
+2. **Replay capability** — buffered data can be sent through any plan
+3. **Clean plan switching** — downstream hasn't started, no cancellation needed
+4. **Isolation** — upstream continues unaffected by downstream changes
+
+#### Enabled Capabilities
+
+| Capability | How the Primitive Enables It |
+|------------|------------------------------|
+| **Sample-to-sample estimation (Axiom-style)** | Buffer = inline pilot query; section boundary = optimization point |
+| **POLAR multi-execute** | Buffer replayed through N alternative orderings; pick winner |
+| **Speculative execution** | Start optimistic plan; buffer enables rollback if reopt needed |
+| **Fault tolerance** | Buffer = lightweight checkpoint; replay on worker failure |
+| **SPJ partition routing** | Different partitions routed to different plans based on statistics |
+
+#### Capability 1: Sample-to-Sample Estimation (Axiom-Style Inline Pilot)
+
+The buffer naturally serves as an **inline pilot query**:
+
+```
+Without AEF (Axiom approach):
+  Optimizer → Run pilot query → Get statistics → Plan → Execute
+
+With AEF:
+  Execute → Buffer fills → Statistics collected → Reoptimize → Continue
+            ↑                                    ↑
+            Pilot data                          Decision point
+```
+
+This eliminates the separate pilot query overhead while providing equivalent statistics quality. The section boundary ensures the optimized plan applies to a fresh downstream section.
+
+#### Capability 2: POLAR Multi-Alternative Execution
+
+POLAR-style execution routes tuples through multiple join orderings and measures actual execution cost. The buffer enables this:
+
+```
+                        ┌→ Ordering A → measure time
+Buffer → [replicate] →├→ Ordering B → measure time  → pick winner → continue
+                        └→ Ordering C → measure time
+
+Section boundary ensures:
+  - Downstream workers not yet allocated
+  - No wasted work on losing alternatives
+  - Winner plan applied to full execution
+```
+
+The buffer is replayed through N alternative plans (small sample), execution time measured, and the winning plan used for the full query.
+
+#### Capability 3: Speculative Execution
+
+Start with the original plan optimistically, but buffer enables rollback:
+
+```
+Timeline:
+  T=0:   Start execution with optimizer's plan
+  T=10ms: Buffer fills, stats collected
+  T=15ms: Deviation detected! Plan would be wrong.
+  T=16ms: Section boundary not yet crossed → switch to reoptimized plan
+
+Without buffer:
+  T=16ms: Downstream already processing → complex cancellation
+```
+
+The buffer provides a **point of no return** that can be deferred until statistics confirm the plan is acceptable.
+
+#### Capability 4: Fault Tolerance
+
+The buffer serves as a lightweight checkpoint:
+
+```
+Normal execution:
+  Source → Buffer → [Section Boundary] → Consumer on Worker-1
+                                              ↓
+                                          Worker-1 fails
+
+Recovery:
+  Source → Buffer → [Section Boundary] → Consumer on Worker-2
+              ↑
+          Replay from buffer (already in memory)
+```
+
+For data already past the buffer, standard fault tolerance applies. But for data in the buffer, the section boundary provides a natural replay point without requiring full source re-execution.
+
+#### Capability 5: SPJ Partition Routing
+
+Storage Partitioned Joins (SPJ) can be combined with adaptive routing:
+
+```
+Partition P1:
+  - Statistics: High containment, low fanout
+  - Route to: Ordering A
+
+Partition P2:
+  - Statistics: Low containment, high fanout
+  - Route to: Ordering B
+
+Buffer per partition → partition-specific statistics → optimal routing
+```
+
+The section boundary enables different downstream plans for different partitions, all within a single query.
+
+#### Architectural Comparison
+
+| Approach | Observation Point | Decision Scope | Replay Capability |
+|----------|------------------|----------------|-------------------|
+| Spark AQE | Full stage completion | Next stage only | No (already materialized) |
+| Oracle Adaptive | Single operator | Single operator | Local only |
+| Eddies | Per-tuple | Per-tuple routing | No |
+| **AEF** | Buffer fill | Full downstream section | Yes (buffer) |
+
+The unique combination in AEF—**bounded buffer + section boundary**—provides the widest decision scope with minimal overhead.
+
+---
+
+### 3.4 Join Output Estimation
 
 The core statistic driving adaptive decisions is **join output cardinality**. Rather than relying solely on optimizer estimates, we gather multiple signals during execution to continuously refine this estimate. All signals feed into a unified estimator that triggers reoptimization when deviation is significant.
 
@@ -672,7 +804,7 @@ void onEstimateUpdated(JoinNode join, long newEstimate, double confidence) {
 
 **Key insight:** We don't just observe cardinality—we measure the actual components of join selectivity (NDV, containment, fanout) from real data. This gives 10-100x more accurate estimates than catalog-based formulas that rely on assumptions about data distribution.
 
-### 3.4 Confidence-Based Insertion
+### 3.5 Confidence-Based Insertion
 
 The optimizer inserts adaptive exchanges **selectively** based on statistics confidence:
 
