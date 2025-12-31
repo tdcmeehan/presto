@@ -468,7 +468,7 @@ With correction:
 
 ##### Bidirectional Fanout for Join Reordering
 
-Following Axiom's approach, we compute fanout in **both directions** to enable full join graph exploration:
+Following Axiom's approach, we compute fanout in **both directions** to enable join reordering:
 
 ```cpp
 // For join A ⋈ B, we need:
@@ -479,6 +479,63 @@ double bToA_Fanout = probeFanout;   // A rows per matching B row
 // A as probe, B as build: |output| = |A| × containment(A→B) × fanout(B)
 // B as probe, A as build: |output| = |B| × containment(B→A) × fanout(A)
 ```
+
+##### Scope: Greedy Join Reordering
+
+Sample-to-sample estimation enables **greedy join reordering** based on pairwise selectivity estimates:
+
+```
+What we CAN estimate (from base table sketches):
+  - Pairwise containment: containment(A, B) for any tables A, B
+  - Pairwise fanout: fanout(A), fanout(B)
+  - First join output: |A| × containment(A,B) × fanout(B)
+
+What we CANNOT estimate accurately:
+  - Intermediate result sketches: After A ⋈ B, which keys survive?
+  - Multi-hop containment: containment((A ⋈ B), C) requires (A ⋈ B)'s keys
+  - Bushy plan costs: (A ⋈ B) ⋈ (C ⋈ D) needs intermediate sketches
+```
+
+**Greedy reordering algorithm:**
+
+```cpp
+// At reoptimization point, choose next join greedily
+JoinEdge selectNextJoin(Set<Table> remainingTables, Table currentResult) {
+    JoinEdge bestJoin = null;
+    double bestCost = INFINITY;
+
+    for (Table t : remainingTables) {
+        if (hasJoinEdge(currentResult, t)) {
+            // Estimate using base table sketches
+            // Approximation: use currentResult's original base table sketch
+            double cost = estimateJoinCost(currentResult, t);
+            if (cost < bestCost) {
+                bestCost = cost;
+                bestJoin = edge(currentResult, t);
+            }
+        }
+    }
+    return bestJoin;
+}
+```
+
+**Why greedy is often sufficient:**
+
+| Scenario | Greedy Performance |
+|----------|-------------------|
+| Star schema (fact + dims) | Optimal: all joins through fact table |
+| Snowflake | Near-optimal: dims join through fact |
+| Chain joins (A-B-C-D) | Good: picks most selective edge first |
+| Complex graphs | May miss bushy plans |
+
+**Future work: Full DP exploration**
+
+For comprehensive join enumeration, we would need:
+1. Collect sketches at intermediate results (after each join)
+2. Use section boundaries as sketch collection points
+3. Cache intermediate sketches for DP memoization
+
+This is deferred to Phase 5+ as greedy reordering addresses most practical cases.
 
 ##### Size Analysis
 
