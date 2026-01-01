@@ -2742,16 +2742,246 @@ The section boundary approach naturally provides "downstream-only" reoptimizatio
 
 **Recommendation**: Per-query buffer pools, isolated decision making.
 
-### 11.5 Integration with Existing Features
+### 11.5 Integration with History-Based Optimization (HBO)
 
-**Question**: How does AEF interact with dynamic filtering, history-based stats, etc.?
+**Question**: How does AEF interact with HBO, and can we avoid repeated measurement overhead?
 
-**Analysis**:
-- Dynamic filtering: AEF can observe filter effectiveness, adjust
-- History-based stats: AEF validates/updates historical predictions
-- Fault-tolerant execution: Buffers provide natural checkpoints
+**Key Insight**: AEF measurements should feed into HBO so future queries reuse learned statistics. This transforms AEF from "always measure" to "measure once, reuse many times."
 
-**Recommendation**: Design AEF as complementary to existing features.
+#### The Feedback Loop
+
+```
+First Query (table pair A ⋈ B):
+  1. Optimizer: LOW confidence on A ⋈ B selectivity
+  2. Insert AEF → measure containment, fanout
+  3. Execute with actual statistics
+  4. Store measured stats in HBO
+
+Subsequent Queries (same A ⋈ B):
+  1. Optimizer: HIGH confidence (from HBO)
+  2. Skip AEF insertion → no measurement overhead
+  3. Use cached selectivity from HBO
+```
+
+#### What to Store: Hash Samples vs Bloom Filters
+
+**Option 1: Bloom Filters**
+
+```
+Bloom filter membership test:
+  Build side keys: {1, 5, 7, 12, 99} → Bloom Filter
+  Probe sample: {1, 3, 5, 8, 10}
+  Test: {1: ✓, 3: ✗, 5: ✓, 8: ✗, 10: ✗}
+  Containment ≈ 2/5 = 0.4
+```
+
+| NDV | Size (1% FPR) | Size (0.1% FPR) |
+|-----|---------------|-----------------|
+| 10K | 12 KB | 18 KB |
+| 100K | 120 KB | 180 KB |
+| 1M | 1.2 MB | 1.8 MB |
+| 10M | 12 MB | 18 MB |
+
+**Problem**: Storage scales with NDV. Large dimension tables become expensive.
+
+**Option 2: Hash Samples (Recommended)**
+
+Store a fixed-size sample of key hashes instead:
+
+```java
+class JoinStatsSample {
+    long[] keyHashes;           // 1K samples × 8 bytes = 8 KB
+    HyperLogLog ndvEstimate;    // 12 KB
+    long totalRows;             // For fanout calculation
+    double measuredContainment; // From last execution
+    double measuredFanout;      // From last execution
+    Instant lastUpdated;
+}
+```
+
+| Aspect | Bloom Filter | Hash Sample |
+|--------|--------------|-------------|
+| Storage | O(NDV) - unbounded | Fixed 8 KB |
+| Containment accuracy | Exact (minus FPR) | ~3% error |
+| Fanout estimation | No | Yes (frequency tracking) |
+| Works for 10M+ keys | Expensive | Same 8 KB |
+| Build cost | O(n) | O(n) reservoir sampling |
+
+**Recommendation**: Use hash samples for bounded storage.
+
+#### HBO Storage Schema
+
+```java
+// Key: (probeTableId, buildTableId, joinColumns)
+class JoinSelectivityStats {
+    // Core measurements
+    double containment;         // P(probe key in build)
+    double buildFanout;         // Avg build rows per matching key
+    double probeFanout;         // Avg probe rows per matching key
+
+    // For sample-to-sample matching in optimizer
+    JoinSketch buildSample;     // Hash sample from build side
+    JoinSketch probeSample;     // Hash sample from probe side
+
+    // Metadata
+    long observationCount;      // How many times measured
+    Instant lastObserved;
+    double variance;            // Stability of measurements
+}
+
+// Stored in HBO catalog
+interface JoinStatsProvider {
+    Optional<JoinSelectivityStats> getJoinStats(
+        TableHandle probeTable,
+        TableHandle buildTable,
+        List<ColumnHandle> joinColumns);
+
+    void recordJoinStats(
+        TableHandle probeTable,
+        TableHandle buildTable,
+        List<ColumnHandle> joinColumns,
+        JoinSelectivityStats stats);
+}
+```
+
+#### Integration Points
+
+**1. Optimizer queries HBO before inserting AEF:**
+
+```java
+class RegretAwareAEFPlanner {
+
+    PlanNode planWithAEF(JoinGraph graph) {
+        for (JoinEdge edge : graph.getEdges()) {
+            // Check HBO for cached statistics
+            Optional<JoinSelectivityStats> cached =
+                hboProvider.getJoinStats(edge.getProbe(), edge.getBuild(), edge.getKeys());
+
+            if (cached.isPresent() && cached.get().isRecent()) {
+                // High confidence from HBO - no AEF needed
+                edge.setConfidence(HIGH);
+                edge.setSelectivity(cached.get().getSelectivity());
+            } else {
+                // No HBO data - consider AEF
+                edge.setConfidence(LOW);
+            }
+        }
+
+        // Regret-aware decision now considers HBO confidence
+        return decideAEFInsertion(graph);
+    }
+}
+```
+
+**2. AEF execution feeds back to HBO:**
+
+```java
+class AdaptiveExchangeCoordinator {
+
+    void onJoinStatsObserved(JoinNode join, JoinProbeStats stats) {
+        // Record in HBO for future queries
+        hboProvider.recordJoinStats(
+            join.getProbeTable(),
+            join.getBuildTable(),
+            join.getJoinColumns(),
+            JoinSelectivityStats.builder()
+                .containment(stats.containment())
+                .fanout(stats.fanout())
+                .buildSample(stats.buildSketch())
+                .probeSample(stats.probeSketch())
+                .observedAt(Instant.now())
+                .build());
+    }
+}
+```
+
+**3. Confidence increases with HBO history:**
+
+```java
+ConfidenceLevel getConfidence(JoinEdge edge, JoinSelectivityStats hboStats) {
+    if (hboStats == null) {
+        return LOW;  // Never observed
+    }
+
+    // More observations = higher confidence
+    if (hboStats.observationCount >= 10 && hboStats.variance < 0.1) {
+        return HIGH;  // Stable, well-observed
+    }
+
+    if (hboStats.observationCount >= 3) {
+        return MEDIUM;  // Some observations
+    }
+
+    // Check staleness
+    if (hboStats.lastObserved.isBefore(Instant.now().minus(Duration.ofDays(7)))) {
+        return LOW;  // Stale data
+    }
+
+    return MEDIUM;
+}
+```
+
+#### Sample-to-Sample Matching with HBO
+
+When HBO has samples from prior executions, the optimizer can estimate containment for **new table pairs** without AEF:
+
+```java
+// Table A was probed against B before (have A's sample)
+// Table A will now join with C (have C's sample from another query)
+// Can estimate A ⋈ C containment without executing!
+
+double estimateContainmentFromHBO(TableHandle probe, TableHandle build) {
+    JoinSketch probeSketch = hboProvider.getSampleForTable(probe);
+    JoinSketch buildSketch = hboProvider.getSampleForTable(build);
+
+    if (probeSketch != null && buildSketch != null) {
+        return estimateFromSamples(buildSketch, probeSketch);
+    }
+    return UNKNOWN;
+}
+```
+
+This enables "transitive" optimization - if we've seen A with B, and B with C, we can estimate A with C.
+
+#### Staleness and Invalidation
+
+```java
+class JoinStatsInvalidator {
+
+    void onTableModified(TableHandle table) {
+        // Invalidate all join stats involving this table
+        hboProvider.invalidateStatsForTable(table);
+    }
+
+    void onPartitionModified(TableHandle table, TupleDomain<ColumnHandle> partition) {
+        // Partial invalidation for partitioned tables
+        hboProvider.markStatsStale(table, partition);
+    }
+
+    boolean isStale(JoinSelectivityStats stats, TableHandle table) {
+        Instant tableLastModified = metastore.getLastModifiedTime(table);
+        return stats.lastObserved.isBefore(tableLastModified);
+    }
+}
+```
+
+#### Summary
+
+| Scenario | Before HBO Integration | After HBO Integration |
+|----------|----------------------|----------------------|
+| First query on table pair | AEF measures | AEF measures, stores to HBO |
+| Repeat query, same tables | AEF measures again | Uses HBO, skips AEF |
+| Similar query, table modified | AEF measures | HBO invalidated, AEF measures |
+| New table pair, samples exist | AEF measures | Sample-to-sample from HBO |
+
+**Storage estimate for HBO samples:**
+
+```
+Per join column pair: ~20 KB (8 KB sample + 12 KB HLL + metadata)
+1000 table pairs: ~20 MB
+```
+
+Much more scalable than storing Bloom filters for every table.
 
 ### 11.6 Build Progress Accuracy
 
