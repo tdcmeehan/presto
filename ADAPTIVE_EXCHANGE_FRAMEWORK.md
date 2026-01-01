@@ -1277,6 +1277,8 @@ class CoordinatorSketchMerger {
 | Union + subsample | Full union, then subsample | Simpler workers, more merging |
 | Bounded union | Stop adding when target reached | Biased toward early reporters |
 
+*Note: At 10K samples × 8 bytes = 80KB per worker, sample size is small. A minor optimization: scale per-worker samples by coverage threshold (send 9K if accepting 90% coverage).*
+
 #### Recommended Approach
 
 Combine row-weighted quorum (Option D) with progressive stats (Option E):
