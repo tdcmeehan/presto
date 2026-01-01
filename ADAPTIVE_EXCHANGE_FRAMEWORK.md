@@ -824,9 +824,13 @@ void onEstimateUpdated(JoinNode join, long newEstimate, double confidence) {
 
 **Key insight:** We don't just observe cardinality—we measure the actual components of join selectivity (NDV, containment, fanout) from real data. This gives 10-100x more accurate estimates than catalog-based formulas that rely on assumptions about data distribution.
 
-### 3.5 Confidence-Based Insertion
+### 3.5 Adaptive Exchange Insertion Strategy
 
-The optimizer inserts adaptive exchanges **selectively** based on statistics confidence:
+The optimizer must decide **where** to insert adaptive exchanges. This section covers the baseline confidence-based approach and an enhanced regret-aware strategy.
+
+#### 3.5.1 Baseline: Confidence-Based Insertion
+
+The simplest approach inserts adaptive exchanges based on statistics confidence:
 
 ```java
 class AdaptiveExchangePlanner {
@@ -856,6 +860,175 @@ class AdaptiveExchangePlanner {
     }
 }
 ```
+
+**Limitation:** This approach only considers whether statistics are uncertain, not whether being wrong actually matters. It may:
+- Insert AEF where uncertainty exists but the plan wouldn't change anyway
+- Skip AEF where uncertainty is "medium" but the cost of being wrong is high
+
+#### 3.5.2 Enhanced: Regret-Aware Insertion
+
+A more sophisticated approach considers the **cost of being wrong**, not just uncertainty:
+
+```
+Regret = Cost(chosen plan) − Cost(optimal plan with perfect information)
+```
+
+**Key insight:** Insert AEF where the plan decision is **close** and **uncertain**:
+
+```java
+class RegretAwareAEFPlanner {
+
+    PlanNode planWithAEF(JoinGraph graph) {
+        // 1. Enumerate candidate join orders
+        List<PlanNode> candidates = enumerateJoinOrders(graph);
+
+        // 2. Find best and second-best by estimated cost
+        PlanNode best = selectLowestCost(candidates);
+        PlanNode secondBest = selectSecondLowestCost(candidates);
+
+        // 3. Check if decision is "close" - high regret if wrong
+        double costRatio = cost(secondBest) / cost(best);
+        boolean closeDecision = costRatio < 1.5;  // Within 50%
+
+        // 4. Check if plans differ at an uncertain node
+        Set<PlanNodeId> decisionPoints = findWherePlansDiffer(best, secondBest);
+        boolean uncertainDecision = decisionPoints.stream()
+            .anyMatch(this::hasLowConfidenceStats);
+
+        // 5. Insert AEF if close AND uncertain
+        if (closeDecision && uncertainDecision) {
+            return insertAdaptiveExchanges(best, decisionPoints);
+        }
+
+        return best;
+    }
+
+    Set<PlanNodeId> findWherePlansDiffer(PlanNode plan1, PlanNode plan2) {
+        // Compare join orders to find divergence point
+        // e.g., plan1: A ⋈ B ⋈ C, plan2: A ⋈ C ⋈ B
+        // Difference is at the second join - measure B and C to decide
+    }
+}
+```
+
+**When this helps:**
+
+| Scenario | Confidence-Based | Regret-Aware |
+|----------|-----------------|--------------|
+| Low confidence, plans similar | Insert AEF (wasteful) | **Skip AEF** |
+| Low confidence, plans differ | Insert AEF | Insert AEF |
+| Medium confidence, plans very close | Skip AEF | **Insert AEF** |
+| High confidence | Skip AEF | Skip AEF |
+
+**Example:**
+
+```
+Query: A ⋈ B ⋈ C
+
+Stats:
+  |A| = 1M   (high confidence)
+  |B| = 100K (medium confidence - could be 50K to 200K)
+  |C| = 10K  (high confidence)
+
+Candidate plans:
+  Plan 1: (A ⋈ B) ⋈ C  - cost: 1000
+  Plan 2: (A ⋈ C) ⋈ B  - cost: 1050  (5% more expensive)
+
+Analysis:
+  - Plans are CLOSE (within 5%)
+  - Plans DIFFER at B vs C ordering
+  - B has only MEDIUM confidence
+
+  Confidence-based: Skip AEF (medium confidence is "good enough")
+  Regret-aware: INSERT AEF (plans are close, measurement could flip decision)
+```
+
+#### 3.5.3 Implementation in Presto
+
+The regret-aware approach requires minimal changes to Presto's optimizer:
+
+| Component | Exists? | Change Needed |
+|-----------|---------|---------------|
+| Confidence levels on stats | Partially | Wire through StatsCalculator |
+| Enumerate candidate plans | Yes (ReorderJoins) | Expose candidates before selecting |
+| Compare candidate costs | Yes | Already done |
+| Detect plan structure differences | No | New: compare join order structure |
+
+**Integration point:** The `ReorderJoins` rule already enumerates join orders and picks the best. We extend it to also check if the second-best is close and differs at uncertain nodes.
+
+```java
+// In ReorderJoins rule
+public Result apply(JoinNode join, Context context) {
+    JoinGraph graph = buildJoinGraph(join);
+    List<JoinOrder> candidates = enumerate(graph);
+
+    JoinOrder best = pickBest(candidates);
+    JoinOrder secondBest = pickSecondBest(candidates);
+
+    // NEW: regret-aware AEF decision
+    if (shouldInsertAEF(best, secondBest, context.getStatsProvider())) {
+        Set<PlanNodeId> measurementPoints =
+            findDivergencePoints(best, secondBest);
+        return Result.ofPlanNode(
+            insertAdaptiveExchanges(best.toPlan(), measurementPoints));
+    }
+
+    return Result.ofPlanNode(best.toPlan());
+}
+```
+
+**Estimated implementation effort:** ~3 weeks
+
+#### 3.5.4 Future Work: Full Regret Minimization
+
+The approach above is a heuristic approximation. Full regret minimization would:
+
+1. **Model uncertainty as distributions**, not just confidence levels
+2. **Propagate uncertainty through cost model** to get cost ranges
+3. **Compute expected regret** across all possible "worlds" (Monte Carlo sampling)
+4. **Calculate value-of-information** for each potential measurement point
+
+```java
+// Full regret minimization (future work)
+double computeExpectedRegret(Plan chosen, List<Plan> candidates,
+                              UncertaintyModel model) {
+    double totalRegret = 0;
+
+    // Sample possible true statistics
+    for (Stats sample : model.samplePossibleWorlds(1000)) {
+        double chosenCost = computeTrueCost(chosen, sample);
+        double optimalCost = candidates.stream()
+            .mapToDouble(p -> computeTrueCost(p, sample))
+            .min().getAsDouble();
+
+        totalRegret += (chosenCost - optimalCost);
+    }
+
+    return totalRegret / 1000;
+}
+
+double valueOfMeasurement(PlanNodeId node, List<Plan> candidates,
+                           UncertaintyModel model) {
+    double regretBefore = computeExpectedRegret(currentBest, candidates, model);
+
+    // If we measure node, uncertainty goes to zero
+    UncertaintyModel reduced = model.assumeMeasured(node);
+    double regretAfter = computeExpectedRegret(newBest, candidates, reduced);
+
+    return regretBefore - regretAfter;  // Value of information
+}
+```
+
+**Relevant research:**
+
+| Paper | Key Contribution |
+|-------|------------------|
+| SkinnerDB (Trummer et al., SIGMOD 2019) | Regret-bounded query processing using multi-armed bandits |
+| Proactive Re-Optimization (Babu et al., SIGMOD 2005) | Identifies "switchable" plan regions based on uncertain stats |
+| Robust Query Processing (Babcock & Chaudhuri, SIGMOD 2005) | Minimizes worst-case cost under uncertainty |
+| Parametric Query Optimization (Ioannidis et al., VLDB 1992) | Precomputes optimal plans for parameter ranges |
+
+Full regret minimization is deferred as it requires significant changes to the stats and cost infrastructure (~3-4 months implementation). The heuristic approach captures most of the value with minimal changes.
 
 ---
 
