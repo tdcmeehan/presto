@@ -1055,7 +1055,291 @@ class AdaptiveExchangeCoordinator {
 }
 ```
 
-### 4.5 Hold Signal Protocol
+### 4.5 Distributed Statistics Collection
+
+During the pilot phase, statistics must be collected from workers executing across the cluster. This section covers the options for aggregating statistics and handling stragglers.
+
+#### The Core Question
+
+```
+All workers execute sample splits in parallel → report statistics
+Coordinator must decide: when do we have "enough" statistics?
+```
+
+#### Option A: Single Worker
+
+```
+Coordinator picks Worker-1 for pilot
+Worker-1: executes sample splits → reports statistics
+Other workers: idle during pilot, then execute remaining splits
+```
+
+| Pros | Cons |
+|------|------|
+| Simple coordination | Sample only from one worker's partitions |
+| No straggler problem | May miss skew in other partitions |
+| Fast response | Underutilizes cluster |
+
+**Verdict**: Not recommended for partitioned data. Different workers see different key ranges:
+
+```
+Worker 1: buckets 0-3   → keys A-F
+Worker 2: buckets 4-7   → keys G-M
+Worker 3: buckets 8-11  → keys N-Z
+
+Single worker: only sees 1/3 of key space → biased sample
+```
+
+#### Option B: All Workers, Wait for All
+
+```
+All workers: execute sample splits in parallel → report statistics
+Coordinator: wait for ALL → merge → decide
+```
+
+| Pros | Cons |
+|------|------|
+| Representative across all partitions | Straggler blocks decision |
+| Full coverage | Max latency = slowest worker |
+| Simple merging | All-or-nothing |
+
+**Verdict**: Safe but potentially slow. May be acceptable for small clusters.
+
+#### Option C: Worker Quorum
+
+```
+All workers: execute sample splits → report as ready
+Coordinator: decide when 80% of workers have reported
+```
+
+| Pros | Cons |
+|------|------|
+| Not blocked by one straggler | May miss skewed partition |
+| Simple threshold | Equal weight to all workers |
+
+**Critical Problem — Skew Stragglers:**
+
+```
+Worker 1: 1M rows   → finishes fast  → reports
+Worker 2: 1M rows   → finishes fast  → reports
+Worker 3: 100M rows → slow (skewed!) → still running...
+
+80% quorum reached (2/3 workers) → decide without Worker 3
+Result: Miss the partition with 98% of the data!
+```
+
+A straggler might be slow *because* it has a skewed partition. That's exactly the worker whose statistics matter most.
+
+**Verdict**: Dangerous. Can miss critical skew information.
+
+#### Option D: Row-Weighted Quorum (Recommended)
+
+Wait for workers representing X% of *data*, not X% of workers:
+
+```java
+class DistributedStatsAggregator {
+    Map<TaskId, WorkerProgress> workerProgress;  // From progress reports
+    Map<TaskId, JoinSketch> receivedStats;       // Completed stats
+
+    boolean hasEnoughCoverage() {
+        // Rows from workers that have reported complete stats
+        long reportedRows = receivedStats.values().stream()
+            .mapToLong(s -> s.totalRows)
+            .sum();
+
+        // Total rows seen by ALL workers (from progress reports)
+        long totalRowsSeen = workerProgress.values().stream()
+            .mapToLong(p -> p.rowsProcessed)
+            .sum();
+
+        // Wait for 90% of DATA, not 90% of workers
+        return (double) reportedRows / totalRowsSeen >= 0.9;
+    }
+}
+```
+
+```
+Worker 1: 1M rows (1%)    → reported  ✓
+Worker 2: 1M rows (1%)    → reported  ✓
+Worker 3: 100M rows (98%) → pending...
+
+Coverage: 2M / 102M = 2% → WAIT for Worker 3
+```
+
+| Pros | Cons |
+|------|------|
+| Naturally waits for heavy partitions | Requires progress reporting |
+| Weights by data volume | Still blocked by true stragglers |
+| Captures skew |  |
+
+#### Option E: Progressive Stats with Partial Reports
+
+Workers report statistics incrementally, not just at completion:
+
+```java
+class ProgressiveStats implements TaskOutput {
+    TaskId workerId;
+    long rowsProcessedSoFar;
+    JoinSketch partialSketch;     // Stats computed so far
+    boolean isComplete;
+}
+```
+
+```
+Timeline:
+  T=50ms:  Worker 1 complete (1M rows, full stats)
+  T=50ms:  Worker 2 complete (1M rows, full stats)
+  T=50ms:  Worker 3 partial  (10M rows so far, partial stats)
+  T=100ms: Worker 3 partial  (50M rows so far, partial stats)
+  T=100ms: Coordinator: "Have 52M/102M rows covered, Worker 3 is big"
+           Can use partial stats from Worker 3 + complete from 1,2
+  T=200ms: Worker 3 complete (100M rows, full stats)
+           Coordinator: "Refine estimate with complete stats"
+```
+
+| Pros | Cons |
+|------|------|
+| Early visibility into stragglers | More complex protocol |
+| Can use partial stats | Partial stats less accurate |
+| Progressive refinement | More TaskOutput messages |
+
+#### Option F: Distinguish Skew Straggler vs Slow Machine
+
+Not all stragglers are equal:
+
+| Signal | Skew Straggler | Slow Machine |
+|--------|---------------|--------------|
+| Rows processed | High (10x+ average) | Normal |
+| Bytes read | High | Normal |
+| Processing rate | Normal MB/s | Low MB/s |
+| CPU utilization | High | Low or I/O waiting |
+
+```java
+enum StragglerType {
+    SKEW,        // Lots of data, processing at normal rate
+    SLOW_MACHINE // Normal data, processing slowly
+}
+
+StragglerType classifyStraggler(WorkerProgress progress,
+                                 WorkerProgress avgProgress) {
+    double dataRatio = progress.rowsProcessed / avgProgress.rowsProcessed;
+    double rateRatio = progress.bytesPerSecond / avgProgress.bytesPerSecond;
+
+    if (dataRatio > 5.0 && rateRatio > 0.7) {
+        return SKEW;        // Lots of data, normal rate → wait
+    } else if (dataRatio < 2.0 && rateRatio < 0.5) {
+        return SLOW_MACHINE; // Normal data, slow rate → don't wait
+    }
+    return UNKNOWN;
+}
+```
+
+For skew stragglers: **wait** — we need their statistics
+For slow machines: **don't wait** — launch speculative copy instead
+
+#### Merging Statistics from Multiple Workers
+
+Sketches are designed to be mergeable:
+
+```java
+class CoordinatorSketchMerger {
+
+    JoinSketch merge(Collection<JoinSketch> workerSketches) {
+        JoinSketch merged = new JoinSketch();
+
+        for (JoinSketch sketch : workerSketches) {
+            // HLL: merge registers (standard algorithm)
+            merged.hll.merge(sketch.hll);
+
+            // Row samples: union (may need subsampling)
+            merged.keyHashes.addAll(sketch.keyHashes);
+
+            // Counts: sum
+            merged.totalRows += sketch.totalRows;
+        }
+
+        // Subsample if union too large
+        if (merged.keyHashes.size() > TARGET_SAMPLE_SIZE) {
+            merged.keyHashes = reservoirSample(
+                merged.keyHashes, TARGET_SAMPLE_SIZE);
+        }
+
+        return merged;
+    }
+}
+```
+
+**Sample size management options:**
+
+| Approach | Mechanism | Trade-off |
+|----------|-----------|-----------|
+| Global rate | Each worker samples at `target / numWorkers` | Coordinated, predictable size |
+| Union + subsample | Full union, then subsample | Simpler workers, more merging |
+| Bounded union | Stop adding when target reached | Biased toward early reporters |
+
+#### Recommended Approach
+
+Combine row-weighted quorum (Option D) with progressive stats (Option E):
+
+```java
+class AdaptiveStatsCollector {
+
+    void onWorkerProgress(TaskId worker, ProgressiveStats stats) {
+        updateProgress(worker, stats);
+
+        if (stats.isComplete) {
+            mergeCompleteStats(worker, stats.sketch);
+        } else {
+            updatePartialStats(worker, stats.sketch);
+        }
+
+        // Check decision criteria
+        if (shouldMakeDecision()) {
+            makeDecision();
+        }
+    }
+
+    boolean shouldMakeDecision() {
+        double dataCoverage = getDataCoverage();  // Row-weighted
+
+        // Have 90% of data covered by complete or partial stats
+        if (dataCoverage >= 0.9) return true;
+
+        // Timeout - use what we have
+        if (elapsed() > maxPilotTime) return true;
+
+        // All workers complete
+        if (allWorkersComplete()) return true;
+
+        return false;
+    }
+
+    double getDataCoverage() {
+        long coveredRows = 0;
+        for (TaskId worker : allWorkers) {
+            if (hasCompleteStats(worker)) {
+                coveredRows += getCompleteStats(worker).totalRows;
+            } else if (hasPartialStats(worker)) {
+                // Partial stats cover the rows processed so far
+                coveredRows += getPartialStats(worker).rowsProcessed;
+            }
+        }
+        return (double) coveredRows / totalRowsAcrossAllWorkers();
+    }
+}
+```
+
+**Summary:**
+
+| Criterion | Decision |
+|-----------|----------|
+| 90% of rows covered (complete + partial) | Proceed |
+| All workers complete | Proceed |
+| Timeout reached | Proceed with lower confidence |
+| Skew straggler detected | Wait for it |
+| Slow machine detected | Use partial or skip |
+
+### 4.6 Hold Signal Protocol
 
 ```java
 // Worker-side: Adaptive exchange signals upstream to hold
@@ -1096,7 +1380,7 @@ class AdaptiveExchangeOperator {
 }
 ```
 
-### 4.6 Reoptimization Scope
+### 4.7 Reoptimization Scope
 
 With cascading holds, the coordinator can reoptimize at different scopes:
 
