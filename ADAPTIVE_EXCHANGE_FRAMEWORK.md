@@ -239,6 +239,8 @@ The buffer provides **replay capability** for speculative task launch:
 - First completion wins, cancel stragglers
 - Reduces P99 latency without wasting source I/O
 
+**Prerequisite:** Requires split-level completion tracking and output deduplication. See Section 11.8 for details on split rescheduling infrastructure.
+
 #### Capability 4: Fault Tolerance
 
 The buffer serves as a lightweight checkpoint:
@@ -256,6 +258,8 @@ Recovery:
 ```
 
 For data already past the buffer, standard fault tolerance applies. But for data in the buffer, the section boundary provides a natural replay point without requiring full source re-execution.
+
+**Prerequisite:** For stateful operators (partial aggregation, sort), additional infrastructure is needed to track which splits contributed to output. See Section 11.8 for details.
 
 #### Capability 5: SPJ Partition Routing
 
@@ -2344,6 +2348,110 @@ For 95% CI within ±20% of true containment:
 - Works for tables from 10K to 10B rows
 
 **Recommendation**: This is the preferred approach for early estimation. Prototype in Phase 1 and validate before removing hash table probe fallback.
+
+### 11.8 Split Rescheduling Infrastructure
+
+**Question**: What infrastructure is needed to support fault tolerance and speculative execution with the buffer primitive?
+
+**Problem**: The buffer enables replay, but we need to track what to replay and handle output deduplication.
+
+**Challenge with Stateful Operators:**
+
+```
+Splits [S1, S2, S3, S4, S5] → Partial Agg → Output Pages [P1, P2, P3]
+
+P1 = f(S1, S2, part of S3)    ← aggregation mixes contributions
+P2 = f(rest of S3, S4)
+P3 = f(S5)  ← worker fails here
+
+Problem: Can't replay just S5 - don't know what state was accumulated
+```
+
+For stateless operators (scan, filter, map), each split produces independent output. For stateful operators (aggregation, sort), output depends on accumulated state across splits.
+
+**Required Infrastructure:**
+
+| Component | Purpose |
+|-----------|---------|
+| Split completion tracking | Know which splits finished processing |
+| Output tagging | Associate output with source splits |
+| Idempotent buffer | Deduplicate replayed output |
+| State checkpointing (stateful ops) | Restore accumulator state on failure |
+
+**Approach 1: Idempotent Output (Stateless Operators)**
+
+```java
+// Tag each output page with identity
+class TaggedPage {
+    SplitId splitId;
+    long sequenceInSplit;  // Incrementing counter per split
+    Page page;
+}
+
+// Buffer deduplicates by (splitId, sequence)
+class IdempotentBuffer {
+    Set<PageId> received;  // (splitId, seq) pairs already seen
+
+    void addPage(TaggedPage page) {
+        PageId id = new PageId(page.splitId, page.sequenceInSplit);
+        if (received.add(id)) {  // Returns false if already present
+            buffer.add(page.page);
+        }
+        // Else: duplicate from replay, ignore
+    }
+}
+```
+
+On failure/speculation, replay all splits - buffer automatically deduplicates.
+
+**Approach 2: Split-Boundary Flush (Stateful Operators)**
+
+```java
+class PartialAggOperator {
+    Set<SplitId> contributingSplits = new HashSet<>();
+
+    void processRow(Row row, SplitId currentSplit) {
+        contributingSplits.add(currentSplit);
+        accumulator.add(row);
+    }
+
+    void onSplitComplete(SplitId split) {
+        // Flush aggregation state at split boundary
+        Page output = flushCurrentGroups();
+        emit(new TaggedPage(output, contributingSplits.copy()));
+        contributingSplits.clear();
+    }
+}
+```
+
+Each output page knows exactly which splits contributed. On failure:
+1. Identify which output pages reached the buffer
+2. Extract `contributingSplits` from each
+3. Replay only splits not in any `contributingSplits` set
+
+**Trade-offs:**
+
+| Approach | Stateless Ops | Stateful Ops | Overhead |
+|----------|--------------|--------------|----------|
+| Idempotent output | ✓ Works | ✗ Doesn't help | Page tagging |
+| Split-boundary flush | ✓ Works | ✓ Works | Reduces aggregation efficiency |
+| Full state checkpoint | ✓ Works | ✓ Works | Serialize accumulator periodically |
+
+**Note on Lifespans:**
+
+Split-level sampling (Section 11.1) is orthogonal to lifespans. A lifespan represents a data partition (bucket), while sample/rest is a scheduling priority:
+
+```
+Lifespan 0 (bucket 0):  [S0.1, S0.2, S0.3, S0.4]
+Lifespan 1 (bucket 1):  [S1.1, S1.2, S1.3]
+
+Sample (across all lifespans):  [S0.1, S1.1]  ← scheduling priority
+Rest (across all lifespans):    [S0.2, S0.3, S0.4, S1.2, S1.3]
+```
+
+Sample splits are scheduled first across all lifespans, not as a separate lifespan. This requires a scheduling priority mechanism orthogonal to the lifespan concept.
+
+**Recommendation**: Start with idempotent output for stateless operators (covers most scan/filter/join cases). Add split-boundary flush for partial aggregation as a follow-on. Full state checkpointing is future work for comprehensive fault tolerance.
 
 ---
 
