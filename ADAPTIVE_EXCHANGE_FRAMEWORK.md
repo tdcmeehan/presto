@@ -3327,5 +3327,104 @@ Metrics to track:
 
 ---
 
-*Document Version: 0.3*
-*Last Updated: December 2024*
+*Document Version: 0.4*
+*Last Updated: January 2025*
+
+---
+
+## Appendix D: Axiom Join Sampling Model
+
+This appendix documents Meta's Axiom approach to join cardinality estimation via empirical sampling. This serves as a reference for integrating similar functionality into Presto's HBO infrastructure.
+
+### D.1 Data Model
+
+Axiom stores bidirectional fanout statistics for each join edge:
+
+```
+Key: Canonical string identifying table pair + join keys
+Value: (lr_fanout, rl_fanout)
+  - lr_fanout: Average right rows matched per left row
+  - rl_fanout: Average left rows matched per right row
+```
+
+### D.2 Canonical Key Generation
+
+Keys are generated deterministically regardless of join direction:
+
+```cpp
+// Example: JOIN orders ON customer.c_custkey = orders.o_custkey
+// Produces: "customer c_custkey   orders o_custkey "
+
+std::pair<std::string, bool> generateJoinSampleKey(
+    std::string leftTable, std::vector<std::string> leftKeys,
+    std::string rightTable, std::vector<std::string> rightKeys) {
+
+  // Sort keys alphabetically for determinism
+  std::vector<int> indices(leftKeys.size());
+  std::iota(indices.begin(), indices.end(), 0);
+  std::sort(indices.begin(), indices.end(),
+    [&](int a, int b) { return leftKeys[a] < leftKeys[b]; });
+
+  // Build canonical strings
+  std::string left = leftTable + " ";
+  std::string right = rightTable + " ";
+  for (int i : indices) {
+    left += leftKeys[i] + " ";
+    right += rightKeys[i] + " ";
+  }
+
+  // Consistent ordering (lexicographically smaller first)
+  if (left < right) {
+    return {left + "  " + right, false};  // not swapped
+  }
+  return {right + "  " + left, true};     // swapped
+}
+```
+
+### D.3 Serialization Format
+
+```json
+{
+  "joins": [
+    {
+      "key": "customer c_custkey   orders o_custkey ",
+      "lr": 10.5,
+      "rl": 0.95
+    },
+    {
+      "key": "lineitem l_orderkey   orders o_orderkey ",
+      "lr": 1.0,
+      "rl": 4.2
+    }
+  ]
+}
+```
+
+### D.4 Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Bidirectional fanout | Supports both join orderings from single sample |
+| Alphabetically sorted keys | Deterministic key generation regardless of SQL join order |
+| Lexicographic table ordering | Same cache entry hit whether A JOIN B or B JOIN A |
+| Base tables only | Derived table cardinalities are unpredictable |
+
+### D.5 Axiom Source References
+
+| Component | File | Lines |
+|-----------|------|-------|
+| History interface | axiom/optimizer/Cost.h | 37-91 |
+| VeloxHistory impl | axiom/optimizer/VeloxHistory.cpp | 32-83, 259-305 |
+| Join sample key generation | axiom/optimizer/QueryGraph.cpp | 283-311 |
+| Sample execution | axiom/optimizer/JoinSample.cpp | 211-256 |
+| Fanout calculation | axiom/optimizer/QueryGraph.cpp | 493-529 |
+
+### D.6 Differences from Presto Integration
+
+| Aspect | Axiom | Presto Integration |
+|--------|-------|-------------------|
+| Storage | In-memory + file | Redis via HBO provider |
+| Sampling | Executed during planning | Captured during execution |
+| Scope | Single process | Cluster-wide via Redis |
+| Invalidation | None | Table version tracking |
+| TTL | Session-scoped | Configurable (default 1 week) |
