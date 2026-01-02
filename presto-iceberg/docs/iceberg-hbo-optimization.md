@@ -62,7 +62,7 @@ snapshot, but HBO may override them with potentially stale historical estimates.
 
 ## Design
 
-### Two-Level Matching with Version-Aware Selection
+### Two-Level Matching with Connector-Driven Selection
 
 #### Phase 1: Version-Agnostic Lookup
 
@@ -76,15 +76,17 @@ Version-agnostic hash: hash(plan_structure + table_id + predicates)
 This allows retrieving all historical statistics entries across multiple table versions with
 a single lookup.
 
-#### Phase 2: Version-Aware Selection
+#### Phase 2: Connector-Driven Selection
 
-The connector determines the best matching version from available historical entries:
+The engine passes ALL candidates to the connector. The connector owns all validation logic:
 
-1. **Exact match** - If statistics exist for the current snapshot, use directly
-2. **Ancestor match** - If statistics exist for an ancestor snapshot, the connector can:
-   - Use the historical stats as-is (conservative)
-   - Compute compensation factors from manifest deltas (precise)
-3. **No match** - Fall back to connector-provided statistics
+- Version/ancestry validation (is this an ancestor snapshot?)
+- Drift checking (has data changed too much?)
+- Branch awareness (reject stats from different branches)
+- Tag handling (reject stats for old tagged versions querying recent data)
+- Compensation calculation (adjust stats based on row count changes)
+
+The engine does NOT pre-filter candidates. This consolidates all drift/version logic in one place.
 
 ### SPI Changes
 
@@ -92,22 +94,39 @@ The connector determines the best matching version from available historical ent
 
 ```java
 /**
- * Selects the best historical version match for HBO statistics.
+ * Select the best historical statistics match for the current table version.
+ * Connector handles all version semantics (ancestry, drift, branches, tags).
+ *
+ * The engine passes ALL candidates from version-agnostic lookup without
+ * pre-filtering. The connector owns all validation and drift checking.
  *
  * @param session The current session
- * @param tableHandle The current table handle (includes current version)
- * @param availableVersions List of versions with available HBO statistics
- * @return The best matching version with optional compensation metadata,
- *         or empty if no suitable match exists
+ * @param tableHandle The table handle for the current query (includes current version)
+ * @param candidates All historical statistics entries from version-agnostic lookup
+ * @return Best match with optional compensation, or empty if none suitable
  */
-default Optional<HistoricalVersionMatch> selectHistoricalVersion(
+default Optional<HistoricalStatisticsMatch> selectHistoricalStatistics(
     ConnectorSession session,
     ConnectorTableHandle tableHandle,
-    List<ConnectorTableVersion> availableVersions)
+    List<HistoricalStatisticsEntry> candidates)
 {
-    // Default implementation: no version-aware matching
-    // Non-versioned connectors (Hive) return empty, preserving current behavior
-    return Optional.empty();
+    // Default: exact match only (preserves current behavior for non-versioned connectors)
+    return candidates.stream()
+        .filter(e -> e.getTableHandle().equals(tableHandle))
+        .findFirst()
+        .map(e -> new HistoricalStatisticsMatch(e, Optional.empty()));
+}
+
+/**
+ * Returns a version-agnostic identifier for the table, used for HBO hash computation.
+ * Two handles for the same table at different versions should return equal identifiers.
+ *
+ * @param tableHandle The table handle (may include version info)
+ * @return Identifier excluding version, or the handle itself if not versioned
+ */
+default Object getTableIdentifier(ConnectorTableHandle tableHandle)
+{
+    return tableHandle;  // Default: use full handle (current behavior)
 }
 ```
 
@@ -115,90 +134,112 @@ default Optional<HistoricalVersionMatch> selectHistoricalVersion(
 
 ```java
 /**
- * Represents a table version identifier that connectors can use for matching.
+ * An entry from HBO storage representing statistics captured at a specific table version.
  */
-public interface ConnectorTableVersion {
-    /**
-     * Opaque version identifier (e.g., snapshot ID for Iceberg)
-     */
-    String getVersionId();
+public class HistoricalStatisticsEntry {
+    private final ConnectorTableHandle tableHandle;  // Includes version info
+    private final PlanStatistics statistics;
 
-    /**
-     * When this version was created
-     */
-    Instant getTimestamp();
-
-    /**
-     * Summary statistics from HBO for this version
-     */
-    PlanStatistics getStatistics();
+    public ConnectorTableHandle getTableHandle() { return tableHandle; }
+    public PlanStatistics getStatistics() { return statistics; }
 }
 
 /**
- * Result of version matching with optional compensation.
+ * Result of connector's historical statistics selection.
  */
-public class HistoricalVersionMatch {
-    private final ConnectorTableVersion matchedVersion;
-    private final Optional<StatisticsCompensation> compensation;
+public class HistoricalStatisticsMatch {
+    private final HistoricalStatisticsEntry entry;
+    private final Optional<Double> rowCountCompensation;  // e.g., 1.15 for 15% more rows
 
-    // Compensation allows adjusting historical stats based on version delta
-    // e.g., if matched version had 1M rows and current has 1.1M,
-    // compensation factor = 1.1
+    public HistoricalStatisticsEntry getEntry() { return entry; }
+    public Optional<Double> getRowCountCompensation() { return rowCountCompensation; }
 }
+```
+
+### Engine Flow
+
+```
+1. CANONICALIZATION
+   - Call connector.getTableIdentifier(handle) for each table
+   - Iceberg returns table UUID (excludes snapshot ID)
+   - Build canonical plan hash using version-agnostic identifiers
+
+2. HBO LOOKUP
+   - Query HBO store with version-agnostic hash
+   - Returns List<HistoricalStatisticsEntry> (all versions)
+
+3. CONNECTOR SELECTION
+   - Call connector.selectHistoricalStatistics(currentHandle, allCandidates)
+   - Connector validates ancestry, drift, branches, tags
+   - Connector returns best match or empty
+
+4. APPLY STATISTICS
+   - If match returned, use stats with optional compensation
+   - If empty, no HBO stats for this node (fall back to connector stats)
 ```
 
 ### Iceberg Implementation
 
 ```java
 @Override
-public Optional<HistoricalVersionMatch> selectHistoricalVersion(
+public Object getTableIdentifier(ConnectorTableHandle tableHandle)
+{
+    IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
+    // Return identifier without snapshot - table UUID or schema.table path
+    return handle.getSchemaTableName();
+}
+
+@Override
+public Optional<HistoricalStatisticsMatch> selectHistoricalStatistics(
     ConnectorSession session,
     ConnectorTableHandle tableHandle,
-    List<ConnectorTableVersion> availableVersions)
+    List<HistoricalStatisticsEntry> candidates)
 {
-    IcebergTableHandle icebergHandle = (IcebergTableHandle) tableHandle;
-    long currentSnapshotId = icebergHandle.getSnapshotId().orElse(-1);
+    IcebergTableHandle current = (IcebergTableHandle) tableHandle;
+    long currentSnapshotId = current.getSnapshotId().orElse(-1);
 
-    Table table = loadTable(icebergHandle);
+    Table table = loadTable(current);
     Snapshot currentSnapshot = table.snapshot(currentSnapshotId);
 
-    // Build ancestor chain for the current snapshot
+    // Build ancestor set for current snapshot
     Set<Long> ancestorIds = new HashSet<>();
-    for (Snapshot s = currentSnapshot; s != null; s = s.parentId() != null ?
-            table.snapshot(s.parentId()) : null) {
+    for (Snapshot s = currentSnapshot; s != null;
+         s = s.parentId() != null ? table.snapshot(s.parentId()) : null) {
         ancestorIds.add(s.snapshotId());
     }
 
-    // Find the closest ancestor with statistics
-    return availableVersions.stream()
-        .filter(v -> ancestorIds.contains(Long.parseLong(v.getVersionId())))
-        .min(Comparator.comparingLong(v ->
-            Math.abs(currentSnapshot.timestampMillis() - v.getTimestamp().toEpochMilli())))
+    // Find best ancestor match
+    return candidates.stream()
+        .filter(e -> {
+            IcebergTableHandle h = (IcebergTableHandle) e.getTableHandle();
+            long snapshotId = h.getSnapshotId().orElse(-1);
+            // Only accept ancestors (handles branches, old tags correctly)
+            return ancestorIds.contains(snapshotId);
+        })
+        .min(Comparator.comparingLong(e -> {
+            // Prefer closest ancestor by snapshot distance
+            IcebergTableHandle h = (IcebergTableHandle) e.getTableHandle();
+            return snapshotDistance(table, currentSnapshotId, h.getSnapshotId().orElse(-1));
+        }))
         .map(matched -> {
-            // Optionally compute compensation from manifest deltas
-            Optional<StatisticsCompensation> compensation =
-                computeCompensation(table, matched, currentSnapshot);
-            return new HistoricalVersionMatch(matched, compensation);
+            // Compute compensation from manifest row counts
+            double compensation = computeRowCountCompensation(
+                table,
+                ((IcebergTableHandle) matched.getTableHandle()).getSnapshotId().orElse(-1),
+                currentSnapshotId);
+            return new HistoricalStatisticsMatch(matched, Optional.of(compensation));
         });
 }
 
-private Optional<StatisticsCompensation> computeCompensation(
-    Table table,
-    ConnectorTableVersion matched,
-    Snapshot current)
+private double computeRowCountCompensation(Table table, long fromSnapshot, long toSnapshot)
 {
-    long matchedSnapshotId = Long.parseLong(matched.getVersionId());
-    Snapshot matchedSnapshot = table.snapshot(matchedSnapshotId);
+    Snapshot from = table.snapshot(fromSnapshot);
+    Snapshot to = table.snapshot(toSnapshot);
 
-    // Use snapshot summaries to compute delta
-    long matchedRows = Long.parseLong(
-        matchedSnapshot.summary().get("total-records"));
-    long currentRows = Long.parseLong(
-        current.summary().get("total-records"));
+    long fromRows = Long.parseLong(from.summary().get("total-records"));
+    long toRows = Long.parseLong(to.summary().get("total-records"));
 
-    double rowCountFactor = (double) currentRows / matchedRows;
-
-    return Optional.of(new StatisticsCompensation(rowCountFactor));
+    return (double) toRows / fromRows;
 }
 ```
 
@@ -227,9 +268,7 @@ private TableStatistics makeTableStatistics(...) {
     result.setRowCount(Estimate.of(recordCount));
 
     // Manifest-derived stats are ground truth for current snapshot
-    if (isCurrentSnapshotStats) {
-        result.setConfidenceLevel(FACT);
-    }
+    result.setConfidenceLevel(FACT);
     // ...
 }
 ```
@@ -298,21 +337,21 @@ PlanStatistics {
 
 ### Non-Versioned Connectors (Hive, etc.)
 
-- `selectHistoricalVersion()` returns `Optional.empty()` by default
-- Falls back to existing hash-based exact matching
-- No behavioral changes
+- `selectHistoricalStatistics()` default returns exact match only
+- `getTableIdentifier()` default returns full handle
+- Behavior identical to current implementation
+- No changes required
 
-### Versioned Connectors (Iceberg, Delta)
+### Versioned Connectors (Iceberg, Delta, Hudi)
 
-- Opt-in to version-aware matching by implementing `selectHistoricalVersion()`
-- Can choose level of sophistication:
-  - Simple: Return closest ancestor by timestamp
-  - Advanced: Include compensation factors from manifest deltas
+- Opt-in by implementing both methods
+- Connector owns all version semantics
+- Can be as simple or sophisticated as needed
 
 ### Migration
 
 - Existing HBO statistics remain valid
-- New version-agnostic hashes computed alongside existing hashes
+- Version-agnostic hashes are new keys; old versioned hashes still work
 - Gradual adoption as connectors implement the new interface
 
 ## Implementation Plan
@@ -325,21 +364,27 @@ PlanStatistics {
 
 ### Phase 2: SPI Extension
 
-1. Add `ConnectorTableVersion` and `HistoricalVersionMatch` to SPI
-2. Add `selectHistoricalVersion()` to `ConnectorMetadata` with default implementation
-3. Update HBO lookup to use version-agnostic hashes
+1. Add `HistoricalStatisticsEntry` and `HistoricalStatisticsMatch` to SPI
+2. Add `selectHistoricalStatistics()` and `getTableIdentifier()` to `ConnectorMetadata`
+3. Update HBO to compute version-agnostic hashes using `getTableIdentifier()`
+4. Update HBO lookup to pass all candidates to connector
+5. Remove engine-side row count similarity check when connector implements selection
 
 ### Phase 3: Iceberg Implementation
 
-1. Implement `selectHistoricalVersion()` in Iceberg connector
-2. Add ancestor detection using snapshot parent chain
-3. Implement optional compensation using snapshot summaries
+1. Implement `getTableIdentifier()` - return table UUID/path without snapshot
+2. Implement `selectHistoricalStatistics()`:
+   - Build ancestor chain from current snapshot
+   - Filter candidates to ancestors only
+   - Rank by snapshot distance
+   - Compute row count compensation
+3. Add unit tests for branch and tag scenarios
 
-### Phase 4: Advanced Compensation
+### Phase 4: Observability
 
-1. Use manifest file deltas for precise row count adjustment
-2. Consider partition-level statistics for filtered queries
-3. Add metrics and logging for match quality
+1. Add metrics for match types (exact, ancestor, none)
+2. Add metrics for compensation factors applied
+3. Add debug logging for troubleshooting
 
 ## Metrics and Observability
 
@@ -349,18 +394,18 @@ PlanStatistics {
 |--------|-------------|
 | `hbo.version_match.exact` | Count of exact version matches |
 | `hbo.version_match.ancestor` | Count of ancestor version matches |
-| `hbo.version_match.none` | Count of no matches |
+| `hbo.version_match.none` | Count of no matches (connector returned empty) |
 | `hbo.compensation.factor` | Distribution of compensation factors applied |
 | `hbo.confidence.override` | Count of connector stats overriding HBO |
 
 ### Logging
 
 ```
-DEBUG: HBO version match for table iceberg.db.events:
-  Current version: snapshot_102
-  Matched version: snapshot_100 (ancestor, 2 generations)
+DEBUG: HBO statistics selection for table iceberg.db.events:
+  Current snapshot: 102
+  Candidates: [snapshot_100, snapshot_95, snapshot_80]
+  Selected: snapshot_100 (ancestor, distance=2)
   Compensation: rowCount *= 1.15
-  Match quality: 0.92
 ```
 
 ## References
