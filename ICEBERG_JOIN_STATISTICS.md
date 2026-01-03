@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.3
+**Version**: 0.4
 
 ---
 
@@ -546,9 +546,140 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 
 ---
 
-## 9. Size and Accuracy
+## 9. Statistics Lifecycle and Cross-Engine Behavior
 
-### 9.1 Sketch Sizes
+### 9.1 How Statistics Files Are Stored
+
+Statistics files are stored **separately from snapshots** in the table metadata:
+
+```json
+{
+  "format-version": 2,
+  "table-uuid": "...",
+  "current-snapshot-id": 123456,
+  "snapshots": [ ... ],
+  "statistics": [
+    {
+      "snapshot-id": 123450,
+      "statistics-path": "s3://bucket/table/metadata/abc-123.stats",
+      "file-size-in-bytes": 16384,
+      "file-footer-size-in-bytes": 1024,
+      "blob-metadata": [ ... ]
+    }
+  ]
+}
+```
+
+Key points:
+- Statistics files are in a **separate list** from snapshots
+- Each statistics file is **associated with a snapshot ID** but not embedded in the snapshot
+- Multiple statistics files can exist for different snapshots
+
+### 9.2 Cross-Engine Writes: Statistics Are NOT Clobbered ✅
+
+When Spark (or another engine that doesn't write statistics) updates the table:
+
+```
+Before Spark write:
+  - Snapshot 100 (current)
+  - Statistics file for snapshot 100 ← Presto wrote this
+
+After Spark INSERT:
+  - Snapshot 100
+  - Snapshot 101 (current, new)  ← Spark created this
+  - Statistics file for snapshot 100 ← STILL EXISTS!
+```
+
+**Why statistics survive:**
+1. Statistics files are stored in the `statistics` list at the table metadata level
+2. Spark's write creates a new snapshot but doesn't modify the `statistics` list
+3. The Iceberg spec states: *"Statistics are informational. A reader can choose to ignore statistics information."*
+4. Engines that don't support statistics simply **ignore** them, they don't delete them
+
+### 9.3 How Presto Handles Stale Statistics
+
+When the current snapshot doesn't have statistics, Presto finds the **closest** statistics file:
+
+```java
+// From TableStatisticsMaker.getClosestStatisticsFileForSnapshot()
+return icebergTable.statisticsFiles()
+    .stream()
+    .min((first, second) -> {
+        // 1. Compare by timestamp difference
+        long firstDiff = abs(target.timestampMillis() - firstSnap.timestampMillis());
+        long secondDiff = abs(target.timestampMillis() - secondSnap.timestampMillis());
+
+        // 2. Weight by row count difference (configurable)
+        if (targetTotalRecords.isPresent() && firstTotalRecords.isPresent()) {
+            double weight = getStatisticSnapshotRecordDifferenceWeight(session);
+            firstDiff += (long) (weight * abs(firstTotalRecords.get() - targetTotal));
+        }
+        return Long.compare(firstDiff, secondDiff);
+    });
+```
+
+**Selection criteria:**
+1. **Timestamp proximity**: Prefer statistics from snapshots closer in time
+2. **Row count similarity**: Weight by how different the row counts are (configurable via session property)
+3. **Scaling**: NDV values are scaled by `current_rows / stats_rows` ratio
+
+### 9.4 Statistics Staleness Scenarios
+
+| Scenario | Statistics Behavior | Accuracy Impact |
+|----------|---------------------|-----------------|
+| **Spark INSERT** | Uses older stats, scaled by row ratio | Good if distribution unchanged |
+| **Spark UPDATE** | Uses older stats | May be stale if keys changed |
+| **Spark DELETE** | Uses older stats, scaled down | Good for uniform deletes |
+| **Schema evolution** | Column ID mismatch → no stats for new columns | Falls back to defaults |
+| **Snapshot expiration** | Old stats files may be cleaned up | Need to re-ANALYZE |
+
+### 9.5 Statistics Cleanup
+
+Statistics files can be removed by:
+
+1. **`expire_snapshots`**: Cleans up statistics files for expired snapshots
+   ```sql
+   CALL iceberg.system.expire_snapshots('db.table', TIMESTAMP '2024-01-01 00:00:00')
+   ```
+
+2. **`remove_orphan_files`**: Does NOT delete valid statistics files (they're in the valid file list)
+
+3. **Manual removal**: Via Iceberg API
+   ```java
+   UpdateStatistics statsUpdate = table.updateStatistics();
+   table.statisticsFiles().stream()
+       .map(StatisticsFile::snapshotId)
+       .forEach(statsUpdate::removeStatistics);
+   statsUpdate.commit();
+   ```
+
+### 9.6 Recommendations for Production
+
+1. **Re-ANALYZE periodically**: After significant data changes (>20% row count change)
+2. **Re-ANALYZE after major updates**: If join key distributions change
+3. **Monitor staleness**: Track `collectedAt` timestamp vs current snapshot
+4. **Configure weight**: Tune `statistic_snapshot_record_difference_weight` for your workload
+5. **Coordinate with Spark jobs**: Schedule ANALYZE after major Spark ETL jobs
+
+### 9.7 Future: Incremental Statistics Updates
+
+Potential improvement: Instead of full re-ANALYZE, merge statistics from new data:
+
+```java
+// Hypothetical incremental update
+LongsSketch existingSketch = loadFromPuffin(oldStatsFile);
+LongsSketch newDataSketch = computeForNewFiles(appendedFiles);
+existingSketch.merge(newDataSketch);  // LongsSketch supports merge!
+writeToPuffin(existingSketch, newSnapshotId);
+```
+
+This would require tracking which files contributed to existing statistics.
+
+---
+
+## 10. Size and Accuracy
+
+### 10.1 Sketch Sizes
 
 | Component | Configuration | Size |
 |-----------|---------------|------|
@@ -558,7 +689,7 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 | Metadata | timestamps, row count | ~100 bytes |
 | **Total per column** | (with maxMapSize=1024) | **~136 KB** |
 
-### 9.2 Storage Budget
+### 10.2 Storage Budget
 
 | Scenario | Columns | Total Size |
 |----------|---------|------------|
@@ -568,7 +699,7 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 
 *Note: Much smaller than original CMS estimate due to LongsSketch efficiency*
 
-### 9.3 Accuracy
+### 10.3 Accuracy
 
 | Metric | Theta Error | Frequency Error | Combined |
 |--------|-------------|-----------------|----------|
@@ -660,5 +791,5 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 
 ---
 
-*Document Version: 0.3*
+*Document Version: 0.4*
 *Last Updated: January 2025*
