@@ -473,6 +473,225 @@ CREATE TABLE system.sampling.stored_samples (
 );
 ```
 
+## Approximate Data Structures for Join Fanout
+
+Computing join fanout requires tracking both **key membership** (which keys exist) and **key frequency** (how many rows per key). For distributed/mergeable sampling, we need approximate data structures.
+
+### Requirements
+
+For join fanout computation:
+- **Left-to-right fanout** = Σ(right_freq[k] for k in intersection) / |left_keys|
+- **Right-to-left fanout** = Σ(left_freq[k] for k in intersection) / |right_keys|
+
+We need structures that:
+1. Track distinct keys (for intersection)
+2. Track frequency of each key
+3. Are mergeable (for distributed sampling)
+4. Have bounded memory
+
+### Available in Presto
+
+| Structure | Purpose | Mergeable | Tracks Frequency |
+|-----------|---------|-----------|------------------|
+| **Theta Sketch** | Distinct count, set intersection | ✅ | ❌ |
+| **KHyperLogLog** | Jaccard index, intersection cardinality | ✅ | ❌ |
+| **KLL Sketch** | Quantile estimation | ✅ | ❌ |
+| **HyperLogLog** | Distinct count | ✅ | ❌ |
+
+**Gap:** None of these track key *frequency*, which is required for fanout.
+
+### Recommended: Theta Sketch + Count-Min Sketch Hybrid
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      JoinFanoutSketch                               │
+├─────────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────────────┐  ┌────────────────────────────────┐  │
+│  │      Theta Sketch        │  │       Count-Min Sketch         │  │
+│  │   (Apache DataSketches)  │  │                                │  │
+│  │                          │  │  ┌───┬───┬───┬───┬───┬───┐    │  │
+│  │  - Distinct key count    │  │  │ 3 │ 0 │ 5 │ 1 │ 2 │...│ d1 │  │
+│  │  - Set intersection      │  │  ├───┼───┼───┼───┼───┼───┤    │  │
+│  │  - Retained hash values  │  │  │ 1 │ 4 │ 0 │ 3 │ 1 │...│ d2 │  │
+│  │  - Jaccard estimation    │  │  ├───┼───┼───┼───┼───┼───┤    │  │
+│  │                          │  │  │ 2 │ 1 │ 3 │ 0 │ 4 │...│ d3 │  │
+│  │  O(k) memory             │  │  └───┴───┴───┴───┴───┴───┘    │  │
+│  │  k = nominal entries     │  │  width × depth counters       │  │
+│  └──────────────────────────┘  └────────────────────────────────┘  │
+│                                                                     │
+│  totalRowCount: long        // Total rows observed                  │
+│  sampleTheta: double        // Sampling rate for extrapolation      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Component Roles
+
+**Theta Sketch:**
+- Provides distinct key estimation
+- Enables set intersection between left and right join keys
+- Returns retained hash values to iterate over sampled keys
+- Uses `org.apache.datasketches.theta.*` (already in Presto)
+
+**Count-Min Sketch:**
+- Provides frequency estimation for any key
+- `update(key)` increments counters at hash positions
+- `estimateCount(key)` returns minimum of counters at hash positions
+- Mergeable via element-wise addition
+- Standard implementation: width=2048, depth=4 gives <1% error
+
+#### Fanout Computation Algorithm
+
+```python
+def compute_fanout(left_sketch: JoinFanoutSketch,
+                   right_sketch: JoinFanoutSketch) -> (float, float):
+    """
+    Compute bidirectional join fanout using approximate sketches.
+    """
+    # Step 1: Compute intersection using Theta Sketches
+    intersection = left_sketch.theta.intersect(right_sketch.theta)
+    intersection_size = intersection.getEstimate()
+
+    if intersection_size == 0:
+        return (0.0, 0.0)
+
+    # Step 2: Estimate total join output rows
+    # For each key in intersection sample, estimate contribution
+    total_join_rows = 0
+    sampled_keys = intersection.getRetainedHashValues()
+
+    for key_hash in sampled_keys:
+        left_freq = left_sketch.count_min.estimate(key_hash)
+        right_freq = right_sketch.count_min.estimate(key_hash)
+        total_join_rows += left_freq * right_freq
+
+    # Step 3: Scale up based on theta (accounts for sampling)
+    # Theta represents the fraction of key space retained
+    scale_factor = 1.0 / intersection.getTheta()
+    estimated_join_rows = total_join_rows * scale_factor
+
+    # Step 4: Compute fanouts
+    left_distinct = left_sketch.theta.getEstimate()
+    right_distinct = right_sketch.theta.getEstimate()
+
+    left_to_right = estimated_join_rows / left_sketch.total_rows
+    right_to_left = estimated_join_rows / right_sketch.total_rows
+
+    return (left_to_right, right_to_left)
+```
+
+#### Merging Distributed Sketches
+
+```python
+def merge(sketch1: JoinFanoutSketch,
+          sketch2: JoinFanoutSketch) -> JoinFanoutSketch:
+    """
+    Merge two sketches from different partitions/workers.
+    """
+    merged = JoinFanoutSketch()
+
+    # Theta Sketch: union operation
+    merged.theta = Union.builder().buildUnion()
+    merged.theta.union(sketch1.theta)
+    merged.theta.union(sketch2.theta)
+
+    # Count-Min Sketch: element-wise addition
+    merged.count_min = CountMinSketch(width, depth)
+    for i in range(depth):
+        for j in range(width):
+            merged.count_min[i][j] = (
+                sketch1.count_min[i][j] + sketch2.count_min[i][j]
+            )
+
+    # Sum row counts
+    merged.total_rows = sketch1.total_rows + sketch2.total_rows
+
+    return merged
+```
+
+### Alternative: Apache DataSketches Tuple Sketch
+
+DataSketches provides `TupleSketch<S>` which associates a custom summary with each key:
+
+```java
+// Tuple Sketch with frequency summary
+UpdateSketch<IntegerSummary> sketch = new UpdateSketchBuilder<>(
+    new IntegerSummaryFactory(IntegerSummary.Mode.Sum)
+).build();
+
+// Each update increments the frequency for that key
+for (Row row : sample) {
+    sketch.update(row.getJoinKey(), new IntegerSummary(1));
+}
+
+// Intersection preserves summaries from both sides
+Intersection<IntegerSummary> intersection = new Intersection<>(
+    new IntegerSummarySetOperations(IntegerSummary.Mode.Sum)
+);
+intersection.intersect(leftSketch);
+intersection.intersect(rightSketch);
+
+// Result contains matching keys with combined frequencies
+CompactSketch<IntegerSummary> result = intersection.getResult();
+```
+
+**Pros:**
+- Single integrated structure
+- Native intersection with summary preservation
+- Well-tested library
+
+**Cons:**
+- Less flexible than separate structures
+- May need custom summary type for bidirectional frequency
+
+### Memory and Error Bounds
+
+| Structure | Memory | Error Bound |
+|-----------|--------|-------------|
+| Theta Sketch (k=4096) | ~32 KB | ~1.5% for distinct count |
+| Count-Min Sketch (w=2048, d=4) | ~32 KB | ε = e/w ≈ 0.1% overestimate |
+| **Combined** | ~64 KB per table | Suitable for optimizer use |
+
+### Serialization Format
+
+```
+JoinFanoutSketch Binary Format:
+┌────────────────────────────────────────┐
+│ Header (16 bytes)                      │
+│  - Magic: 4 bytes ("JFSK")             │
+│  - Version: 2 bytes                    │
+│  - Flags: 2 bytes                      │
+│  - Total Row Count: 8 bytes            │
+├────────────────────────────────────────┤
+│ Theta Sketch (variable)                │
+│  - Length prefix: 4 bytes              │
+│  - Serialized sketch bytes             │
+├────────────────────────────────────────┤
+│ Count-Min Sketch (fixed ~32KB)         │
+│  - Width: 4 bytes                      │
+│  - Depth: 4 bytes                      │
+│  - Counters: width × depth × 4 bytes   │
+└────────────────────────────────────────┘
+```
+
+### Integration with Sampling Endpoint
+
+The `/v1/sample` response would include serialized sketches:
+
+```json
+{
+  "tableSamples": [
+    {
+      "tableName": "hive.default.orders",
+      "sampledRowCount": 15000,
+      "joinFanoutSketch": "<base64-encoded JoinFanoutSketch>",
+      "columnStatistics": { ... }
+    }
+  ]
+}
+```
+
+The coordinator deserializes sketches, caches them, and computes fanout when evaluating join edges.
+
 ## Implementation Phases
 
 ### Phase 1: Basic Infrastructure
