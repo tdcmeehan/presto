@@ -934,10 +934,38 @@ Metrics:
 
 ### Current Limitations
 
-1. **Base tables only**: Cannot track joins on derived tables/CTEs
+1. **Base tables only**: Cannot track joins on derived tables/CTEs/subqueries
 2. **No predicate awareness**: Same fanout used regardless of WHERE clause
 3. **First query doesn't benefit**: Learning is retrospective
 4. **Staleness risk**: Data changes may invalidate stored fanouts
+5. **Dynamic filter pushdown**: If HashProbe becomes no-op after filter pushdown, stats show fanout=1.0 (misleading)
+6. **Self-joins**: Same table joined to itself needs special handling in canonical key
+7. **Expression join keys**: `LOWER(a.name) = LOWER(b.name)` - can't generate stable canonical key
+8. **Partition pruning variance**: Different partitions may have very different selectivity
+
+### Risk: Predicate Sensitivity Can Make Things Worse
+
+**Critical concern**: Different predicates on the same table pair can have vastly different fanouts:
+
+```sql
+-- Query 1: Active customers have many orders (fanout = 10.5)
+SELECT * FROM orders JOIN customers ON o_custkey = c_custkey
+WHERE status = 'ACTIVE'
+
+-- Query 2: Deleted customers have few orders (fanout = 0.1)
+SELECT * FROM orders JOIN customers ON o_custkey = c_custkey
+WHERE status = 'DELETED'
+```
+
+If we cache fanout=10.5 from Query 1 and apply to Query 2:
+- **Default estimate**: Might guess 1.0 (100x off)
+- **HBO estimate**: Uses 10.5 (105x off) ← **WORSE!**
+
+**Mitigations**:
+1. Store variance across observations; don't use HBO stats if variance is high
+2. Only use HBO when confidence is high (many similar observations)
+3. Use HBO as a signal for AEF insertion rather than direct estimation
+4. Future: predicate-qualified keys (hash of relevant predicates)
 
 ### Future Enhancements
 
