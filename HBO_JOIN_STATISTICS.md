@@ -275,34 +275,60 @@ struct OperatorStats {
 
 **No changes to presto-native-execution needed!** The coordinator simply reads existing data.
 
-### 4.2 Coordinator: Extracting Join Stats from TaskInfo
+### 4.2 Handling Broadcast (REPLICATED) Joins
+
+**Critical issue**: For broadcast joins, the build side is replicated to all workers:
+
+```
+PARTITIONED join (100 workers):
+  - Build: 1M rows total, ~10K per worker → sum = 1M ✓
+  - Probe: 100M rows total, 1M per worker → sum = 100M ✓
+
+REPLICATED join (100 workers):
+  - Build: 1M rows REPLICATED to each worker → sum = 100M ✗ (actual: 1M)
+  - Probe: 100M rows total, 1M per worker → sum = 100M ✓
+```
+
+**Solution**: Check distribution type from plan and handle accordingly:
 
 ```java
-// In SqlQueryExecution.java or StageStateMachine.java
-// Extract join stats from existing TaskInfo - no worker changes needed!
+public Map<String, JoinOperatorPair> extractJoinStats(
+        List<TaskInfo> taskInfos,
+        Map<PlanNodeId, JoinNode> joinNodes) {
 
-public Map<String, JoinOperatorPair> extractJoinStats(TaskInfo taskInfo) {
     Map<String, JoinOperatorPair> joinPairs = new HashMap<>();
 
-    for (PipelineStats pipeline : taskInfo.getStats().getPipelines()) {
-        for (OperatorStats op : pipeline.getOperatorSummaries()) {
+    for (TaskInfo taskInfo : taskInfos) {
+        for (PipelineStats pipeline : taskInfo.getStats().getPipelines()) {
+            for (OperatorStats op : pipeline.getOperatorSummaries()) {
 
-            // HashProbe is sent as "LookupJoinOperator" in Presto protocol
-            // This has BOTH probe input rows AND join output rows
-            if ("LookupJoinOperator".equals(op.getOperatorType())) {
-                JoinOperatorPair pair = joinPairs.computeIfAbsent(
-                    op.getPlanNodeId(), k -> new JoinOperatorPair());
-                pair.probeInputRows += op.getInputPositions();
-                pair.outputRows += op.getOutputPositions();  // Join output comes from probe operator
-            }
+                if ("LookupJoinOperator".equals(op.getOperatorType())) {
+                    JoinOperatorPair pair = joinPairs.computeIfAbsent(
+                        op.getPlanNodeId(), k -> new JoinOperatorPair());
+                    // Probe side: always sum (partitioned across workers)
+                    pair.probeInputRows += op.getInputPositions();
+                    pair.outputRows += op.getOutputPositions();
+                }
 
-            // HashBuild is sent as "HashBuilderOperator" in Presto protocol
-            // This has build input rows, but outputPositions is always 0
-            if ("HashBuilderOperator".equals(op.getOperatorType())) {
-                JoinOperatorPair pair = joinPairs.computeIfAbsent(
-                    op.getPlanNodeId(), k -> new JoinOperatorPair());
-                pair.buildInputRows += op.getInputPositions();
-                // Note: op.getOutputPositions() is always 0 for HashBuild
+                if ("HashBuilderOperator".equals(op.getOperatorType())) {
+                    JoinOperatorPair pair = joinPairs.computeIfAbsent(
+                        op.getPlanNodeId(), k -> new JoinOperatorPair());
+
+                    // Check if this is a broadcast join
+                    JoinNode joinNode = joinNodes.get(op.getPlanNodeId());
+                    boolean isBroadcast = joinNode.getDistributionType()
+                        .map(t -> t == JoinDistributionType.REPLICATED)
+                        .orElse(false);
+
+                    if (isBroadcast) {
+                        // Build side replicated: take MAX (all workers have same data)
+                        pair.buildInputRows = Math.max(
+                            pair.buildInputRows, op.getInputPositions());
+                    } else {
+                        // Build side partitioned: sum across workers
+                        pair.buildInputRows += op.getInputPositions();
+                    }
+                }
             }
         }
     }
@@ -311,7 +337,7 @@ public Map<String, JoinOperatorPair> extractJoinStats(TaskInfo taskInfo) {
 }
 ```
 
-**This is purely a coordinator-side change** - workers already send the data we need.
+**Why MAX for broadcast**: All workers have identical build-side data, so any single worker's count is the true total. Using MAX handles edge cases where some workers might report 0 due to early termination.
 
 ### 4.3 Heartbeat vs Final TaskInfo
 
