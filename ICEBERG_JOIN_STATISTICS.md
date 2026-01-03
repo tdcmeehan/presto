@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.2
+**Version**: 0.3
 
 ---
 
@@ -14,7 +14,7 @@
 This document describes an approach to accurate join cardinality estimation using **connector-native sketches** stored in Iceberg table metadata. The key insight is that join fanout can be computed from two composable sketches:
 
 1. **Theta Sketch** - Which keys exist (**Already implemented in Presto/Iceberg**)
-2. **Count-Min Sketch (CMS)** - Frequency of each key (new addition)
+2. **Frequency Sketch** - Frequency of each key (new addition, using DataSketches `LongsSketch`)
 
 By storing these sketches per column in Iceberg metadata, we can compute pairwise join statistics at query planning time without runtime overhead.
 
@@ -23,7 +23,7 @@ By storing these sketches per column in Iceberg metadata, we can compute pairwis
 | Challenge | Solution |
 |-----------|----------|
 | Unknown join selectivity | Theta intersection estimates matching keys |
-| Unknown join fanout | CMS frequency product estimates output rows |
+| Unknown join fanout | Frequency sketch estimates output rows |
 | Storage overhead | Connector-native, no separate infrastructure |
 | Collection overhead | Periodic ANALYZE, not per-query |
 | Staleness | Tied to table metadata versioning |
@@ -104,65 +104,83 @@ public static CompactSketch readThetaSketch(BlobMetadata metadata, ByteBuffer bl
 
 3. **Optimizer Integration**: Wire sketch retrieval into cost estimation rules
 
-### 2.2 Count-Min Sketch: Needs Implementation 🔨
+### 2.2 Frequency Sketch: Needs Implementation 🔨
 
-CMS is not currently implemented. Here's the plan based on the existing Theta/KLL pattern.
+Frequency estimation is not currently implemented. We'll use **Apache DataSketches `LongsSketch`** for cross-platform compatibility.
 
 ---
 
-## 3. CMS Implementation Plan
+## 3. Frequency Sketch Implementation Plan
 
-### 3.1 Library Options
+### 3.1 Why DataSketches LongsSketch (Not Count-Min Sketch)
 
-| Library | Package | Pros | Cons |
-|---------|---------|------|------|
-| **stream-lib** | `com.clearspring.analytics:stream:2.9.5` | Battle-tested, used by Spark | External dependency |
-| **Apache DataSketches** | `org.apache.datasketches:datasketches-java` | Already in classpath, consistent API | Has `ItemsSketch`/`LongsSketch` (different algo than CMS) |
-| **Custom** | N/A | Full control | Maintenance burden |
+| Criteria | stream-lib CMS | DataSketches LongsSketch |
+|----------|----------------|--------------------------|
+| **Cross-platform** | ❌ Java only | ✅ Java, C++, Python binary compatible |
+| **Already in classpath** | ❌ New dependency | ✅ Already used for Theta/KLL |
+| **Error bounds** | Upper only (overestimates) | Upper AND lower bounds |
+| **Algorithm** | Hash-based counters | Heavy hitters / frequent items |
+| **Native execution** | ❌ Not portable | ✅ Compatible with presto-native |
 
-**Recommendation**: Use **stream-lib** for CMS. It's proven, compact, and Apache Spark uses it for the same purpose. DataSketches frequency sketches (`ItemsSketch`, `LongsSketch`) use a different algorithm that's not directly compatible with our use case (they track top-K heavy hitters rather than point-query all keys).
+**Decision**: Use **DataSketches `LongsSketch`** for frequency estimation.
 
-### 3.2 New Components
+From the [DataSketches docs](https://datasketches.apache.org/docs/Architecture/LargeScale.html):
+> "By design, a sketch that is available in one language that is also available in a different language will be 'binary compatible' via serialization."
+
+The `LongsSketch` is optimized for `long` keys (join keys are typically integers or hashed strings) and has a smaller serialization footprint than generic `ItemsSketch<T>`.
+
+### 3.2 LongsSketch Characteristics
+
+**Heavy Hitters Algorithm**:
+- Tracks frequently occurring items with guaranteed error bounds
+- For any item: `(Upper Bound - Lower Bound) ≤ W × ε`, where W = total count, ε = 3.5/maxMapSize
+- If fewer than 0.75 × maxMapSize distinct items, frequencies are **exact**
+
+**Trade-off for Join Estimation**:
+- ✅ Excellent for high-frequency keys (which dominate join output anyway)
+- ⚠️ May have wider bounds for low-frequency keys
+- ✅ For low-frequency keys, can fall back to average fanout: `row_count / NDV`
+
+### 3.3 New Components
 
 Following the established pattern from Theta/KLL sketches:
 
 #### A. Aggregation Function
 
-**File**: `presto-main-base/src/main/java/com/facebook/presto/operator/aggregation/sketch/cms/CmsSketchAggregationFunction.java`
+**File**: `presto-main-base/src/main/java/com/facebook/presto/operator/aggregation/sketch/frequency/FrequencySketchAggregationFunction.java`
 
 ```java
-@AggregationFunction(value = "sketch_cms", isCalledOnNullInput = true)
-@Description("calculates a count-min sketch for frequency estimation")
-public class CmsSketchAggregationFunction {
+@AggregationFunction(value = "sketch_frequency", isCalledOnNullInput = true)
+@Description("calculates a frequency sketch for estimating item occurrence counts")
+public class FrequencySketchAggregationFunction {
 
     @InputFunction
     @TypeParameter("T")
     public static void input(
             @TypeParameter("T") Type type,
-            @AggregationState CmsSketchAggregationState state,
+            @AggregationState FrequencySketchAggregationState state,
             @SqlType("T") @BlockPosition Block block,
             @BlockIndex int position) {
         if (block.isNull(position)) {
             return;
         }
-        CountMinSketch sketch = state.getSketch();
-        long hash = computeHash(type, block, position);
-        sketch.add(hash, 1);
+        LongsSketch sketch = state.getSketch();
+        long hash = computeHash(type, block, position);  // Same hashing as Theta
+        sketch.update(hash);  // Default weight = 1
     }
 
     @CombineFunction
     public static void merge(
-            @AggregationState CmsSketchAggregationState state,
-            @AggregationState CmsSketchAggregationState otherState) {
-        // stream-lib CMS supports merging
+            @AggregationState FrequencySketchAggregationState state,
+            @AggregationState FrequencySketchAggregationState otherState) {
         state.getSketch().merge(otherState.getSketch());
     }
 
     @OutputFunction(StandardTypes.VARBINARY)
     public static void output(
-            @AggregationState CmsSketchAggregationState state,
+            @AggregationState FrequencySketchAggregationState state,
             BlockBuilder out) {
-        byte[] bytes = CountMinSketch.serialize(state.getSketch());
+        byte[] bytes = state.getSketch().toByteArray();
         VARBINARY.writeSlice(out, Slices.wrappedBuffer(bytes));
     }
 }
@@ -171,99 +189,115 @@ public class CmsSketchAggregationFunction {
 #### B. State Classes
 
 **Files**:
-- `CmsSketchAggregationState.java` - Interface
-- `CmsSketchStateFactory.java` - Creates CMS with configurable epsilon/delta
-- `CmsSketchStateSerializer.java` - Serialize/deserialize for distributed execution
-
-#### C. Scalar Functions (Optional)
-
-**File**: `presto-main-base/src/main/java/com/facebook/presto/operator/scalar/CmsSketchFunctions.java`
+- `FrequencySketchAggregationState.java` - Interface wrapping `LongsSketch`
+- `FrequencySketchStateFactory.java` - Creates sketch with configurable `maxMapSize`
+- `FrequencySketchStateSerializer.java` - Uses DataSketches native serialization
 
 ```java
-@ScalarFunction("cms_estimate")
-@Description("Estimates the frequency of a value in a CMS sketch")
-@SqlType(StandardTypes.BIGINT)
-public static long estimateCount(
-        @SqlType(StandardTypes.VARBINARY) Slice sketch,
-        @SqlType(StandardTypes.BIGINT) long value) {
-    CountMinSketch cms = CountMinSketch.deserialize(sketch.getBytes());
-    return cms.estimateCount(value);
-}
+// State factory - configurable accuracy
+public class FrequencySketchStateFactory {
+    // maxMapSize controls accuracy vs memory trade-off
+    // Default: 1024 → ~8KB sketch, ε ≈ 0.34%
+    // Higher: 8192 → ~64KB sketch, ε ≈ 0.04%
+    private static final int DEFAULT_MAX_MAP_SIZE = 1024;
 
-@ScalarFunction("cms_merge")
-@Description("Merges two CMS sketches")
-@SqlType(StandardTypes.VARBINARY)
-public static Slice merge(
-        @SqlType(StandardTypes.VARBINARY) Slice left,
-        @SqlType(StandardTypes.VARBINARY) Slice right) {
-    CountMinSketch cmsLeft = CountMinSketch.deserialize(left.getBytes());
-    CountMinSketch cmsRight = CountMinSketch.deserialize(right.getBytes());
-    cmsLeft.merge(cmsRight);
-    return Slices.wrappedBuffer(CountMinSketch.serialize(cmsLeft));
+    public LongsSketch createSketch(int maxMapSize) {
+        return new LongsSketch(maxMapSize);
+    }
 }
 ```
 
-### 3.3 Puffin Integration
+#### C. Scalar Functions
+
+**File**: `presto-main-base/src/main/java/com/facebook/presto/operator/scalar/FrequencySketchFunctions.java`
+
+```java
+@ScalarFunction("frequency_estimate")
+@Description("Estimates the frequency of a value, returns (lower_bound, estimate, upper_bound)")
+@SqlType("row(lower bigint, estimate bigint, upper bigint)")
+public static Block estimateFrequency(
+        @SqlType(StandardTypes.VARBINARY) Slice sketchBytes,
+        @SqlType(StandardTypes.BIGINT) long item) {
+    LongsSketch sketch = LongsSketch.getInstance(Memory.wrap(sketchBytes.getBytes()));
+    Row row = sketch.getRow(item);  // Returns frequency bounds
+    // Return structured result with lower, estimate, upper bounds
+}
+
+@ScalarFunction("frequency_heavy_hitters")
+@Description("Returns items with frequency above threshold")
+@SqlType("array(row(item bigint, lower bigint, upper bigint))")
+public static Block getHeavyHitters(
+        @SqlType(StandardTypes.VARBINARY) Slice sketchBytes,
+        @SqlType(StandardTypes.BIGINT) long threshold) {
+    LongsSketch sketch = LongsSketch.getInstance(Memory.wrap(sketchBytes.getBytes()));
+    Row[] rows = sketch.getFrequentItems(threshold, ErrorType.NO_FALSE_NEGATIVES);
+    // Return array of heavy hitters
+}
+```
+
+### 3.4 Puffin Integration
 
 **File**: `presto-iceberg/src/main/java/com/facebook/presto/iceberg/TableStatisticsMaker.java`
 
 #### New Constants
 
 ```java
-private static final String ICEBERG_CMS_SKETCH_BLOB_TYPE_ID = "presto-cms-sketch-bytes-v1";
-private static final String ICEBERG_CMS_TOTAL_COUNT_KEY = "total_count";
+// Use DataSketches-style naming for potential future standardization
+private static final String ICEBERG_FREQUENCY_SKETCH_BLOB_TYPE_ID = "apache-datasketches-fi-longs-v1";
+private static final String ICEBERG_FREQUENCY_TOTAL_COUNT_KEY = "total_count";
+private static final String ICEBERG_FREQUENCY_NUM_ACTIVE_KEY = "num_active_items";
 ```
 
 #### Register Generators/Readers
 
 ```java
 // Add to puffinStatWriters map (line 148-152)
-.put(FREQUENCY_SKETCH, TableStatisticsMaker::generateCmsBlob)
+.put(FREQUENCY_SKETCH, TableStatisticsMaker::generateFrequencyBlob)
 
 // Add to puffinStatReaders map (line 154-158)
-.put(ICEBERG_CMS_SKETCH_BLOB_TYPE_ID, TableStatisticsMaker::readCmsBlob)
+.put(ICEBERG_FREQUENCY_SKETCH_BLOB_TYPE_ID, TableStatisticsMaker::readFrequencyBlob)
 ```
 
 #### Generator Function
 
 ```java
-private static Blob generateCmsBlob(ColumnStatisticMetadata metadata, Block value,
+private static Blob generateFrequencyBlob(ColumnStatisticMetadata metadata, Block value,
         Table icebergTable, Snapshot snapshot, TypeManager typeManager) {
     int id = getField(metadata, icebergTable, snapshot).fieldId();
     ByteBuffer raw = VARBINARY.getSlice(value, 0).toByteBuffer();
 
-    // Deserialize to get total count for metadata
-    CountMinSketch cms = CountMinSketch.deserialize(raw.array());
+    // Deserialize to extract metadata
+    LongsSketch sketch = LongsSketch.getInstance(Memory.wrap(raw, ByteOrder.LITTLE_ENDIAN));
 
     return new Blob(
-            ICEBERG_CMS_SKETCH_BLOB_TYPE_ID,
+            ICEBERG_FREQUENCY_SKETCH_BLOB_TYPE_ID,
             ImmutableList.of(id),
             snapshot.snapshotId(),
             snapshot.sequenceNumber(),
             raw,
             null,
-            ImmutableMap.of(ICEBERG_CMS_TOTAL_COUNT_KEY, Long.toString(cms.size())));
+            ImmutableMap.of(
+                ICEBERG_FREQUENCY_TOTAL_COUNT_KEY, Long.toString(sketch.getStreamLength()),
+                ICEBERG_FREQUENCY_NUM_ACTIVE_KEY, Long.toString(sketch.getNumActiveItems())));
 }
 ```
 
 #### Reader Function
 
 ```java
-private static void readCmsBlob(BlobMetadata metadata, ByteBuffer blob,
+private static void readFrequencyBlob(BlobMetadata metadata, ByteBuffer blob,
         ColumnStatistics.Builder statistics, Table icebergTable, TypeManager typeManager) {
-    // Store the raw CMS in a new field in ColumnStatistics
-    // Or create a separate cache for join sketches
-    CountMinSketch cms = CountMinSketch.deserialize(blob.array());
-    statistics.setFrequencySketch(Optional.of(cms));
+    LongsSketch sketch = LongsSketch.getInstance(Memory.wrap(blob, ByteOrder.LITTLE_ENDIAN));
+    statistics.setFrequencySketch(Optional.of(sketch));
 }
 ```
 
-### 3.4 ANALYZE Integration
+### 3.5 ANALYZE Integration
 
 **File**: `TableStatisticsMaker.java:669-695` - `getSupportedColumnStatistics()`
 
 ```java
-// Add CMS collection for join-eligible types
+// Add frequency collection for join-eligible types
 if (isNumericType(type) || type.equals(DATE) || isVarcharType(type) ||
         type.equals(TIMESTAMP) || type.equals(TIMESTAMP_WITH_TIME_ZONE)) {
     // Existing Theta for NDV
@@ -271,39 +305,39 @@ if (isNumericType(type) || type.equals(DATE) || isVarcharType(type) ||
             columnName, format("RETURN sketch_theta(%s)", formatIdentifier(columnName)),
             ImmutableList.of(columnName)));
 
-    // NEW: CMS for frequency
+    // NEW: Frequency sketch for fanout estimation
     supportedStatistics.add(FREQUENCY_SKETCH.getColumnStatisticMetadataWithCustomFunction(
             columnName,
-            format("RETURN sketch_cms(%s)", formatIdentifier(columnName)),
+            format("RETURN sketch_frequency(%s)", formatIdentifier(columnName)),
             ImmutableList.of(columnName)));
 }
 ```
 
-### 3.5 Configuration
+### 3.6 Configuration
 
 **File**: `IcebergSessionProperties.java`
 
 ```java
-public static final String CMS_EPSILON = "cms_epsilon";
-public static final String CMS_DELTA = "cms_delta";
+public static final String FREQUENCY_SKETCH_MAX_MAP_SIZE = "frequency_sketch_max_map_size";
 
-// epsilon controls accuracy, delta controls confidence
-// epsilon=0.0001, delta=0.99 → ~1MB sketch, 99% confidence of ±0.01% error
+// maxMapSize controls accuracy vs memory trade-off
+// 1024 (default) → ~8KB sketch, handles up to ~768 distinct heavy hitters exactly
+// 8192           → ~64KB sketch, handles up to ~6144 distinct heavy hitters exactly
 ```
 
 ---
 
 ## 4. Join Estimation Algorithm
 
-With both Theta and CMS available, join estimation becomes:
+With both Theta and Frequency sketches available, join estimation becomes:
 
 ```java
 public JoinEstimate computeJoinEstimate(
         CompactSketch leftTheta,
-        CountMinSketch leftCms,
+        LongsSketch leftFreq,
         long leftRowCount,
         CompactSketch rightTheta,
-        CountMinSketch rightCms,
+        LongsSketch rightFreq,
         long rightRowCount) {
 
     // 1. Compute key intersection using Theta sketches
@@ -320,14 +354,24 @@ public JoinEstimate computeJoinEstimate(
     double containmentLR = matchingKeys / leftNDV;  // L keys in R
     double containmentRL = matchingKeys / rightNDV; // R keys in L
 
-    // 3. Estimate output using CMS frequencies
+    // 3. Estimate output using frequency sketches
     //    For each retained hash in intersection, multiply frequencies
     long sampleOutput = 0;
     long[] hashes = intersectionSketch.getCache();
 
+    // Fallback fanout for keys not tracked by frequency sketch
+    double avgFanoutL = (double) leftRowCount / leftNDV;
+    double avgFanoutR = (double) rightRowCount / rightNDV;
+
     for (long hash : hashes) {
-        long freqL = leftCms.estimateCount(hash);
-        long freqR = rightCms.estimateCount(hash);
+        // LongsSketch.getEstimate returns 0 for untracked items
+        long freqL = leftFreq.getEstimate(hash);
+        long freqR = rightFreq.getEstimate(hash);
+
+        // Fall back to average if frequency unknown (low-frequency key)
+        if (freqL == 0) freqL = (long) avgFanoutL;
+        if (freqR == 0) freqR = (long) avgFanoutR;
+
         sampleOutput += freqL * freqR;
     }
 
@@ -344,6 +388,8 @@ public JoinEstimate computeJoinEstimate(
     return new JoinEstimate(totalOutput, lrFanout, rlFanout, containmentLR, containmentRL);
 }
 ```
+
+**Note**: The `LongsSketch` heavy-hitter algorithm naturally prioritizes high-frequency keys, which typically dominate join output. For low-frequency keys (not tracked), we fall back to the average fanout derived from `row_count / NDV`.
 
 ---
 
@@ -393,7 +439,7 @@ public interface FieldSummary {
 |--------|---------------|----------|
 | Theta sketch binary access | ✅ Stored in Puffin | Expose via new reader |
 | Theta intersection | ✅ DataSketches API | Use `SetOperation.buildIntersection()` |
-| CMS for frequencies | ❌ Not implemented | Add as new statistic type |
+| Frequency sketch | ❌ Not implemented | Add DataSketches `LongsSketch` as new statistic type |
 | Optimizer integration | ❌ Not wired | New cost estimation rule |
 
 ---
@@ -415,19 +461,22 @@ public interface FieldSummary {
 SELECT sketch_theta(customer_id) FROM orders
 ```
 
-### 6.2 Count-Min Sketch (New Addition)
+### 6.2 Frequency Sketch (New Addition)
 
 **Purpose**: Estimate frequency of each key (rows per key).
 
+**Implementation**: Apache DataSketches `LongsSketch` (heavy hitters algorithm)
+
 **Properties**:
-- Fixed size: ~256 KB - 1 MB (configurable via epsilon/delta)
-- Mergeable: Element-wise addition
-- Point-queryable: Given key, estimate its count
-- One-sided error: Always overestimates (never underestimates)
+- Fixed size: ~8-64 KB (configurable via maxMapSize)
+- Mergeable: Yes, via `merge()` operation
+- Point-queryable: Given key hash, estimate its count
+- Error bounds: Provides BOTH upper and lower bounds
+- Cross-platform: Binary compatible across Java, C++, Python
 
 **Proposed SQL**:
 ```sql
-SELECT sketch_cms(customer_id) FROM orders
+SELECT sketch_frequency(customer_id) FROM orders
 ```
 
 ### 6.3 Combined Join Column Sketch
@@ -435,9 +484,9 @@ SELECT sketch_cms(customer_id) FROM orders
 ```java
 public class JoinColumnSketch {
     private final CompactSketch thetaSketch;   // Key existence + hashes
-    private final CountMinSketch cmsSketch;     // Key frequencies
-    private final long rowCount;                // Total rows
-    private final Instant collectedAt;          // For staleness
+    private final LongsSketch freqSketch;      // Key frequencies (DataSketches)
+    private final long rowCount;               // Total rows
+    private final Instant collectedAt;         // For staleness
 }
 ```
 
@@ -459,7 +508,7 @@ table-location/
 ```
 
 Each Puffin blob contains:
-- `type`: Blob type ID (e.g., `apache-datasketches-theta-v1`, `presto-cms-sketch-bytes-v1`)
+- `type`: Blob type ID (e.g., `apache-datasketches-theta-v1`, `apache-datasketches-fi-longs-v1`)
 - `fields`: List of column IDs
 - `snapshot-id`, `sequence-number`: For versioning
 - `properties`: Metadata (e.g., NDV estimate, total count)
@@ -504,26 +553,30 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 | Component | Configuration | Size |
 |-----------|---------------|------|
 | Theta Sketch | k=16384 | ~128 KB |
-| CMS | ε=0.0001, δ=0.99 | ~1 MB |
+| Frequency Sketch | maxMapSize=1024 | ~8 KB |
+| Frequency Sketch | maxMapSize=8192 | ~64 KB |
 | Metadata | timestamps, row count | ~100 bytes |
-| **Total per column** | | **~1.1 MB** |
+| **Total per column** | (with maxMapSize=1024) | **~136 KB** |
 
 ### 9.2 Storage Budget
 
 | Scenario | Columns | Total Size |
 |----------|---------|------------|
-| Small warehouse | 100 hot columns | 110 MB |
-| Medium warehouse | 500 hot columns | 550 MB |
-| Large warehouse | 2000 hot columns | 2.2 GB |
+| Small warehouse | 100 hot columns | 14 MB |
+| Medium warehouse | 500 hot columns | 68 MB |
+| Large warehouse | 2000 hot columns | 272 MB |
+
+*Note: Much smaller than original CMS estimate due to LongsSketch efficiency*
 
 ### 9.3 Accuracy
 
-| Metric | Theta Error | CMS Error | Combined |
-|--------|-------------|-----------|----------|
+| Metric | Theta Error | Frequency Error | Combined |
+|--------|-------------|-----------------|----------|
 | NDV | ~1% | N/A | ~1% |
 | Containment | ~2% | N/A | ~2% |
-| Frequency | N/A | ~0.01% overestimate | ~0.01% |
-| Fanout | ~2% | ~1% | ~3% |
+| Frequency (heavy hitters) | N/A | ε ≈ 0.34% (maxMapSize=1024) | ~0.34% |
+| Frequency (low-freq keys) | N/A | Falls back to avg fanout | Variable |
+| Fanout | ~2% | ~1-2% | ~3-4% |
 
 ---
 
@@ -532,9 +585,9 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 ### Phase 1: Foundation ⬅️ **Start Here**
 - [x] Theta sketch already in Puffin
 - [ ] Expose raw Theta sketch via new reader method
-- [ ] Add CMS aggregation function (`sketch_cms`)
-- [ ] Add CMS blob type to Puffin writer/reader
-- [ ] Wire CMS into ANALYZE
+- [ ] Add Frequency aggregation function (`sketch_frequency`) using DataSketches `LongsSketch`
+- [ ] Add frequency blob type (`apache-datasketches-fi-longs-v1`) to Puffin writer/reader
+- [ ] Wire frequency sketch into ANALYZE
 
 ### Phase 2: Query Log Integration
 - [ ] Build query log analyzer for join column frequency
@@ -560,12 +613,14 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 
 ## 11. Open Questions
 
-1. **CMS library choice**: stream-lib vs custom implementation?
+1. ~~**Frequency library choice**: stream-lib CMS vs DataSketches?~~
+   - **RESOLVED**: Use DataSketches `LongsSketch` for cross-platform binary compatibility (Java/C++/Python)
 
 2. **Incremental updates**: Can sketches be updated incrementally on data append, or always full rebuild?
+   - LongsSketch supports `merge()` - could potentially merge new data sketch with existing
 
 3. **Multi-column joins**: How to handle composite join keys `(a.x, a.y) = (b.x, b.y)`?
-   - Option: Concatenate column values before hashing
+   - Option: Concatenate column values before hashing (same approach as Theta)
 
 4. **Cross-catalog joins**: What if one table is Iceberg and another is Hive?
    - Option: Only estimate when both sides have sketches
@@ -573,16 +628,21 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 5. **Staleness threshold**: When are sketches too old to use?
    - Option: Session property, default 7 days
 
+6. **Heavy hitter threshold**: What frequency threshold makes a key "heavy"?
+   - LongsSketch auto-manages this based on maxMapSize
+   - Low-frequency keys fall back to average fanout estimation
+
 ---
 
 ## 12. References
 
 1. [Apache DataSketches](https://datasketches.apache.org/)
-2. [Iceberg Table Spec](https://iceberg.apache.org/spec/)
-3. [Iceberg Puffin Spec](https://iceberg.apache.org/puffin-spec/)
-4. [stream-lib CMS](https://github.com/addthis/stream-lib)
-5. Count-Min Sketch: Cormode & Muthukrishnan, 2005
+2. [DataSketches Frequent Items Overview](https://datasketches.apache.org/docs/Frequency/FrequentItemsOverview.html)
+3. [DataSketches Cross-Language Compatibility](https://datasketches.apache.org/docs/Architecture/LargeScale.html)
+4. [Iceberg Table Spec](https://iceberg.apache.org/spec/)
+5. [Iceberg Puffin Spec](https://iceberg.apache.org/puffin-spec/)
 6. [Theta Sketch Framework](https://datasketches.apache.org/docs/Theta/ThetaSketchFramework.html)
+7. [LongsSketch Java Source](https://github.com/apache/datasketches-java/blob/master/src/main/java/org/apache/datasketches/frequencies/LongsSketch.java)
 
 ---
 
@@ -600,5 +660,5 @@ ANALYZE TABLE orders FOR COLUMNS (id, cust_id)
 
 ---
 
-*Document Version: 0.2*
+*Document Version: 0.3*
 *Last Updated: January 2025*
