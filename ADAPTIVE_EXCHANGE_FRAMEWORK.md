@@ -40,9 +40,11 @@ This approach provides Axiom-like statistics quality (actual cardinalities, meas
 | Approach | Statistics Source | Scope | Overhead | Streaming |
 |----------|------------------|-------|----------|-----------|
 | **Static optimization** | Catalog estimates | N/A | None | Yes |
-| **Spark AQE** | Stage boundaries | Local (no join reorder) | Stage materialization | No (stage-based) |
+| **Spark AQE** | Stage boundaries | Per-join decisions | Stage materialization | No (stage-based) |
 | **Axiom pilots** | Separate sample queries | Full plan | Pilot execution | N/A |
-| **AEF (this design)** | Inline buffer samples | Full plan (with cascading) | Buffer fill time | Yes |
+| **AEF (this design)** | Inline buffer samples | Per-join decisions* | Buffer fill time | Yes |
+
+*AEF adapts probe/build assignment, distribution type, and parallelism. Full join reordering (A⋈B⋈C → A⋈C⋈B) is out of scope—see "Join Order Interaction Problem" in Section 4.
 
 ---
 
@@ -76,7 +78,7 @@ Nested join estimates (errors compound):
 
 **Static optimization**: Commits to plan before seeing any actual data. Estimation errors are locked in.
 
-**Spark AQE**: Observes statistics at stage boundaries but explicitly does NOT do join reordering. Limited to join strategy switching, partition coalescing, and skew handling.
+**Spark AQE**: Observes statistics at stage boundaries. Limited to join strategy switching, partition coalescing, and skew handling. Does not attempt full join reordering (nor does AEF—see Section 4).
 
 **Axiom pilots**: Runs separate sample queries during optimization. Adds latency for ad-hoc queries. Requires complex sampling infrastructure.
 
@@ -152,7 +154,7 @@ This creates a **global synchronization point** without full materialization.
 
 ### 3.3 Architectural Primitive: Buffer + Section Boundary
 
-The combination of **buffering at exchanges** and **section boundaries** forms an architectural primitive that enables multiple adaptive execution strategies beyond join reordering.
+The combination of **buffering at exchanges** and **section boundaries** forms an architectural primitive that enables multiple adaptive execution strategies: probe/build swapping, distribution type changes, and parallelism adjustment.
 
 #### Why This Is a Primitive
 
@@ -199,22 +201,22 @@ With AEF:
 
 This eliminates the separate pilot query overhead while providing equivalent statistics quality. The section boundary ensures the optimized plan applies to a fresh downstream section.
 
-#### Capability 2: POLAR Multi-Alternative Execution
+#### Capability 2: Multi-Alternative Join Execution
 
-POLAR-style execution routes tuples through multiple join orderings and measures actual execution cost. The buffer enables this:
+The buffer primitive could enable testing alternative join configurations for a single join:
 
 ```
-                        ┌→ Ordering A → measure time
-Buffer → [replicate] →├→ Ordering B → measure time  → pick winner → continue
-                        └→ Ordering C → measure time
+                        ┌→ Broadcast join → measure time
+Buffer → [replicate] →├→ Partitioned join → measure time  → pick winner → continue
+                        └→ Probe/build swap → measure time
 
 Section boundary ensures:
   - Downstream workers not yet allocated
   - No wasted work on losing alternatives
-  - Winner plan applied to full execution
+  - Winner configuration applied to full execution
 ```
 
-The buffer is replayed through N alternative plans (small sample), execution time measured, and the winning plan used for the full query.
+The buffer is replayed through N alternative configurations (small sample), execution time measured, and the winning approach used. **Note**: This is for single-join alternatives, not full join reordering across multiple tables.
 
 #### Capability 3: Speculative Execution (Tail Latency Reduction)
 
@@ -618,76 +620,53 @@ With correction:
   Corrected: 0.9% / 1% = 90%  ✓ Correct!
 ```
 
-##### Bidirectional Fanout for Join Reordering
+##### Bidirectional Fanout for Probe/Build Swapping
 
-Following Axiom's approach, we compute fanout in **both directions** to enable join reordering:
+We compute fanout in **both directions** to decide optimal probe vs build assignment:
 
 ```cpp
-// For join A ⋈ B, we need:
+// For join A ⋈ B, we need both directions:
 double aToB_Fanout = buildFanout;   // B rows per matching A row
 double bToA_Fanout = probeFanout;   // A rows per matching B row
 
-// This allows evaluating both orderings:
-// A as probe, B as build: |output| = |A| × containment(A→B) × fanout(B)
-// B as probe, A as build: |output| = |B| × containment(B→A) × fanout(A)
+// This allows evaluating both assignments:
+// A as probe, B as build: build cost = |B|, probe cost = |A| × fanout(B)
+// B as probe, A as build: build cost = |A|, probe cost = |B| × fanout(A)
 ```
 
-##### Scope: Greedy Join Reordering
+##### Scope: Limited to Single-Join Decisions
 
-Sample-to-sample estimation enables **greedy join reordering** based on pairwise selectivity estimates:
+**Important Limitation**: AEF does NOT attempt full join reordering across multiple tables.
 
 ```
-What we CAN estimate (from base table sketches):
-  - Pairwise containment: containment(A, B) for any tables A, B
-  - Pairwise fanout: fanout(A), fanout(B)
-  - First join output: |A| × containment(A,B) × fanout(B)
+What AEF CAN do:
+  - Swap probe/build sides for a single join
+  - Switch between broadcast and partitioned distribution
+  - Adjust parallelism based on actual cardinalities
 
-What we CANNOT estimate accurately:
-  - Intermediate result sketches: After A ⋈ B, which keys survive?
-  - Multi-hop containment: containment((A ⋈ B), C) requires (A ⋈ B)'s keys
-  - Bushy plan costs: (A ⋈ B) ⋈ (C ⋈ D) needs intermediate sketches
+What AEF CANNOT do accurately:
+  - Reorder joins across multiple tables (e.g., A⋈B⋈C → A⋈C⋈B)
+  - Reason about intermediate result statistics
 ```
 
-**Greedy reordering algorithm:**
+**Why full join reordering is out of scope:**
 
-```cpp
-// At reoptimization point, choose next join greedily
-JoinEdge selectNextJoin(Set<Table> remainingTables, Table currentResult) {
-    JoinEdge bestJoin = null;
-    double bestCost = INFINITY;
+Join reordering requires reasoning about intermediate results. After A ⋈ B, which keys survive? The intermediate result may have very different fanout characteristics to table C than the base tables did.
 
-    for (Table t : remainingTables) {
-        if (hasJoinEdge(currentResult, t)) {
-            // Estimate using base table sketches
-            // Approximation: use currentResult's original base table sketch
-            double cost = estimateJoinCost(currentResult, t);
-            if (cost < bestCost) {
-                bestCost = cost;
-                bestJoin = edge(currentResult, t);
-            }
-        }
-    }
-    return bestJoin;
-}
+```
+Example: A ⋈ B produces rows skewed toward high-fanout keys
+  - Pairwise A→C fanout: 1.0 (average)
+  - Actual (A⋈B)→C fanout: 9.0 (because survivors are high-fanout)
+
+Using pairwise statistics to reorder joins can make things WORSE.
 ```
 
-**Why greedy is often sufficient:**
+This is a fundamental limitation of pairwise statistics. Accurate join reordering would require:
+1. Collecting sketches from intermediate results (expensive)
+2. Sample-to-sample matching at each join step
+3. Significant additional infrastructure
 
-| Scenario | Greedy Performance |
-|----------|-------------------|
-| Star schema (fact + dims) | Optimal: all joins through fact table |
-| Snowflake | Near-optimal: dims join through fact |
-| Chain joins (A-B-C-D) | Good: picks most selective edge first |
-| Complex graphs | May miss bushy plans |
-
-**Future work: Full DP exploration**
-
-For comprehensive join enumeration, we would need:
-1. Collect sketches at intermediate results (after each join)
-2. Use section boundaries as sketch collection points
-3. Cache intermediate sketches for DP memoization
-
-This is deferred to Phase 5+ as greedy reordering addresses most practical cases.
+For now, AEF focuses on **per-join optimizations** (probe/build swap, distribution type) which are safe and effective.
 
 ##### Size Analysis
 
@@ -1784,19 +1763,21 @@ Implementation:
   - Join build side replicated for hot keys
 ```
 
-### 6.4 Join Reordering
+### 6.4 Join Side Swapping (Probe/Build)
 
 ```
-Original: fact JOIN dim1 JOIN dim2 JOIN dim3
-Observed: dim3 join is highly selective (via build progress or buffer probe)
-Adapted: fact JOIN dim3 JOIN dim1 JOIN dim2
+Original: A as probe, B as build (optimizer guessed A is larger)
+Observed: A is actually smaller than B
+Adapted: B as probe, A as build
 
 Implementation:
-  - JoinOutputEstimator detects selectivity deviation
-  - Coordinator reoptimizes join order
-  - Upstream exchanges held until decision
-  - New plan uses different join order
+  - RuntimeReorderJoinSides compares actual cardinalities
+  - Swaps probe/build assignment if beneficial
+  - Smaller side becomes build (fits in memory)
+  - Larger side becomes probe (streams through)
 ```
+
+**Note**: AEF does NOT reorder joins across multiple tables (e.g., changing A⋈B⋈C to A⋈C⋈B). This would require accurate intermediate result statistics, which pairwise sampling cannot provide. See "Scope: Limited to Single-Join Decisions" in Section 4.
 
 ### 6.5 Parallelism Adjustment
 
@@ -2521,30 +2502,30 @@ runtimeBuilder.add(new IterativeOptimizer(
 - Parallelism adjustment
 - Multiple optimizations can fire together
 
-### Phase 4: Join Reordering
+### Phase 4: Distribution Type Adaptation
 
-**Goal**: Reorder joins across the plan based on actual statistics.
+**Goal**: Switch between broadcast and partitioned joins based on actual sizes.
 
 **New Rule:**
 
 ```java
-// More complex: reorder joins in a join graph
-public class RuntimeReorderJoins implements Rule<JoinNode> {
+// Switch join distribution type based on actual cardinalities
+public class RuntimeAdaptJoinDistribution implements Rule<JoinNode> {
     public Result apply(JoinNode join, Captures captures, Context context) {
-        // Build join graph from current position
-        JoinGraph graph = JoinGraph.buildFrom(join, context.getLookup());
+        PlanNodeStatsEstimate buildStats = context.getStatsProvider()
+            .getStats(join.getRight());
 
-        // Get actual stats for all tables in graph
-        Map<PlanNodeId, PlanNodeStatsEstimate> actualStats =
-            graph.getNodes().stream()
-                .collect(toMap(PlanNode::getId,
-                    node -> context.getStatsProvider().getStats(node)));
+        long actualBuildRows = (long) buildStats.getOutputRowCount();
+        long broadcastThreshold = context.getSession()
+            .getJoinBroadcastTableThreshold();
 
-        // Greedy reordering with actual stats
-        List<PlanNode> newOrder = greedyJoinOrder(graph, actualStats);
+        boolean shouldBroadcast = actualBuildRows < broadcastThreshold;
+        boolean currentlyBroadcast = join.getDistributionType() == REPLICATED;
 
-        if (!newOrder.equals(graph.getOriginalOrder())) {
-            return Result.ofPlanNode(buildJoinTree(newOrder, graph.getEdges()));
+        if (shouldBroadcast != currentlyBroadcast) {
+            return Result.ofPlanNode(
+                join.withDistributionType(
+                    shouldBroadcast ? REPLICATED : PARTITIONED));
         }
 
         return Result.empty();
@@ -2553,8 +2534,13 @@ public class RuntimeReorderJoins implements Rule<JoinNode> {
 ```
 
 **What Works After Phase 4:**
-- Full join reordering based on actual cardinalities
-- Can fix severe mis-estimates in complex queries
+- Broadcast → partitioned when build side is larger than expected
+- Partitioned → broadcast when build side is smaller than expected
+- Combined with Phase 3's probe/build swapping for optimal join execution
+
+**What AEF Does NOT Do:**
+- Full join reordering (A⋈B⋈C → A⋈C⋈B) - requires intermediate result statistics
+- See "Scope: Limited to Single-Join Decisions" for rationale
 
 ### Phase 5: Advanced Features
 
@@ -3380,7 +3366,7 @@ Extended Eddies for distributed indexed joins:
 - Dynamically reorder joins based on observed selectivities
 - Use "moments of symmetry" to identify safe reordering points
 
-*AEF relationship*: Similar goal (runtime join reordering) but different mechanism. AEF reorders via plan replacement at section boundaries rather than per-tuple routing.
+*AEF relationship*: AEF does NOT attempt full join reordering due to the join order interaction problem—pairwise statistics cannot accurately predict intermediate result characteristics. AEF focuses on per-join decisions (probe/build swap, distribution type) which are safe with pairwise statistics.
 
 ### 12.2 Commercial Systems
 
@@ -3392,9 +3378,9 @@ Stage-based adaptation:
 - Reoptimize before starting next stage
 
 Capabilities: Partition coalescing, join strategy switching, skew handling.
-Limitation: **No join reordering**. Full materialization adds latency.
+Limitation: No join reordering. Full materialization adds latency.
 
-*AEF relationship*: AEF provides similar capabilities plus join reordering. Uses buffer-then-stream rather than full materialization, preserving Presto's streaming model.
+*AEF relationship*: AEF provides similar capabilities with lower latency. Uses buffer-then-stream rather than full materialization, preserving Presto's streaming model. Neither system attempts full join reordering due to the join order interaction problem.
 
 **Oracle Adaptive Plans (12c+)**
 
@@ -3436,11 +3422,13 @@ AEF combines existing concepts in a novel way:
 
 3. **Hash table probing for selectivity**: Directly measuring containment (fraction of probe keys in build) and fanout (average matches per key) by probing the buffer through the hash table. This captures correlations that NDV-based estimation misses.
 
-4. **Full query reoptimization scope**: Unlike Oracle (single operator) or SQL Server (single join), AEF can reoptimize the entire remaining plan including join reordering.
+4. **Broader reoptimization scope**: Unlike Oracle (single operator) or SQL Server (single join), AEF can reoptimize multiple aspects of the remaining plan: probe/build assignment, distribution type, and parallelism.
 
 5. **Section boundary integration**: Treating adaptive exchanges as section boundaries eliminates the complexity of cancelling running tasks or rewiring shuffle links—the downstream section simply hasn't started yet.
 
-**In summary**: AEF's contribution is the synthesis of buffering-based statistics collection (Oracle), checkpoint-triggered reoptimization (Kabra/Markl), and streaming execution (Presto's model) into a unified framework that enables full-scope adaptation including join reordering.
+**In summary**: AEF's contribution is the synthesis of buffering-based statistics collection (Oracle), checkpoint-triggered reoptimization (Kabra/Markl), and streaming execution (Presto's model) into a unified framework that enables multi-aspect join adaptation (probe/build swap, broadcast/shuffle, parallelism).
+
+**Explicit non-goal**: Full join reordering (A⋈B⋈C → A⋈C⋈B) is out of scope because pairwise statistics cannot accurately predict intermediate result characteristics. See "Join Order Interaction Problem" in Section 4.
 
 ### 12.4 References
 
@@ -3477,11 +3465,13 @@ AEF combines existing concepts in a novel way:
 | Partition coalescing | Yes | Yes |
 | Join strategy switching | Yes | Yes |
 | Skew handling | Yes | Yes |
-| Join reordering | No | Yes |
-| Execution model | Stage-based (blocking) | Streaming (buffer-then-stream) |
+| Join reordering | No | No* |
 | Statistics source | Shuffle file stats | Buffer samples + build progress + hash probes |
 | Early error detection | No (waits for stage) | Yes (build progress monitoring) |
+| Execution model | Stage-based (blocking) | Streaming (buffer-then-stream) |
 | Reoptimization scope | Within stage | Configurable (up to global) |
+
+*AEF supports probe/build swapping and distribution type changes, but NOT full join reordering (A⋈B⋈C → A⋈C⋈B) due to the join order interaction problem with pairwise statistics.
 
 ## Appendix C: Telemetry
 
