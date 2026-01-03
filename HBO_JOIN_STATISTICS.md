@@ -152,12 +152,15 @@ struct OperatorStats {
 
 **What we can compute from existing stats:**
 
-| Metric | Source |
-|--------|--------|
-| Probe input rows | `HashProbe.inputPositions` |
-| Output rows | `HashProbe.outputPositions` |
-| Build input rows | `HashBuild.inputPositions` (same planNodeId) |
-| Probe fanout | `outputPositions / inputPositions` |
+| Metric | Source | Notes |
+|--------|--------|-------|
+| Probe input rows | `HashProbe.inputPositions` | Rows entering probe side |
+| Build input rows | `HashBuild.inputPositions` | Rows added to hash table |
+| Output rows | `HashProbe.outputPositions` | Join result (0-N per probe row) |
+| Probe fanout | `HashProbe.output / HashProbe.input` | |
+| Build fanout | `HashProbe.output / HashBuild.input` | |
+
+**Important**: `HashBuild.outputPositions` is always 0 (it builds a hash table, doesn't produce output rows). The join output comes from `HashProbe.outputPositions`.
 
 ### 3.2 Architecture: Coordinator-Only Changes
 
@@ -282,18 +285,21 @@ public Map<String, JoinOperatorPair> extractJoinStats(TaskInfo taskInfo) {
         for (OperatorStats op : pipeline.getOperatorSummaries()) {
 
             // HashProbe is sent as "LookupJoinOperator" in Presto protocol
+            // This has BOTH probe input rows AND join output rows
             if ("LookupJoinOperator".equals(op.getOperatorType())) {
                 JoinOperatorPair pair = joinPairs.computeIfAbsent(
                     op.getPlanNodeId(), k -> new JoinOperatorPair());
                 pair.probeInputRows += op.getInputPositions();
-                pair.outputRows += op.getOutputPositions();
+                pair.outputRows += op.getOutputPositions();  // Join output comes from probe operator
             }
 
             // HashBuild is sent as "HashBuilderOperator" in Presto protocol
+            // This has build input rows, but outputPositions is always 0
             if ("HashBuilderOperator".equals(op.getOperatorType())) {
                 JoinOperatorPair pair = joinPairs.computeIfAbsent(
                     op.getPlanNodeId(), k -> new JoinOperatorPair());
                 pair.buildInputRows += op.getInputPositions();
+                // Note: op.getOutputPositions() is always 0 for HashBuild
             }
         }
     }
