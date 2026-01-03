@@ -366,46 +366,35 @@ Fragment 2: Exchange → HashBuild ─┐
 | PARTITIONED (shuffle) | ✅ |
 | Nested loop / Cross | ✅ |
 
-### 4.4 Critical: Operator Stats Are Summarized by Default
+### 4.4 Operator Stats in Final TaskInfo
 
-**Problem discovered**: For regular queries, operator stats are **stripped** before sending to coordinator:
+**Good news**: The `summarize` parameter only affects heartbeats. Final TaskInfo **always** includes pipeline stats:
+
+```cpp
+// PrestoTask.cpp line 698
+includePipelineStats = isFinalState(prestoTaskStatus.state) || !summarize;
+//                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//                     TRUE for FINISHED/FAILED/ABORTED/CANCELED
+```
+
+| TaskInfo Type | Pipeline Stats | Our Action |
+|---------------|----------------|------------|
+| Heartbeat (during execution) | ❌ Stripped if summarize=true | Ignore |
+| Final (on completion) | ✅ Always included | Extract join stats |
+
+**No session property needed!** We extract join stats from the final TaskInfo, which always has operator-level detail. The coordinator just needs to intercept the final TaskInfo before any post-processing discards the pipeline stats.
 
 ```java
-// SqlQueryExecution.java line 625
-summarizeTaskInfos = !explainAnalyze;  // TRUE for regular queries!
-
-// TaskStats.java summarize() method
-public TaskStats summarize() {
-    return new TaskStats(
-        // ... other fields ...
-        ImmutableList.of(),  // ← EMPTY pipelines list!
-        runtimeStats);
+// In task completion handler
+public void onTaskCompleted(TaskInfo finalTaskInfo) {
+    // finalTaskInfo.getStats().getPipelines() is populated!
+    if (isTrackHboJoinSamplesEnabled()) {
+        joinStatsCollector.extractAndStore(finalTaskInfo);
+    }
 }
 ```
 
-**Current behavior:**
-| Query Type | summarizeTaskInfo | Operator Stats |
-|------------|-------------------|----------------|
-| Regular query | TRUE | ❌ Stripped |
-| EXPLAIN ANALYZE | FALSE | ✅ Included |
-
-**Solution**: For HBO join stats, we need operator-level detail. Options:
-
-1. **Add session property** `track_hbo_join_samples` that disables summarization
-2. **Selective inclusion**: Only include join operator stats, still summarize others
-3. **Separate collection path**: Extract join stats before summarization
-
-**Recommended approach** (Option 1 - simplest):
-
-```java
-// In SqlQueryExecution.java
-boolean summarizeTaskInfos = !explainAnalyze
-    && !isTrackHboJoinSamplesEnabled(session);  // NEW
-```
-
-This adds ~1KB per task for operator stats, which is acceptable overhead when explicitly opted in.
-
-### 4.4 Heartbeat vs Final TaskInfo
+### 4.5 Heartbeat vs Final TaskInfo
 
 Presto workers send TaskInfo in two contexts:
 
