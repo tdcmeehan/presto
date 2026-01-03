@@ -6,9 +6,13 @@ This document describes a stepping stone project to improve join cardinality est
 
 **Goal**: After executing a query with joins, subsequent queries joining the same tables should have more accurate cardinality estimates.
 
-## Motivation
+**Runtime**: Velox (C++) only. There are no plans to implement this in the Java runtime.
 
-### The Problem
+---
+
+## 1. Motivation
+
+### 1.1 The Problem
 
 Join cardinality estimation is the primary source of query optimizer errors. The classic formula:
 
@@ -21,18 +25,18 @@ Fails because it assumes:
 - Key containment = 1.0 (all probe keys exist in build)
 - Fanout = 1.0 (one match per key)
 
-### The Opportunity
+### 1.2 The Opportunity
 
 During join execution, we observe the **actual** selectivity:
 
 ```
-Actual output rows = left input rows × left-to-right fanout
-                   = right input rows × right-to-left fanout
+Actual output rows = probe input rows × probe-to-build fanout
+                   = build input rows × build-to-probe fanout
 ```
 
 If we capture and store this, future queries benefit without additional overhead.
 
-### Why This Is a Good Stepping Stone
+### 1.3 Why This Is a Good Stepping Stone
 
 | Aspect | Full AEF | HBO Join Stats (This Project) |
 |--------|----------|-------------------------------|
@@ -42,197 +46,541 @@ If we capture and store this, future queries benefit without additional overhead
 | Infrastructure changes | Significant | Minimal (extends HBO) |
 | Risk | Higher | Lower |
 
-## Design
+---
 
-### High-Level Flow
+## 2. Data Model
 
-```
-Query 1: SELECT ... FROM orders JOIN customers ON ...
-  ├─ Execute normally
-  ├─ At join operator, observe: left_rows=1M, right_rows=100K, output=950K
-  ├─ Compute: lr_fanout = 950K/1M = 0.95, rl_fanout = 950K/100K = 9.5
-  ├─ Store in HBO: ("orders o_custkey", "customers c_custkey") → (0.95, 9.5)
-  └─ Return results
+### 2.1 Bidirectional Fanout
 
-Query 2: SELECT ... FROM orders JOIN customers ON ... (different columns selected)
-  ├─ Optimizer queries HBO for ("orders", "customers", "o_custkey=c_custkey")
-  ├─ HBO returns: lr_fanout=0.95, rl_fanout=9.5
-  ├─ Optimizer uses accurate fanout instead of assumptions
-  └─ Better plan selected
-```
+Following Axiom's model, we store bidirectional fanout for each join edge:
 
-### Data Structures
+```cpp
+struct JoinSelectivityStats {
+  // Bidirectional fanout - supports both join orderings from single observation
+  double leftToRightFanout;   // output_rows / left_input_rows
+  double rightToLeftFanout;   // output_rows / right_input_rows
 
-#### JoinSampleStatistics
+  // Observation metadata
+  int64_t observationTimestamp;  // Unix epoch millis
+  int32_t observationCount;      // Number of times observed
+  double variance;               // Stability across observations (Welford's algorithm)
 
-```java
-public class JoinSampleStatistics {
-    // Bidirectional fanout - supports both join orderings
-    private final double leftToRightFanout;   // output_rows / left_input_rows
-    private final double rightToLeftFanout;   // output_rows / right_input_rows
-
-    // Metadata for cache management
-    private final long sampleTimestamp;
-    private final long leftTableVersion;      // For invalidation
-    private final long rightTableVersion;
-
-    // Observation quality
-    private final long observationCount;      // How many times observed
-    private final double variance;            // Stability across observations
-
-    public JoinSampleStatistics(
-            double leftToRightFanout,
-            double rightToLeftFanout,
-            long sampleTimestamp,
-            long leftTableVersion,
-            long rightTableVersion) {
-        this.leftToRightFanout = leftToRightFanout;
-        this.rightToLeftFanout = rightToLeftFanout;
-        this.sampleTimestamp = sampleTimestamp;
-        this.leftTableVersion = leftTableVersion;
-        this.rightTableVersion = rightTableVersion;
-        this.observationCount = 1;
-        this.variance = 0.0;
-    }
-
-    // Swap for when join direction is reversed
-    public JoinSampleStatistics swap() {
-        return new JoinSampleStatistics(
-            rightToLeftFanout, leftToRightFanout,
-            sampleTimestamp, rightTableVersion, leftTableVersion);
-    }
-
-    // Merge with new observation (running average)
-    public JoinSampleStatistics mergeObservation(JoinSampleStatistics newer) {
-        long newCount = this.observationCount + 1;
-        double newLrFanout = this.leftToRightFanout +
-            (newer.leftToRightFanout - this.leftToRightFanout) / newCount;
-        double newRlFanout = this.rightToLeftFanout +
-            (newer.rightToLeftFanout - this.rightToLeftFanout) / newCount;
-        // ... update variance using Welford's algorithm
-        return new JoinSampleStatistics(newLrFanout, newRlFanout, ...);
-    }
-}
+  // For cache invalidation (optional)
+  int64_t leftTableVersion;
+  int64_t rightTableVersion;
+};
 ```
 
-#### Canonical Key Generation
+**Why bidirectional?**
+
+```
+Query 1: SELECT * FROM orders JOIN customers ON o_custkey = c_custkey
+  - orders is probe (left), customers is build (right)
+  - Observe: lr_fanout = 0.95 (most orders have a customer)
+  - Observe: rl_fanout = 10.5 (each customer has ~10 orders)
+
+Query 2: SELECT * FROM customers JOIN orders ON c_custkey = o_custkey
+  - customers is probe (left), orders is build (right)
+  - Need: lr_fanout from customer perspective = 10.5
+  - Use stored rl_fanout from Query 1 (swap!)
+```
+
+### 2.2 Canonical Key Generation
 
 Keys must be deterministic regardless of SQL join order:
 
-```java
-public class CanonicalJoinKeyGenerator {
+```cpp
+// Generates a canonical key for any join between two tables
+// Returns: (canonical_key, was_swapped)
+std::pair<std::string, bool> generateCanonicalJoinKey(
+    const std::string& leftTable,
+    const std::vector<std::string>& leftKeys,
+    const std::string& rightTable,
+    const std::vector<std::string>& rightKeys) {
 
-    /**
-     * Generate a canonical key for a join between two tables.
-     * Returns (key, swapped) where swapped indicates if tables were reordered.
-     */
-    public static Pair<String, Boolean> generateKey(
-            QualifiedObjectName leftTable,
-            List<String> leftKeys,
-            QualifiedObjectName rightTable,
-            List<String> rightKeys) {
+  // 1. Sort join keys alphabetically for determinism
+  std::vector<size_t> indices(leftKeys.size());
+  std::iota(indices.begin(), indices.end(), 0);
+  std::sort(indices.begin(), indices.end(),
+    [&](size_t a, size_t b) { return leftKeys[a] < leftKeys[b]; });
 
-        // Sort join keys alphabetically for determinism
-        List<Integer> indices = IntStream.range(0, leftKeys.size())
-            .boxed()
-            .sorted(Comparator.comparing(leftKeys::get))
-            .collect(Collectors.toList());
+  // 2. Build canonical strings: "table key1 key2 ... "
+  std::string leftCanonical = leftTable + " ";
+  std::string rightCanonical = rightTable + " ";
+  for (size_t i : indices) {
+    leftCanonical += leftKeys[i] + " ";
+    rightCanonical += rightKeys[i] + " ";
+  }
 
-        // Build canonical table+keys strings
-        StringBuilder left = new StringBuilder(leftTable.getObjectName() + " ");
-        StringBuilder right = new StringBuilder(rightTable.getObjectName() + " ");
-
-        for (int i : indices) {
-            left.append(leftKeys.get(i)).append(" ");
-            right.append(rightKeys.get(i)).append(" ");
-        }
-
-        String leftStr = left.toString();
-        String rightStr = right.toString();
-
-        // Lexicographically smaller table first
-        if (leftStr.compareTo(rightStr) < 0) {
-            return Pair.of(leftStr + "  " + rightStr, false);
-        }
-        return Pair.of(rightStr + "  " + leftStr, true);
-    }
+  // 3. Lexicographically smaller table first (ensures A-B and B-A map to same key)
+  if (leftCanonical < rightCanonical) {
+    return {leftCanonical + "  " + rightCanonical, false};
+  }
+  return {rightCanonical + "  " + leftCanonical, true};
 }
 
 // Examples:
-// A JOIN B ON a.x = b.y → "a x   b y " (not swapped)
-// B JOIN A ON b.y = a.x → "a x   b y " (swapped=true, need to swap fanouts)
+// orders JOIN customers ON o_custkey = c_custkey
+//   → "customers c_custkey   orders o_custkey " (swapped=true)
+//
+// customers JOIN orders ON c_custkey = o_custkey
+//   → "customers c_custkey   orders o_custkey " (swapped=false)
+//
+// Both queries map to the SAME key!
 ```
 
-### Integration Points
+---
 
-#### 1. Capturing Statistics During Execution
+## 3. Velox Implementation: Collecting Statistics
 
-**Option A: Final TaskInfo (Recommended)**
+### 3.1 Architecture Overview
 
-Presto's TaskInfo contains execution statistics. The "final" TaskInfo has the most complete data:
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Velox Task                                   │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐  │
+│  │ HashProbe   │───▶│ Driver      │───▶│ Task                    │  │
+│  │ Operator    │    │             │    │                         │  │
+│  │             │    │ Collects    │    │ Aggregates operator     │  │
+│  │ Tracks:     │    │ operator    │    │ stats across drivers    │  │
+│  │ - probeRows │    │ stats at    │    │                         │  │
+│  │ - buildRows │    │ pipeline    │    │ Publishes to            │  │
+│  │ - matches   │    │ completion  │    │ TaskStats               │  │
+│  └─────────────┘    └─────────────┘    └─────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Presto Worker (C++)                               │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ PrestoTask                                                       ││
+│  │                                                                  ││
+│  │ updateHeartbeatInfo() / createTaskInfo()                        ││
+│  │   - Reads Task::taskStats()                                     ││
+│  │   - Extracts JoinSelectivityStats per join operator             ││
+│  │   - Includes in TaskInfo sent to coordinator                    ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Presto Coordinator (Java)                         │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │ SqlQueryExecution                                                ││
+│  │                                                                  ││
+│  │ On final TaskInfo:                                               ││
+│  │   - Extract JoinSelectivityStats                                 ││
+│  │   - Aggregate across tasks (weighted by row count)               ││
+│  │   - Store to HBO via HistoryBasedPlanStatisticsProvider         ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-```java
-// In TaskInfo or a new JoinExecutionStats
-public class JoinExecutionStats {
-    private final PlanNodeId joinNodeId;
-    private final String canonicalJoinKey;
-    private final long leftInputRows;
-    private final long rightInputRows;
-    private final long outputRows;
+### 3.2 HashProbe Operator: Tracking Join Statistics
 
-    public JoinSampleStatistics toJoinSampleStatistics() {
-        double lrFanout = (double) outputRows / leftInputRows;
-        double rlFanout = (double) outputRows / rightInputRows;
-        return new JoinSampleStatistics(lrFanout, rlFanout, ...);
+The `HashProbe` operator in Velox executes the probe phase of a hash join. We extend it to track join selectivity:
+
+```cpp
+// In velox/exec/HashProbe.h
+
+class HashProbe : public Operator {
+ public:
+  // ... existing code ...
+
+  // NEW: Join statistics tracking
+  struct JoinStats {
+    int64_t probeInputRows = 0;    // Rows received from probe side
+    int64_t buildInputRows = 0;    // Rows in hash table (from HashBuild)
+    int64_t outputRows = 0;        // Rows emitted from join
+
+    // For canonical key generation
+    std::string probeTableName;
+    std::string buildTableName;
+    std::vector<std::string> probeKeyColumns;
+    std::vector<std::string> buildKeyColumns;
+
+    double probeToBuildfanout() const {
+      return probeInputRows > 0
+          ? static_cast<double>(outputRows) / probeInputRows
+          : 0.0;
     }
+
+    double buildToProbeFanout() const {
+      return buildInputRows > 0
+          ? static_cast<double>(outputRows) / buildInputRows
+          : 0.0;
+    }
+  };
+
+  const JoinStats& joinStats() const { return joinStats_; }
+
+ private:
+  JoinStats joinStats_;
+};
+```
+
+### 3.3 HashProbe: Populating Statistics During Execution
+
+```cpp
+// In velox/exec/HashProbe.cpp
+
+void HashProbe::addInput(RowVectorPtr input) {
+  // Track probe input rows
+  joinStats_.probeInputRows += input->size();
+
+  // ... existing probe logic ...
+}
+
+RowVectorPtr HashProbe::getOutput() {
+  auto output = /* ... existing output generation ... */;
+
+  if (output) {
+    // Track output rows
+    joinStats_.outputRows += output->size();
+  }
+
+  return output;
+}
+
+void HashProbe::initialize() {
+  // Get build side stats from HashBuild via the hash table
+  auto* hashTable = table_.get();
+  joinStats_.buildInputRows = hashTable->numDistinct();  // Or total rows
+
+  // Extract table and column names from plan node
+  auto* joinNode = dynamic_cast<const core::HashJoinNode*>(planNode_.get());
+  if (joinNode) {
+    // Extract probe side table name (requires walking the plan tree)
+    joinStats_.probeTableName = extractTableName(joinNode->sources()[0]);
+    joinStats_.buildTableName = extractTableName(joinNode->sources()[1]);
+
+    // Extract join key column names
+    for (const auto& key : joinNode->leftKeys()) {
+      joinStats_.probeKeyColumns.push_back(key->name());
+    }
+    for (const auto& key : joinNode->rightKeys()) {
+      joinStats_.buildKeyColumns.push_back(key->name());
+    }
+  }
+}
+
+// Helper to extract base table name from a plan subtree
+std::string HashProbe::extractTableName(
+    const std::shared_ptr<const core::PlanNode>& node) {
+  // Walk down to find TableScanNode
+  if (auto* tableScan = dynamic_cast<const core::TableScanNode*>(node.get())) {
+    // Extract table name from TableHandle
+    // This is connector-specific; for Hive:
+    auto* hiveHandle = dynamic_cast<const HiveTableHandle*>(
+        tableScan->tableHandle().get());
+    if (hiveHandle) {
+      return hiveHandle->tableName();
+    }
+  }
+
+  // Recurse into sources
+  for (const auto& source : node->sources()) {
+    auto name = extractTableName(source);
+    if (!name.empty()) {
+      return name;
+    }
+  }
+
+  return "";  // Not a base table join
 }
 ```
 
-**Where to capture:**
+### 3.4 Operator Stats: Exposing Join Statistics
 
-```java
-// In HashJoinOperator or similar
-class HashJoinOperator implements Operator {
+Velox operators expose statistics via `OperatorStats`. We extend this:
 
-    private long leftInputPositions = 0;
-    private long rightInputPositions = 0;
-    private long outputPositions = 0;
+```cpp
+// In velox/exec/OperatorStats.h
 
-    @Override
-    public void finish() {
-        // Capture join stats
-        operatorContext.recordJoinStats(new JoinExecutionStats(
-            planNodeId,
-            getCanonicalJoinKey(),
-            leftInputPositions,
-            rightInputPositions,
-            outputPositions));
-    }
+struct OperatorStats {
+  // ... existing fields ...
+
+  // NEW: Join-specific statistics
+  struct JoinOperatorStats {
+    int64_t probeInputRows = 0;
+    int64_t buildInputRows = 0;
+    int64_t outputRows = 0;
+    std::string canonicalJoinKey;  // Pre-computed canonical key
+    bool keyWasSwapped = false;    // Whether tables were swapped in key
+  };
+
+  std::optional<JoinOperatorStats> joinStats;
+};
+
+// In velox/exec/HashProbe.cpp
+
+void HashProbe::close() {
+  // Populate operator stats with join statistics
+  auto stats = operatorStats();
+
+  OperatorStats::JoinOperatorStats joinOpStats;
+  joinOpStats.probeInputRows = joinStats_.probeInputRows;
+  joinOpStats.buildInputRows = joinStats_.buildInputRows;
+  joinOpStats.outputRows = joinStats_.outputRows;
+
+  // Generate canonical key
+  auto [key, swapped] = generateCanonicalJoinKey(
+      joinStats_.probeTableName,
+      joinStats_.probeKeyColumns,
+      joinStats_.buildTableName,
+      joinStats_.buildKeyColumns);
+
+  joinOpStats.canonicalJoinKey = std::move(key);
+  joinOpStats.keyWasSwapped = swapped;
+
+  stats.joinStats = std::move(joinOpStats);
+
+  Operator::close();
 }
 ```
 
-**Aggregating at coordinator:**
+### 3.5 Task Stats: Aggregating Across Pipelines
+
+```cpp
+// In velox/exec/Task.cpp
+
+TaskStats Task::taskStats() const {
+  TaskStats stats;
+
+  // ... existing stats collection ...
+
+  // NEW: Collect join stats from all pipelines
+  for (const auto& pipeline : pipelines_) {
+    for (const auto& driver : pipeline.drivers) {
+      for (const auto& op : driver->operators()) {
+        if (op->operatorType() == "HashProbe") {
+          auto opStats = op->stats();
+          if (opStats.joinStats.has_value()) {
+            stats.joinStats.push_back(opStats.joinStats.value());
+          }
+        }
+      }
+    }
+  }
+
+  return stats;
+}
+```
+
+---
+
+## 4. Presto Worker: Including Join Stats in TaskInfo
+
+### 4.1 TaskInfo Protocol Buffer Extension
+
+```protobuf
+// In presto-native-execution/presto_protocol/presto_protocol.proto
+
+message JoinSelectivityInfo {
+  string canonical_join_key = 1;
+  int64 probe_input_rows = 2;
+  int64 build_input_rows = 3;
+  int64 output_rows = 4;
+  bool key_was_swapped = 5;
+}
+
+message TaskInfo {
+  // ... existing fields ...
+
+  // NEW: Join statistics observed during execution
+  repeated JoinSelectivityInfo join_selectivity_stats = 20;
+}
+```
+
+### 4.2 PrestoTask: Populating TaskInfo
+
+```cpp
+// In presto-native-execution/src/PrestoTask.cpp
+
+protocol::TaskInfo PrestoTask::createTaskInfo() const {
+  protocol::TaskInfo info;
+
+  // ... existing TaskInfo population ...
+
+  // NEW: Add join selectivity stats
+  auto taskStats = task_->taskStats();
+  for (const auto& joinStat : taskStats.joinStats) {
+    if (!joinStat.canonicalJoinKey.empty()) {
+      protocol::JoinSelectivityInfo jsInfo;
+      jsInfo.canonical_join_key = joinStat.canonicalJoinKey;
+      jsInfo.probe_input_rows = joinStat.probeInputRows;
+      jsInfo.build_input_rows = joinStat.buildInputRows;
+      jsInfo.output_rows = joinStat.outputRows;
+      jsInfo.key_was_swapped = joinStat.keyWasSwapped;
+
+      info.join_selectivity_stats.push_back(std::move(jsInfo));
+    }
+  }
+
+  return info;
+}
+```
+
+### 4.3 Heartbeat vs Final TaskInfo
+
+Presto workers send TaskInfo in two contexts:
+
+1. **Heartbeat**: Periodic updates during execution (partial stats)
+2. **Final**: When task completes (complete stats)
+
+We only use **final** TaskInfo for HBO updates to ensure complete statistics:
+
+```cpp
+// In PrestoTask.cpp
+
+void PrestoTask::updateHeartbeatInfo() {
+  auto info = createTaskInfo();
+
+  // For heartbeats, we might send partial join stats for monitoring
+  // but mark them as incomplete
+  for (auto& jsInfo : info.join_selectivity_stats) {
+    jsInfo.is_complete = false;  // Partial observation
+  }
+
+  sendHeartbeat(info);
+}
+
+void PrestoTask::onTaskComplete() {
+  auto info = createTaskInfo();
+
+  // Final stats are complete
+  for (auto& jsInfo : info.join_selectivity_stats) {
+    jsInfo.is_complete = true;  // Full observation
+  }
+
+  sendFinalInfo(info);
+}
+```
+
+---
+
+## 5. Coordinator: Aggregating and Storing to HBO
+
+### 5.1 Receiving Join Stats from Workers
 
 ```java
-// In SqlQueryExecution or QueryStateMachine
-void onStageComplete(StageId stageId, StageInfo stageInfo) {
-    for (TaskInfo task : stageInfo.getTasks()) {
-        for (JoinExecutionStats joinStats : task.getJoinStats()) {
-            // Aggregate across tasks (sum rows, compute average fanout)
-            aggregatedJoinStats.merge(joinStats);
+// In SqlQueryExecution.java or StageStateMachine.java
+
+public void updateTaskInfo(TaskInfo taskInfo) {
+    // ... existing task info handling ...
+
+    // NEW: Collect join selectivity stats
+    if (taskInfo.isComplete()) {
+        for (JoinSelectivityInfo jsInfo : taskInfo.getJoinSelectivityStats()) {
+            joinStatsCollector.addObservation(jsInfo);
         }
     }
 }
+```
 
-void onQueryComplete() {
-    // Store aggregated stats to HBO
-    for (JoinSampleStatistics stats : aggregatedJoinStats.values()) {
-        hboProvider.putJoinSample(stats.getCanonicalKey(), stats);
+### 5.2 Aggregating Across Tasks
+
+Multiple tasks execute the same join (partitioned). We aggregate:
+
+```java
+public class JoinStatsCollector {
+
+    // Key: canonical join key
+    // Value: aggregated stats across all tasks
+    private final Map<String, AggregatedJoinStats> statsMap = new ConcurrentHashMap<>();
+
+    public void addObservation(JoinSelectivityInfo info) {
+        statsMap.compute(info.getCanonicalJoinKey(), (key, existing) -> {
+            if (existing == null) {
+                return new AggregatedJoinStats(info);
+            }
+            return existing.merge(info);
+        });
+    }
+
+    public static class AggregatedJoinStats {
+        private long totalProbeInputRows = 0;
+        private long totalBuildInputRows = 0;
+        private long totalOutputRows = 0;
+        private boolean keyWasSwapped;
+
+        public AggregatedJoinStats(JoinSelectivityInfo first) {
+            this.totalProbeInputRows = first.getProbeInputRows();
+            this.totalBuildInputRows = first.getBuildInputRows();
+            this.totalOutputRows = first.getOutputRows();
+            this.keyWasSwapped = first.isKeyWasSwapped();
+        }
+
+        public AggregatedJoinStats merge(JoinSelectivityInfo other) {
+            // Sum across partitions
+            this.totalProbeInputRows += other.getProbeInputRows();
+            this.totalBuildInputRows += other.getBuildInputRows();
+            this.totalOutputRows += other.getOutputRows();
+            return this;
+        }
+
+        public JoinSampleStatistics toJoinSampleStatistics() {
+            double lrFanout = totalProbeInputRows > 0
+                ? (double) totalOutputRows / totalProbeInputRows
+                : 0.0;
+            double rlFanout = totalBuildInputRows > 0
+                ? (double) totalOutputRows / totalBuildInputRows
+                : 0.0;
+
+            // If key was swapped, fanouts are from swapped perspective
+            // Store in canonical order (swap back)
+            if (keyWasSwapped) {
+                return new JoinSampleStatistics(rlFanout, lrFanout, ...);
+            }
+            return new JoinSampleStatistics(lrFanout, rlFanout, ...);
+        }
     }
 }
 ```
 
-#### 2. Extended HBO Provider Interface
+### 5.3 Storing to HBO on Query Completion
+
+```java
+// In SqlQueryExecution.java
+
+@Override
+public void queryComplete() {
+    // ... existing completion logic ...
+
+    // NEW: Store join stats to HBO
+    if (isTrackHboJoinSamplesEnabled(session)) {
+        storeJoinStatsToHbo();
+    }
+}
+
+private void storeJoinStatsToHbo() {
+    HistoryBasedPlanStatisticsProvider hboProvider = getHboProvider();
+
+    for (Map.Entry<String, AggregatedJoinStats> entry :
+            joinStatsCollector.getStats().entrySet()) {
+
+        String canonicalKey = entry.getKey();
+        JoinSampleStatistics stats = entry.getValue().toJoinSampleStatistics();
+
+        // Merge with existing observation if present
+        Optional<JoinSampleStatistics> existing = hboProvider.getJoinSample(canonicalKey);
+        if (existing.isPresent()) {
+            stats = existing.get().mergeObservation(stats);
+        }
+
+        hboProvider.putJoinSample(canonicalKey, stats);
+
+        log.debug("Stored join stats for %s: lr=%.3f, rl=%.3f",
+            canonicalKey, stats.getLeftToRightFanout(), stats.getRightToLeftFanout());
+    }
+}
+```
+
+---
+
+## 6. HBO Provider: Storage Interface
+
+### 6.1 Extended Interface
 
 ```java
 public interface HistoryBasedPlanStatisticsProvider {
@@ -247,7 +595,7 @@ public interface HistoryBasedPlanStatisticsProvider {
 
     // NEW: Join sample methods
     default Optional<JoinSampleStatistics> getJoinSample(String joinKey) {
-        return Optional.empty();  // Default: not implemented
+        return Optional.empty();
     }
 
     default void putJoinSample(String joinKey, JoinSampleStatistics statistics) {
@@ -257,7 +605,6 @@ public interface HistoryBasedPlanStatisticsProvider {
     default Map<String, JoinSampleStatistics> getJoinSamples(
             Set<String> joinKeys,
             long timeoutInMillis) {
-        // Default: iterate over keys
         Map<String, JoinSampleStatistics> result = new HashMap<>();
         for (String key : joinKeys) {
             getJoinSample(key).ifPresent(s -> result.put(key, s));
@@ -267,13 +614,13 @@ public interface HistoryBasedPlanStatisticsProvider {
 }
 ```
 
-#### 3. Redis Implementation
+### 6.2 Redis Implementation
 
 ```java
 public class RedisHistoryBasedPlanStatisticsProvider
         implements HistoryBasedPlanStatisticsProvider {
 
-    private static final String JOIN_SAMPLE_PREFIX = "hbo:join_sample:";
+    private static final String JOIN_SAMPLE_PREFIX = "hbo:join:";
     private static final int JOIN_SAMPLE_TTL_SECONDS = 7 * 24 * 3600; // 1 week
 
     private final JedisPool jedisPool;
@@ -282,13 +629,13 @@ public class RedisHistoryBasedPlanStatisticsProvider
     @Override
     public Optional<JoinSampleStatistics> getJoinSample(String joinKey) {
         try (Jedis jedis = jedisPool.getResource()) {
-            String value = jedis.get(JOIN_SAMPLE_PREFIX + joinKey);
+            String value = jedis.get(JOIN_SAMPLE_PREFIX + hashKey(joinKey));
             if (value == null) {
                 return Optional.empty();
             }
             return Optional.of(objectMapper.readValue(value, JoinSampleStatistics.class));
         } catch (Exception e) {
-            log.warn("Failed to get join sample for key: " + joinKey, e);
+            log.warn("Failed to get join sample: " + joinKey, e);
             return Optional.empty();
         }
     }
@@ -297,40 +644,43 @@ public class RedisHistoryBasedPlanStatisticsProvider
     public void putJoinSample(String joinKey, JoinSampleStatistics stats) {
         try (Jedis jedis = jedisPool.getResource()) {
             String value = objectMapper.writeValueAsString(stats);
-            jedis.setex(JOIN_SAMPLE_PREFIX + joinKey, JOIN_SAMPLE_TTL_SECONDS, value);
+            jedis.setex(JOIN_SAMPLE_PREFIX + hashKey(joinKey),
+                        JOIN_SAMPLE_TTL_SECONDS, value);
         } catch (Exception e) {
-            log.warn("Failed to store join sample for key: " + joinKey, e);
+            log.warn("Failed to store join sample: " + joinKey, e);
         }
     }
 
-    @Override
-    public Map<String, JoinSampleStatistics> getJoinSamples(
-            Set<String> joinKeys, long timeoutInMillis) {
-        try (Jedis jedis = jedisPool.getResource()) {
-            String[] keys = joinKeys.stream()
-                .map(k -> JOIN_SAMPLE_PREFIX + k)
-                .toArray(String[]::new);
-
-            List<String> values = jedis.mget(keys);
-
-            Map<String, JoinSampleStatistics> result = new HashMap<>();
-            int i = 0;
-            for (String joinKey : joinKeys) {
-                String value = values.get(i++);
-                if (value != null) {
-                    result.put(joinKey, objectMapper.readValue(value, JoinSampleStatistics.class));
-                }
-            }
-            return result;
-        } catch (Exception e) {
-            log.warn("Failed to batch get join samples", e);
-            return Collections.emptyMap();
-        }
+    // Hash long keys to fixed-length for Redis efficiency
+    private String hashKey(String joinKey) {
+        return Hashing.sha256()
+            .hashString(joinKey, StandardCharsets.UTF_8)
+            .toString()
+            .substring(0, 32);
     }
 }
 ```
 
-#### 4. Integration with Stats Calculation
+### 6.3 Redis Key Schema
+
+```
+Key:   hbo:join:{sha256(canonical_key)[0:32]}
+Value: {
+  "lr": 10.5,              // left-to-right fanout
+  "rl": 0.95,              // right-to-left fanout
+  "ts": 1704067200000,     // observation timestamp (epoch ms)
+  "cnt": 5,                // observation count
+  "var": 0.02,             // variance across observations
+  "key": "customer c_custkey   orders o_custkey "  // original key for debugging
+}
+TTL: 7 days (configurable)
+```
+
+---
+
+## 7. Optimizer Integration
+
+### 7.1 HistoryBasedJoinStatsRule
 
 ```java
 public class HistoryBasedJoinStatsRule
@@ -350,185 +700,276 @@ public class HistoryBasedJoinStatsRule
             Lookup lookup,
             Session session) {
 
-        if (!isHboJoinSamplesEnabled(session)) {
+        if (!isUseHboJoinSamplesEnabled(session)) {
             return Optional.empty();
         }
 
-        // Only support base table joins for now
-        Optional<QualifiedObjectName> leftTable = extractBaseTable(node.getLeft());
-        Optional<QualifiedObjectName> rightTable = extractBaseTable(node.getRight());
+        // Only support base table joins
+        Optional<TableInfo> leftTable = extractBaseTableInfo(node.getLeft());
+        Optional<TableInfo> rightTable = extractBaseTableInfo(node.getRight());
 
         if (leftTable.isEmpty() || rightTable.isEmpty()) {
             return Optional.empty();
         }
 
         // Generate canonical key
-        List<String> leftKeys = extractJoinColumns(node.getCriteria(), true);
-        List<String> rightKeys = extractJoinColumns(node.getCriteria(), false);
+        List<String> leftKeys = extractJoinColumnNames(node.getCriteria(), true);
+        List<String> rightKeys = extractJoinColumnNames(node.getCriteria(), false);
 
-        Pair<String, Boolean> keyPair = CanonicalJoinKeyGenerator.generateKey(
-            leftTable.get(), leftKeys, rightTable.get(), rightKeys);
+        CanonicalJoinKey keyResult = CanonicalJoinKeyGenerator.generate(
+            leftTable.get().tableName(), leftKeys,
+            rightTable.get().tableName(), rightKeys);
 
         // Lookup in HBO
-        Optional<JoinSampleStatistics> sample = hboProvider.getJoinSample(keyPair.getLeft());
+        Optional<JoinSampleStatistics> sample =
+            hboProvider.getJoinSample(keyResult.getKey());
 
         if (sample.isEmpty()) {
-            return Optional.empty();  // Fall back to traditional estimation
+            return Optional.empty();  // No historical data, fall back
         }
 
         JoinSampleStatistics stats = sample.get();
-        if (keyPair.getRight()) {
-            stats = stats.swap();  // Swap if key was reversed
-        }
 
-        // Check staleness
+        // Swap fanouts if key was reversed
+        double fanout = keyResult.isSwapped()
+            ? stats.getRightToLeftFanout()
+            : stats.getLeftToRightFanout();
+
+        // Check staleness (optional)
         if (isStale(stats, leftTable.get(), rightTable.get())) {
-            return Optional.empty();  // Stale, fall back
+            return Optional.empty();
         }
 
-        // Compute output cardinality using historical fanout
+        // Compute output cardinality
         PlanNodeStatsEstimate leftStats = statsProvider.getStats(node.getLeft());
-        double outputRows = leftStats.getOutputRowCount() * stats.getLeftToRightFanout();
+        double outputRows = leftStats.getOutputRowCount() * fanout;
 
         return Optional.of(PlanNodeStatsEstimate.builder()
             .setOutputRowCount(outputRows)
             .build());
     }
-
-    private boolean isStale(JoinSampleStatistics stats,
-                           QualifiedObjectName leftTable,
-                           QualifiedObjectName rightTable) {
-        // Check if tables have been modified since stats were captured
-        // This could query metastore for last modification time
-        return false; // TODO: implement staleness check
-    }
 }
 ```
 
-### Session Properties
+### 7.2 Registering the Rule
 
 ```java
-// SystemSessionProperties.java
+// In StatsCalculatorModule.java or similar
+
+@Override
+protected void setup(Binder binder) {
+    // ... existing rules ...
+
+    // NEW: HBO join stats rule
+    binder.bind(HistoryBasedJoinStatsRule.class).in(Scopes.SINGLETON);
+
+    // Add to composable stats calculator
+    Multibinder<ComposableStatsCalculator.Rule<?>> rulesBinder =
+        Multibinder.newSetBinder(binder, new TypeLiteral<ComposableStatsCalculator.Rule<?>>() {});
+    rulesBinder.addBinding().to(HistoryBasedJoinStatsRule.class);
+}
+```
+
+---
+
+## 8. Session Properties
+
+```java
+// In SystemSessionProperties.java
+
 public static final String USE_HBO_JOIN_SAMPLES = "use_hbo_join_samples";
 public static final String TRACK_HBO_JOIN_SAMPLES = "track_hbo_join_samples";
 
 propertyMetadataBuilder(USE_HBO_JOIN_SAMPLES)
     .description("Use historical join samples for cardinality estimation")
     .booleanValue()
-    .defaultValue(false)  // Off by default during rollout
+    .defaultValue(false)
     .build();
 
 propertyMetadataBuilder(TRACK_HBO_JOIN_SAMPLES)
     .description("Record join execution statistics for future optimization")
     .booleanValue()
-    .defaultValue(false)  // Off by default
+    .defaultValue(false)
     .build();
 ```
 
-### Redis Key Schema
+---
 
-```
-Key:   hbo:join_sample:{canonical_key}
-Value: {
-  "lr": <float>,           // left-to-right fanout
-  "rl": <float>,           // right-to-left fanout
-  "ts": <epoch_millis>,    // sample timestamp
-  "lv": <long>,            // left table version (optional)
-  "rv": <long>,            // right table version (optional)
-  "cnt": <int>,            // observation count
-  "var": <float>           // variance across observations
-}
+## 9. End-to-End Example
 
-# Example
-hbo:join_sample:customer c_custkey   orders o_custkey  ->
-  {"lr":10.5,"rl":0.95,"ts":1704067200000,"cnt":5,"var":0.02}
+### Query 1: First Execution (Learning)
+
+```sql
+SET SESSION track_hbo_join_samples = true;
+
+SELECT o.order_id, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.status = 'SHIPPED';
 ```
 
-## Implementation Plan
+**Execution flow:**
 
-### Phase 1: Capture and Store (2-3 weeks)
+1. Optimizer uses traditional estimation: `|orders ⋈ customers| ≈ 1M × 100K / 100K = 1M`
 
-1. Add `JoinExecutionStats` to track join statistics during execution
-2. Aggregate stats at query completion
-3. Extend `HistoryBasedPlanStatisticsProvider` with join sample methods
-4. Implement Redis storage for join samples
+2. HashProbe executes, observes:
+   - `probeInputRows = 500,000` (filtered orders)
+   - `buildInputRows = 100,000` (all customers)
+   - `outputRows = 475,000` (most orders have customers)
 
-**Deliverable**: Queries store join statistics in Redis after execution.
+3. Task completes, sends final TaskInfo with:
+   ```
+   JoinSelectivityInfo {
+     canonical_key: "customers id   orders customer_id "
+     probe_input_rows: 500000
+     build_input_rows: 100000
+     output_rows: 475000
+     key_was_swapped: true
+   }
+   ```
 
-### Phase 2: Use in Optimizer (1-2 weeks)
+4. Coordinator aggregates (sums across tasks) and stores to HBO:
+   ```
+   Key: hbo:join:a1b2c3d4...
+   Value: {
+     "lr": 0.95,    // 475K/500K - most orders match
+     "rl": 4.75,    // 475K/100K - each customer has ~5 shipped orders
+     "ts": 1704067200000,
+     "cnt": 1
+   }
+   ```
+
+### Query 2: Second Execution (Benefiting)
+
+```sql
+SET SESSION use_hbo_join_samples = true;
+
+SELECT c.name, COUNT(*)
+FROM customers c
+JOIN orders o ON c.id = o.customer_id  -- Note: reversed join order!
+WHERE o.status = 'PENDING'
+GROUP BY c.name;
+```
+
+**Optimization flow:**
+
+1. Optimizer sees join: `customers ⋈ orders`
+
+2. Generates canonical key: `"customers id   orders customer_id "` (same as before!)
+
+3. Queries HBO, gets: `lr=0.95, rl=4.75`
+
+4. Since join is `customers JOIN orders`:
+   - customers is probe (left)
+   - Key was NOT swapped (customers < orders lexicographically)
+   - Use `lr_fanout = 0.95`... wait, that's wrong direction
+
+5. Actually: Key WAS generated with customers first, so:
+   - Original observation had orders as probe (swapped=true)
+   - Current query has customers as probe (swapped=false)
+   - Need to use `rl_fanout = 4.75` (each customer has ~5 orders)
+
+6. Estimate: `|customers| × 4.75 = 100K × 4.75 = 475K` (accurate!)
+
+7. Better plan selected based on accurate cardinality.
+
+---
+
+## 10. Implementation Plan
+
+### Phase 1: Velox Stats Collection (2 weeks)
+
+1. Add `JoinStats` struct to `HashProbe`
+2. Track rows in `addInput()` and `getOutput()`
+3. Extract table/column names from plan node
+4. Expose via `OperatorStats`
+5. Aggregate in `Task::taskStats()`
+
+**Deliverable**: Velox tasks collect join statistics.
+
+### Phase 2: TaskInfo Transport (1 week)
+
+1. Add `JoinSelectivityInfo` to protocol buffer
+2. Populate in `PrestoTask::createTaskInfo()`
+3. Mark complete vs incomplete observations
+
+**Deliverable**: Join stats included in TaskInfo to coordinator.
+
+### Phase 3: HBO Storage (1-2 weeks)
+
+1. Extend `HistoryBasedPlanStatisticsProvider` interface
+2. Implement Redis storage methods
+3. Add aggregation in coordinator
+4. Store on query completion
+
+**Deliverable**: Join stats persisted to Redis.
+
+### Phase 4: Optimizer Integration (1-2 weeks)
 
 1. Implement `CanonicalJoinKeyGenerator`
-2. Add `HistoryBasedJoinStatsRule` to stats calculation
-3. Add session properties for feature gating
+2. Add `HistoryBasedJoinStatsRule`
+3. Register rule in stats calculator
+4. Add session properties
 
-**Deliverable**: Second+ executions of join queries use HBO statistics.
+**Deliverable**: Second+ queries use HBO stats.
 
-### Phase 3: Validation and Tuning (1-2 weeks)
+### Phase 5: Validation (1 week)
 
-1. Add logging/metrics for HBO join stats usage
-2. Implement staleness detection
+1. Add logging/metrics
+2. Test with real workloads
 3. Tune TTL and merge strategy
-4. A/B test on real workloads
+4. Document operational procedures
 
-**Deliverable**: Production-ready feature with observability.
+**Deliverable**: Production-ready feature.
 
-## Success Metrics
+---
+
+## 11. Success Metrics
 
 ### Correctness
 
-- Query results unchanged (this is statistics only, no execution changes)
-- HBO stats retrieved match stored values
+- Query results unchanged (statistics only)
+- Fanout values mathematically consistent (lr × probe_rows = rl × build_rows = output)
 
 ### Performance
 
 | Metric | Target |
 |--------|--------|
-| Second query improvement | 10-50% for join-heavy queries with misestimates |
+| Second query plan improvement | Better join order in 20%+ of cases with misestimates |
 | HBO lookup latency | < 10ms (Redis mget) |
-| Storage overhead | < 1KB per join pair |
+| Stats collection overhead | < 1% CPU in HashProbe |
+| Storage per join pair | < 500 bytes |
 
 ### Observability
 
 ```
 Metrics:
-- hbo.join_samples.stored - Number of join stats stored
-- hbo.join_samples.retrieved - Number of join stats retrieved
-- hbo.join_samples.used - Number of times HBO stats used in optimization
-- hbo.join_samples.stale - Number of stale entries encountered
-- hbo.join_samples.estimate_improvement - Ratio of actual vs estimated cardinality
+- hbo.join_stats.observations_stored
+- hbo.join_stats.observations_retrieved
+- hbo.join_stats.cache_hits
+- hbo.join_stats.cache_misses
+- hbo.join_stats.estimate_improvement_ratio
 ```
-
-## Comparison with Axiom
-
-| Aspect | Axiom | This Design |
-|--------|-------|-------------|
-| Storage | In-memory + file | Redis via HBO |
-| Capture point | During planning (pilot query) | During execution |
-| Cluster scope | Single process | Cluster-wide |
-| Invalidation | None | Table version tracking |
-| TTL | Session-scoped | Configurable (default 1 week) |
-| First query benefit | Yes (pilot) | No |
-| Second query benefit | Yes | Yes |
-
-## Future Work
-
-### Integration with AEF
-
-Once HBO join statistics are working, they integrate naturally with AEF:
-
-1. **HBO provides baseline confidence**: If HBO has stats, optimizer knows join selectivity with high confidence
-2. **AEF fills gaps**: For new table pairs or stale stats, AEF measures during execution
-3. **AEF updates HBO**: Measurements feed back to HBO for future queries
-
-### Hash Samples for New Table Pairs
-
-Current design only helps when we've seen the exact table pair before. Future enhancement: store hash samples per table to enable sample-to-sample matching for new combinations.
-
-### Predicate-Qualified Statistics
-
-Current design ignores WHERE clause predicates. Future enhancement: track statistics per (table pair, predicate hash) to handle filtered joins.
 
 ---
 
-*Document Version: 0.1*
+## 12. Limitations and Future Work
+
+### Current Limitations
+
+1. **Base tables only**: Cannot track joins on derived tables/CTEs
+2. **No predicate awareness**: Same fanout used regardless of WHERE clause
+3. **First query doesn't benefit**: Learning is retrospective
+4. **Staleness risk**: Data changes may invalidate stored fanouts
+
+### Future Enhancements
+
+1. **Predicate-qualified stats**: Key by (tables, columns, predicate_hash)
+2. **Hash samples**: Store key samples for new table pair estimation
+3. **AEF integration**: Use HBO for confidence, AEF for first-query adaptation
+4. **Automatic invalidation**: Hook into table modification events
+
+---
+
+*Document Version: 0.2*
 *Last Updated: January 2025*
