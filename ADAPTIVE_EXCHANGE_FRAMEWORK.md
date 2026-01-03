@@ -2965,6 +2965,148 @@ class JoinStatsInvalidator {
 }
 ```
 
+#### Filter Selectivity Cache (Handling Predicate Sensitivity)
+
+**Problem**: Join fanout is sensitive to upstream filters. The same join `A ⋈ B` may have very different fanouts depending on predicates:
+
+```sql
+-- Query 1: All customers
+SELECT * FROM customers c JOIN orders o ON c.id = o.cust_id
+-- Fanout: 1.8 orders per customer
+
+-- Query 2: Premium customers only (more orders per customer)
+SELECT * FROM customers c JOIN orders o ON c.id = o.cust_id
+WHERE c.tier = 'PREMIUM'
+-- Fanout: 12.3 orders per customer
+
+-- Query 3: New customers only (fewer orders)
+SELECT * FROM customers c JOIN orders o ON c.id = o.cust_id
+WHERE c.created_date > '2024-01-01'
+-- Fanout: 0.4 orders per customer
+```
+
+If we store join fanout with predicates in the key, we get cache explosion. If we ignore predicates, we get wrong estimates.
+
+**Solution: Separate Filter Selectivity Cache**
+
+Use **two separate caches** that are multiplied together:
+
+1. **Join Fanout Cache**: Predicate-free, keyed only by table pair and join columns
+2. **Filter Selectivity Cache**: Per-predicate, keyed by table + normalized predicate
+
+```java
+// Cache 1: Join Fanout (predicate-free base join behavior)
+// Key: (probeTable, buildTable, joinColumns)
+// Value: baseLeftToRightFanout, baseRightToLeftFanout
+class JoinFanoutCache {
+    Map<JoinKey, JoinFanout> cache;
+
+    record JoinKey(TableHandle left, TableHandle right, List<ColumnHandle> joinCols) {}
+    record JoinFanout(double lrFanout, double rlFanout, long observationCount) {}
+}
+
+// Cache 2: Filter Selectivity (per-predicate)
+// Key: (table, normalizedPredicate)
+// Value: selectivity (fraction of rows passing filter)
+class FilterSelectivityCache {
+    Map<FilterKey, FilterSelectivity> cache;
+
+    record FilterKey(TableHandle table, String normalizedPredicate) {}
+    record FilterSelectivity(double selectivity, long rowsObserved, Instant lastSeen) {}
+}
+```
+
+**Combined Estimation**:
+
+```java
+// Estimate output of: SELECT * FROM A JOIN B WHERE filterA AND filterB
+double estimateJoinOutput(
+    TableHandle tableA, long baseRowsA, String filterA,
+    TableHandle tableB, long baseRowsB, String filterB,
+    List<ColumnHandle> joinCols) {
+
+    // Step 1: Get filter selectivities
+    double selA = filterSelectivityCache.get(tableA, filterA)
+        .orElse(DEFAULT_SELECTIVITY);  // 0.33 if unknown
+    double selB = filterSelectivityCache.get(tableB, filterB)
+        .orElse(DEFAULT_SELECTIVITY);
+
+    // Step 2: Get base join fanout (A → B direction)
+    double fanoutAtoB = joinFanoutCache.get(tableA, tableB, joinCols)
+        .map(f -> f.lrFanout())
+        .orElse(DEFAULT_FANOUT);  // 1.0 if unknown
+
+    // Step 3: Combine
+    // Filtered A rows × fanout to B × filter on B
+    double filteredRowsA = baseRowsA * selA;
+    double joinOutput = filteredRowsA * fanoutAtoB * selB;
+
+    return joinOutput;
+}
+```
+
+**Collecting Filter Selectivity**:
+
+Filter selectivity is observable from any operator that applies predicates:
+- `FilterNode`: inputPositions / outputPositions = selectivity
+- `TableScanNode` with pushdown predicates: compare to unfiltered table stats
+
+```java
+void recordFilterSelectivity(PlanNode node, OperatorStats stats) {
+    if (node instanceof FilterNode) {
+        FilterNode filter = (FilterNode) node;
+        TableHandle table = extractTable(filter.getSource());
+        String predicate = normalize(filter.getPredicate());
+
+        double selectivity = (double) stats.getOutputPositions()
+                           / stats.getInputPositions();
+
+        filterSelectivityCache.record(table, predicate, selectivity);
+    }
+}
+```
+
+**Predicate Normalization**:
+
+Predicates must be normalized to maximize cache hits:
+
+```java
+String normalize(Expression predicate) {
+    // 1. Sort conjuncts alphabetically
+    // 2. Normalize whitespace
+    // 3. Canonicalize comparisons (column on left)
+    // 4. Use column names not positions
+
+    // "status = 'ACTIVE' AND region = 'US'"
+    // → "region='US' AND status='ACTIVE'"
+
+    return CanonicalPredicateFormatter.format(predicate);
+}
+```
+
+**Why This Works**:
+
+The insight is that filter selectivity and join fanout are **approximately independent**:
+- Filter selectivity depends on the predicate and table data distribution
+- Join fanout depends on the relationship between tables' join columns
+- Multiplying them gives a reasonable estimate for the filtered join
+
+This isn't perfect (highly correlated filters can break independence), but it's far better than either:
+- Ignoring predicates entirely (uses wrong base fanout)
+- Keying by predicates (cache explosion, low hit rate)
+
+**Cache Size Estimation**:
+
+```
+Join Fanout Cache:
+  - 1000 table pairs × 100 bytes = 100 KB
+
+Filter Selectivity Cache:
+  - 10,000 unique predicates × 200 bytes = 2 MB
+
+Total: ~2.1 MB (very manageable)
+```
+
 #### Summary
 
 | Scenario | Before HBO Integration | After HBO Integration |
