@@ -339,7 +339,46 @@ public Map<String, JoinOperatorPair> extractJoinStats(
 
 **Why MAX for broadcast**: All workers have identical build-side data, so any single worker's count is the true total. Using MAX handles edge cases where some workers might report 0 due to early termination.
 
-### 4.3 Heartbeat vs Final TaskInfo
+### 4.3 Critical: Operator Stats Are Summarized by Default
+
+**Problem discovered**: For regular queries, operator stats are **stripped** before sending to coordinator:
+
+```java
+// SqlQueryExecution.java line 625
+summarizeTaskInfos = !explainAnalyze;  // TRUE for regular queries!
+
+// TaskStats.java summarize() method
+public TaskStats summarize() {
+    return new TaskStats(
+        // ... other fields ...
+        ImmutableList.of(),  // ← EMPTY pipelines list!
+        runtimeStats);
+}
+```
+
+**Current behavior:**
+| Query Type | summarizeTaskInfo | Operator Stats |
+|------------|-------------------|----------------|
+| Regular query | TRUE | ❌ Stripped |
+| EXPLAIN ANALYZE | FALSE | ✅ Included |
+
+**Solution**: For HBO join stats, we need operator-level detail. Options:
+
+1. **Add session property** `track_hbo_join_samples` that disables summarization
+2. **Selective inclusion**: Only include join operator stats, still summarize others
+3. **Separate collection path**: Extract join stats before summarization
+
+**Recommended approach** (Option 1 - simplest):
+
+```java
+// In SqlQueryExecution.java
+boolean summarizeTaskInfos = !explainAnalyze
+    && !isTrackHboJoinSamplesEnabled(session);  // NEW
+```
+
+This adds ~1KB per task for operator stats, which is acceptable overhead when explicitly opted in.
+
+### 4.4 Heartbeat vs Final TaskInfo
 
 Presto workers send TaskInfo in two contexts:
 
