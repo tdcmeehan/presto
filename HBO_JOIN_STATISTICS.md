@@ -173,7 +173,7 @@ struct OperatorStats {
 │  │ Already     │    │ Already     │                                  │
 │  │ tracks:     │    │ tracks:     │                                  │
 │  │ -inputPos   │    │ -inputPos   │  ← Same planNodeId               │
-│  │ -outputPos  │    │ -outputPos  │                                  │
+│  │ -outputPos ←──── join output   │  (outputPos = 0)                 │
 │  └─────────────┘    └─────────────┘                                  │
 └─────────────────────────────────────────────────────────────────────┘
                                 │
@@ -187,7 +187,7 @@ struct OperatorStats {
 │  │   - operatorType ("LookupJoinOperator", "HashBuilderOperator")   ││
 │  │   - planNodeId                                                   ││
 │  │   - inputPositions                                               ││
-│  │   - outputPositions                                              ││
+│  │   - outputPositions (only meaningful for HashProbe)              ││
 │  └─────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────┘
                                 │
@@ -201,8 +201,11 @@ struct OperatorStats {
 │  │   1. Extract operator stats from existing TaskInfo               ││
 │  │   2. Identify join operators by operatorType                     ││
 │  │   3. Correlate HashProbe + HashBuild by planNodeId               ││
-│  │   4. Sum inputPositions/outputPositions across tasks             ││
-│  │   5. Compute fanout = sum(output) / sum(probe)                   ││
+│  │   4. Sum across tasks:                                           ││
+│  │      - HashProbe.inputPositions  → probe input                   ││
+│  │      - HashProbe.outputPositions → join output                   ││
+│  │      - HashBuild.inputPositions  → build input                   ││
+│  │   5. Compute fanouts from sums                                   ││
 │  │   6. Map planNodeId → canonical join key                         ││
 │  │   7. Store to HBO                                                ││
 │  └─────────────────────────────────────────────────────────────────┘│
