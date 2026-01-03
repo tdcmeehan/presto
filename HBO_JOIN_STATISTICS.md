@@ -184,8 +184,8 @@ struct OperatorStats {
 │  │   1. Iterate veloxTaskStats.pipelineStats                        ││
 │  │   2. Find HashProbe/HashBuild operators by operatorType          ││
 │  │   3. Correlate by planNodeId                                     ││
-│  │   4. Compute fanout from inputPositions/outputPositions          ││
-│  │   5. Add JoinSelectivityInfo to TaskInfo                         ││
+│  │   4. Send RAW COUNTS (not fanout) in TaskInfo                    ││
+│  │      - probeInputRows, buildInputRows, outputRows                ││
 │  └─────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────┘
                                 │
@@ -195,13 +195,16 @@ struct OperatorStats {
 │  ┌─────────────────────────────────────────────────────────────────┐│
 │  │ SqlQueryExecution                                                ││
 │  │                                                                  ││
-│  │ On final TaskInfo:                                               ││
-│  │   - Extract JoinSelectivityInfo                                  ││
-│  │   - Aggregate across tasks                                       ││
-│  │   - Store to HBO                                                 ││
+│  │ On final TaskInfo from ALL tasks:                                ││
+│  │   1. Sum raw counts across tasks (lossless merge)                ││
+│  │   2. Compute fanout = sum(output) / sum(probe)                   ││
+│  │   3. Map planNodeId → canonical join key                         ││
+│  │   4. Store to HBO                                                ││
 │  └─────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Why fanout must be computed on coordinator**: Workers process different partitions. Summing raw counts preserves the row-weighted average; averaging pre-computed fanouts would not.
 
 ### 3.3 Existing PrestoTask Infrastructure
 
