@@ -339,7 +339,34 @@ public Map<String, JoinOperatorPair> extractJoinStats(
 
 **Why MAX for broadcast**: All workers have identical build-side data, so any single worker's count is the true total. Using MAX handles edge cases where some workers might report 0 due to early termination.
 
-### 4.3 Critical: Operator Stats Are Summarized by Default
+### 4.3 Verified: planNodeId Correlation Is Reliable
+
+**Concern**: Do HashBuild and HashProbe share the same planNodeId across stages?
+
+**Answer**: Yes, always. A JoinNode is never split across fragments:
+
+```java
+// LocalExecutionPlanner.java - both use node.getId()
+HashBuilderOperatorFactory(..., node.getId(), ...);  // line 2436
+LookupJoinOperatorFactory(..., node.getId(), ...);   // line 2556
+```
+
+Exchanges are inserted as **children** of the JoinNode, not replacements:
+
+```
+Fragment 1: TableScan → Exchange (broadcast/partition)
+                              ↓
+Fragment 2: Exchange → HashBuild ─┐
+            TableScan → HashProbe ←┘  ← Same JoinNode.getId() for both
+```
+
+| Join Type | Same planNodeId? |
+|-----------|------------------|
+| REPLICATED (broadcast) | ✅ |
+| PARTITIONED (shuffle) | ✅ |
+| Nested loop / Cross | ✅ |
+
+### 4.4 Critical: Operator Stats Are Summarized by Default
 
 **Problem discovered**: For regular queries, operator stats are **stripped** before sending to coordinator:
 
