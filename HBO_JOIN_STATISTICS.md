@@ -8,7 +8,7 @@ This document describes a stepping stone project to improve join cardinality est
 
 **Runtime**: Velox (C++) only. There are no plans to implement this in the Java runtime.
 
-**Key Design Decision**: No Velox modifications required. Velox already tracks `inputPositions` and `outputPositions` for all operators. We extract join statistics in `PrestoTask` (presto-native-execution) using existing data.
+**Key Design Decision**: No Velox or presto-native-execution modifications required. The existing `TaskInfo` protocol already contains `inputPositions`, `outputPositions`, `operatorType`, and `planNodeId` for every operator. The coordinator simply reads this existing data.
 
 ---
 
@@ -159,7 +159,7 @@ struct OperatorStats {
 | Build input rows | `HashBuild.inputPositions` (same planNodeId) |
 | Probe fanout | `outputPositions / inputPositions` |
 
-### 3.2 Architecture: Changes in presto-native-execution Only
+### 3.2 Architecture: Coordinator-Only Changes
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -176,127 +176,47 @@ struct OperatorStats {
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                 Presto Worker (C++) - MODIFIED                       │
+│                 Presto Worker (C++) - UNCHANGED                      │
 │  ┌─────────────────────────────────────────────────────────────────┐│
 │  │ PrestoTask                                                       ││
 │  │                                                                  ││
-│  │ updateExecutionInfoLocked():                                     ││
-│  │   1. Iterate veloxTaskStats.pipelineStats                        ││
-│  │   2. Find HashProbe/HashBuild operators by operatorType          ││
-│  │   3. Correlate by planNodeId                                     ││
-│  │   4. Send RAW COUNTS (not fanout) in TaskInfo                    ││
-│  │      - probeInputRows, buildInputRows, outputRows                ││
+│  │ Already sends in TaskInfo.stats.pipelines[*].operatorSummaries:  ││
+│  │   - operatorType ("LookupJoinOperator", "HashBuilderOperator")   ││
+│  │   - planNodeId                                                   ││
+│  │   - inputPositions                                               ││
+│  │   - outputPositions                                              ││
 │  └─────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────┘
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    Presto Coordinator (Java)                         │
+│                 Presto Coordinator (Java) - MODIFIED                 │
 │  ┌─────────────────────────────────────────────────────────────────┐│
-│  │ SqlQueryExecution                                                ││
+│  │ SqlQueryExecution + JoinStatsCollector                           ││
 │  │                                                                  ││
 │  │ On final TaskInfo from ALL tasks:                                ││
-│  │   1. Sum raw counts across tasks (lossless merge)                ││
-│  │   2. Compute fanout = sum(output) / sum(probe)                   ││
-│  │   3. Map planNodeId → canonical join key                         ││
-│  │   4. Store to HBO                                                ││
+│  │   1. Extract operator stats from existing TaskInfo               ││
+│  │   2. Identify join operators by operatorType                     ││
+│  │   3. Correlate HashProbe + HashBuild by planNodeId               ││
+│  │   4. Sum inputPositions/outputPositions across tasks             ││
+│  │   5. Compute fanout = sum(output) / sum(probe)                   ││
+│  │   6. Map planNodeId → canonical join key                         ││
+│  │   7. Store to HBO                                                ││
 │  └─────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Why fanout must be computed on coordinator**: Workers process different partitions. Summing raw counts preserves the row-weighted average; averaging pre-computed fanouts would not.
 
-### 3.3 Existing PrestoTask Infrastructure
+### 3.3 Mapping planNodeId to Canonical Join Key
 
-PrestoTask already iterates over operator stats and has special handling for joins:
-
-```cpp
-// In presto-native-execution/presto_cpp/main/PrestoTask.cpp (EXISTING CODE)
-
-// Lines 461-468: Already identifies join operators
-if (veloxOp.operatorType == "HashBuild") {
-  prestoOp.joinBuildKeyCount = veloxOp.inputPositions;
-  prestoOp.nullJoinBuildKeyCount = veloxOp.numNullKeys;
-}
-if (veloxOp.operatorType == "HashProbe") {
-  prestoOp.joinProbeKeyCount = veloxOp.inputPositions;
-  prestoOp.nullJoinProbeKeyCount = veloxOp.numNullKeys;
-}
-```
-
-We extend this pattern to compute and store join selectivity.
-
-### 3.4 Correlating HashProbe and HashBuild
-
-HashProbe and HashBuild for the same join share the same `planNodeId`. We collect both:
-
-```cpp
-// NEW: In PrestoTask.cpp
-
-struct JoinOperatorPair {
-  std::string planNodeId;
-  int64_t probeInputRows = 0;
-  int64_t buildInputRows = 0;
-  int64_t outputRows = 0;
-};
-
-std::unordered_map<std::string, JoinOperatorPair> collectJoinStats(
-    const velox::exec::TaskStats& veloxTaskStats) {
-
-  std::unordered_map<std::string, JoinOperatorPair> joinPairs;
-
-  for (const auto& pipeline : veloxTaskStats.pipelineStats) {
-    for (const auto& op : pipeline.operatorStats) {
-
-      if (op.operatorType == "HashProbe") {
-        auto& pair = joinPairs[op.planNodeId];
-        pair.planNodeId = op.planNodeId;
-        pair.probeInputRows += op.inputPositions;
-        pair.outputRows += op.outputPositions;
-      }
-
-      if (op.operatorType == "HashBuild") {
-        auto& pair = joinPairs[op.planNodeId];
-        pair.planNodeId = op.planNodeId;
-        pair.buildInputRows += op.inputPositions;
-      }
-    }
-  }
-
-  return joinPairs;
-}
-```
-
-### 3.5 The Challenge: Table and Column Names
-
-The remaining challenge is obtaining table and column names for the canonical join key. The Velox `OperatorStats` contains `planNodeId` but not the table metadata. Two options:
-
-**Option A: Pass plan metadata to workers (Recommended)**
-
-The coordinator already sends the `PlanFragment` to workers. We can include a mapping:
-
-```cpp
-// In presto_protocol (already sent to workers)
-message JoinPlanNodeInfo {
-  string plan_node_id = 1;
-  string left_table_name = 2;
-  string right_table_name = 3;
-  repeated string left_key_columns = 4;
-  repeated string right_key_columns = 5;
-}
-
-message TaskUpdateRequest {
-  // ... existing fields ...
-  repeated JoinPlanNodeInfo join_plan_nodes = 20;  // NEW
-}
-```
-
-The coordinator extracts this from the plan during scheduling:
+The coordinator has the `PlanFragment` and can map `planNodeId` → canonical join key:
 
 ```java
-// In SqlStageExecution or StageScheduler
-private List<JoinPlanNodeInfo> extractJoinPlanNodes(PlanFragment fragment) {
-    List<JoinPlanNodeInfo> result = new ArrayList<>();
+// In SqlQueryExecution or JoinStatsCollector
+private Map<String, CanonicalJoinKey> buildPlanNodeToJoinKeyMap(PlanFragment fragment) {
+    Map<String, CanonicalJoinKey> result = new HashMap<>();
+
     fragment.getRoot().accept(new PlanVisitor<Void, Void>() {
         @Override
         public Void visitJoin(JoinNode node, Void context) {
@@ -305,113 +225,84 @@ private List<JoinPlanNodeInfo> extractJoinPlanNodes(PlanFragment fragment) {
             Optional<String> rightTable = findBaseTableName(node.getRight());
 
             if (leftTable.isPresent() && rightTable.isPresent()) {
-                result.add(new JoinPlanNodeInfo(
-                    node.getId().toString(),
+                CanonicalJoinKey key = CanonicalJoinKey.create(
                     leftTable.get(),
-                    rightTable.get(),
                     extractColumnNames(node.getCriteria(), true),
+                    rightTable.get(),
                     extractColumnNames(node.getCriteria(), false)
-                ));
+                );
+                result.put(node.getId().toString(), key);
             }
             return super.visitJoin(node, context);
         }
     }, null);
+
     return result;
 }
 ```
 
-**Option B: Use planNodeId as key, resolve on coordinator**
-
-Simpler but less flexible: use `planNodeId` in TaskInfo, resolve to canonical key on coordinator where plan metadata is available.
-
-```cpp
-// Worker just sends planNodeId + stats
-message JoinSelectivityInfo {
-  string plan_node_id = 1;
-  int64 probe_input_rows = 2;
-  int64 build_input_rows = 3;
-  int64 output_rows = 4;
-}
-
-// Coordinator maps planNodeId -> canonical key using its plan knowledge
-```
+Since the coordinator has the plan, no worker changes are needed to obtain table/column names.
 
 ---
 
-## 4. Presto Worker: Including Join Stats in TaskInfo
+## 4. Coordinator: Extracting Join Stats from Existing TaskInfo
 
-### 4.1 TaskInfo Protocol Extension
+### 4.1 Key Insight: No Protocol Changes Needed
 
-Using Option B (simpler approach), the worker sends `planNodeId` and the coordinator resolves to canonical key:
+The existing `OperatorStats` in TaskInfo **already contains everything we need**:
 
 ```cpp
-// In presto-native-execution/presto_cpp/presto_protocol/core/presto_protocol_core.h
-
-// NEW: Add to existing OperatorStats structure
+// In presto_protocol_core.h - ALREADY EXISTS
 struct OperatorStats {
-  // ... existing fields (already present) ...
+  PlanNodeId planNodeId = {};           // Links HashProbe + HashBuild
+  String operatorType = {};             // "LookupJoinOperator" or "HashBuilderOperator"
+  int64_t inputPositions = {};          // Probe/build input rows
+  int64_t outputPositions = {};         // Join output rows
 
-  // These already exist and are populated:
-  int64_t inputPositions;
-  int64_t outputPositions;
-  std::string operatorType;
-  std::string planNodeId;
-
-  // No new fields needed! We use existing data.
+  // Even has join-specific stats already!
+  int64_t joinBuildKeyCount = {};       // Build side rows
+  int64_t joinProbeKeyCount = {};       // Probe side rows
+  int64_t nullJoinBuildKeyCount = {};
+  int64_t nullJoinProbeKeyCount = {};
 };
 ```
 
-The coordinator can extract join stats from existing `OperatorStats` in `TaskInfo.stats.pipelines[*].operatorSummaries[*]`.
+**No changes to presto-native-execution needed!** The coordinator simply reads existing data.
 
-### 4.2 PrestoTask: Collecting Join Stats from Existing Velox Stats
+### 4.2 Coordinator: Extracting Join Stats from TaskInfo
 
-```cpp
-// In presto-native-execution/presto_cpp/main/PrestoTask.cpp
+```java
+// In SqlQueryExecution.java or StageStateMachine.java
+// Extract join stats from existing TaskInfo - no worker changes needed!
 
-// Within updateExecutionInfoLocked() or updatePipelineStats()
-// We already iterate over all operators - extend this pattern:
+public Map<String, JoinOperatorPair> extractJoinStats(TaskInfo taskInfo) {
+    Map<String, JoinOperatorPair> joinPairs = new HashMap<>();
 
-void PrestoTask::collectJoinSelectivityStats(
-    const velox::exec::TaskStats& veloxTaskStats,
-    protocol::TaskStats& prestoStats) {
+    for (PipelineStats pipeline : taskInfo.getStats().getPipelines()) {
+        for (OperatorStats op : pipeline.getOperatorSummaries()) {
 
-  // Map planNodeId -> JoinOperatorPair to correlate HashBuild + HashProbe
-  std::unordered_map<std::string, JoinOperatorPair> joinPairs;
+            // HashProbe is sent as "LookupJoinOperator" in Presto protocol
+            if ("LookupJoinOperator".equals(op.getOperatorType())) {
+                JoinOperatorPair pair = joinPairs.computeIfAbsent(
+                    op.getPlanNodeId(), k -> new JoinOperatorPair());
+                pair.probeInputRows += op.getInputPositions();
+                pair.outputRows += op.getOutputPositions();
+            }
 
-  for (const auto& pipeline : veloxTaskStats.pipelineStats) {
-    for (const auto& op : pipeline.operatorStats) {
-
-      if (op.operatorType == "HashProbe") {
-        auto& pair = joinPairs[op.planNodeId];
-        pair.planNodeId = op.planNodeId;
-        pair.probeInputRows += op.inputPositions;   // Already tracked by Velox
-        pair.outputRows += op.outputPositions;      // Already tracked by Velox
-      }
-
-      if (op.operatorType == "HashBuild") {
-        auto& pair = joinPairs[op.planNodeId];
-        pair.planNodeId = op.planNodeId;
-        pair.buildInputRows += op.inputPositions;   // Already tracked by Velox
-      }
+            // HashBuild is sent as "HashBuilderOperator" in Presto protocol
+            if ("HashBuilderOperator".equals(op.getOperatorType())) {
+                JoinOperatorPair pair = joinPairs.computeIfAbsent(
+                    op.getPlanNodeId(), k -> new JoinOperatorPair());
+                pair.buildInputRows += op.getInputPositions();
+            }
+        }
     }
-  }
 
-  // Store in TaskStats for coordinator consumption
-  for (const auto& [planNodeId, pair] : joinPairs) {
-    if (pair.probeInputRows > 0 && pair.buildInputRows > 0) {
-      protocol::JoinSelectivityInfo jsInfo;
-      jsInfo.planNodeId = planNodeId;
-      jsInfo.probeInputRows = pair.probeInputRows;
-      jsInfo.buildInputRows = pair.buildInputRows;
-      jsInfo.outputRows = pair.outputRows;
-
-      prestoStats.joinSelectivityStats.push_back(std::move(jsInfo));
-    }
-  }
+    return joinPairs;
 }
 ```
 
-**Key point**: This uses ONLY existing `inputPositions`/`outputPositions` from Velox - no Velox modifications required.
+**This is purely a coordinator-side change** - workers already send the data we need.
 
 ### 4.3 Heartbeat vs Final TaskInfo
 
@@ -869,40 +760,28 @@ GROUP BY c.name;
 
 ## 10. Implementation Plan
 
-**Key simplification**: No Velox modifications required. All changes in presto-native-execution and coordinator.
+**Key simplification**: No Velox or presto-native-execution changes required. All changes are coordinator-side only.
 
-### Phase 1: PrestoTask Stats Extraction (1 week)
+### Phase 1: Coordinator Stats Extraction (1 week)
 
-1. Add `collectJoinSelectivityStats()` to PrestoTask
-2. Iterate existing `veloxTaskStats.pipelineStats`
-3. Correlate HashProbe/HashBuild by planNodeId
-4. Compute fanouts from existing `inputPositions`/`outputPositions`
-5. Add `JoinSelectivityInfo` list to protocol TaskStats
+1. Add `JoinStatsCollector` to extract stats from existing `TaskInfo`
+2. Iterate `TaskInfo.stats.pipelines[*].operatorSummaries[*]`
+3. Identify `LookupJoinOperator` (probe) and `HashBuilderOperator` (build)
+4. Correlate by `planNodeId`, sum `inputPositions`/`outputPositions` across tasks
+5. Map `planNodeId` → canonical join key using plan metadata
 
-**Deliverable**: Workers extract join stats from existing Velox data.
-
-**Files changed**:
-- `presto-native-execution/presto_cpp/main/PrestoTask.cpp`
-- `presto-native-execution/presto_cpp/presto_protocol/core/presto_protocol_core.h`
-
-### Phase 2: Coordinator Aggregation (1 week)
-
-1. Extract join stats from TaskInfo on task completion
-2. Map planNodeId → canonical join key using plan metadata
-3. Aggregate across all tasks for each join
-4. Store to HBO on query completion
-
-**Deliverable**: Coordinator aggregates and stores fanouts.
+**Deliverable**: Coordinator extracts join stats from existing TaskInfo.
 
 **Files changed**:
 - `presto-main/.../execution/SqlQueryExecution.java` (or StageStateMachine)
 - New `JoinStatsCollector.java`
 
-### Phase 3: HBO Storage (1 week)
+### Phase 2: HBO Storage (1 week)
 
 1. Extend `HistoryBasedPlanStatisticsProvider` with join sample methods
 2. Implement Redis storage for join selectivity
-3. Handle observation merging (Welford's for variance)
+3. Compute fanout after aggregation: `sum(output) / sum(probe)`
+4. Handle observation merging (Welford's for variance)
 
 **Deliverable**: Join stats persisted to Redis.
 
@@ -910,7 +789,7 @@ GROUP BY c.name;
 - `presto-main/.../statistics/HistoryBasedPlanStatisticsProvider.java`
 - Redis implementation class
 
-### Phase 4: Optimizer Integration (1-2 weeks)
+### Phase 3: Optimizer Integration (1-2 weeks)
 
 1. Implement `CanonicalJoinKeyGenerator`
 2. Add `HistoryBasedJoinStatsRule` to stats calculator
@@ -919,7 +798,7 @@ GROUP BY c.name;
 
 **Deliverable**: Second+ queries use learned fanouts.
 
-### Phase 5: Validation (1 week)
+### Phase 4: Validation (1 week)
 
 1. Add logging/metrics for cache hit rates
 2. Test with TPC-H/DS workloads
@@ -928,7 +807,7 @@ GROUP BY c.name;
 
 **Deliverable**: Production-ready feature.
 
-**Total: 5-6 weeks** (vs 7-8 weeks with Velox modifications)
+**Total: 4-5 weeks** (coordinator-only changes)
 
 ---
 
