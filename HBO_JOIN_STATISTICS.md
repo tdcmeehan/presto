@@ -961,11 +961,109 @@ If we cache fanout=10.5 from Query 1 and apply to Query 2:
 - **Default estimate**: Might guess 1.0 (100x off)
 - **HBO estimate**: Uses 10.5 (105x off) ← **WORSE!**
 
-**Mitigations**:
-1. Store variance across observations; don't use HBO stats if variance is high
-2. Only use HBO when confidence is high (many similar observations)
-3. Use HBO as a signal for AEF insertion rather than direct estimation
-4. Future: predicate-qualified keys (hash of relevant predicates)
+### Solution: Separate Filter Selectivity Cache (Axiom Approach)
+
+Axiom solves this elegantly with **two separate caches**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Join Fanout Cache (predicate-free)                              │
+│                                                                  │
+│  Key: "customers id   orders cust_id "                          │
+│  Value: (lr_fanout=10.5, rl_fanout=0.95)                        │
+│                                                                  │
+│  This is the "base" fanout without any filters                   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Filter Selectivity Cache (per-table with predicates)           │
+│                                                                  │
+│  Key: "customers[status='ACTIVE']" → 0.60                       │
+│  Key: "customers[status='DELETED']" → 0.05                      │
+│  Key: "orders[total>1000]" → 0.15                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Combined estimation**:
+```
+Cardinality(A ⋈ B with filters) ≈
+    |A| × filterSelectivity(A) × joinFanout(A→B) × filterSelectivity(B)
+```
+
+**Example**:
+```
+Query 2: orders JOIN customers WHERE status='DELETED'
+
+  |orders| × filterSel(orders) × fanout × filterSel(customers[status='DELETED'])
+= 1M × 1.0 × 10.5 × 0.05
+= 525K (much closer to actual!)
+```
+
+### Implementing Filter Selectivity in Presto
+
+**Key insight**: TableScan operator stats already have what we need:
+
+```java
+// From existing OperatorStats
+TableScan.rawInputPositions  = rows read from source (before filter)
+TableScan.outputPositions    = rows after pushed-down predicates
+
+filterSelectivity = outputPositions / rawInputPositions
+```
+
+**Filter selectivity key generation**:
+```java
+// Key includes table + pushed-down predicates
+String filterKey = generateFilterKey(tableScanNode);
+// e.g., "hive.default.customers[status='ACTIVE']"
+
+// Value is the observed selectivity
+float selectivity = (float) outputPositions / rawInputPositions;
+```
+
+**Two caches in HBO**:
+```java
+public interface HistoryBasedPlanStatisticsProvider {
+    // Existing HBO methods...
+
+    // NEW: Join fanout (predicate-free)
+    Optional<JoinFanout> getJoinFanout(String canonicalJoinKey);
+    void putJoinFanout(String canonicalJoinKey, JoinFanout fanout);
+
+    // NEW: Filter selectivity (includes predicates)
+    Optional<Float> getFilterSelectivity(String tableWithPredicatesKey);
+    void putFilterSelectivity(String tableWithPredicatesKey, float selectivity);
+}
+```
+
+**Cardinality estimation with both caches**:
+```java
+// In HistoryBasedJoinStatsRule
+double estimateJoinCardinality(JoinNode join, StatsProvider stats) {
+    // 1. Get base table cardinalities
+    double leftRows = stats.getStats(join.getLeft()).getOutputRowCount();
+    double rightRows = stats.getStats(join.getRight()).getOutputRowCount();
+
+    // 2. Get filter selectivities (if available)
+    float leftFilterSel = getFilterSelectivity(join.getLeft()).orElse(1.0f);
+    float rightFilterSel = getFilterSelectivity(join.getRight()).orElse(1.0f);
+
+    // 3. Get join fanout (predicate-free)
+    Optional<JoinFanout> fanout = hboProvider.getJoinFanout(canonicalKey);
+    if (fanout.isEmpty()) {
+        return Optional.empty();  // Fall back to default estimation
+    }
+
+    // 4. Combine: base × filter × fanout × filter
+    return leftRows * leftFilterSel * fanout.get().lrFanout() * rightFilterSel;
+}
+```
+
+This approach:
+- ✅ Handles predicate sensitivity correctly
+- ✅ Reuses join fanout across queries with different predicates
+- ✅ Uses existing TableScan stats (rawInputPositions, outputPositions)
+- ✅ No additional Velox changes needed
 
 ### Future Enhancements
 
