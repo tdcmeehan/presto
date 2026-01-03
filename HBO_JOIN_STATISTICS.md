@@ -1065,6 +1065,101 @@ This approach:
 - ✅ Uses existing TableScan stats (rawInputPositions, outputPositions)
 - ✅ No additional Velox changes needed
 
+### Correcting Observed Fanout for Build-Side Filters
+
+**Problem**: When collecting join stats from a query with filters, the observed fanout is NOT the base (predicate-free) fanout. If we store the observed fanout directly, we contaminate the cache with predicate-specific values.
+
+**Example**:
+```sql
+SELECT * FROM orders o JOIN customers c ON o.cust_id = c.id
+WHERE c.status = 'ACTIVE'  -- 60% of customers
+```
+
+What we observe:
+- `probe_input` = 1M (all orders)
+- `build_input` = 60K (only ACTIVE customers)
+- `output` = 600K (orders for active customers)
+- `observed_lr_fanout` = 600K / 1M = **0.6**
+
+But the base LR fanout (without filter) is 1.0 (each order matches one customer).
+
+**The Math: Why Build-Side Filter Affects LR Fanout**
+
+Let:
+- `s_A` = probe filter selectivity, `s_B` = build filter selectivity
+- `X` = base matching pairs (no filters)
+- `base_lr` = X / |A|
+
+With filters (assuming independence):
+```
+output ≈ X × s_A × s_B
+probe_input = |A| × s_A
+observed_lr = output / probe_input
+           = (X × s_A × s_B) / (|A| × s_A)
+           = (X / |A|) × s_B
+           = base_lr × s_B
+```
+
+**Key insight**: The probe filter (s_A) cancels out! Only the build filter affects observed LR fanout.
+
+**Correction Formulas**:
+```
+base_lr_fanout = observed_lr_fanout / build_filter_selectivity
+base_rl_fanout = observed_rl_fanout / probe_filter_selectivity
+```
+
+**Implementation**:
+
+```java
+void collectJoinStats(QueryExecution query, JoinNode joinNode) {
+    // 1. Get join operator stats
+    long probeInput = hashProbe.getInputPositions();
+    long buildInput = hashBuild.getInputPositions();
+    long joinOutput = hashProbe.getOutputPositions();
+
+    // 2. Get filter selectivities from TableScan stats
+    TableScanStats probeScan = findTableScan(joinNode.getProbeSource());
+    TableScanStats buildScan = findTableScan(joinNode.getBuildSource());
+
+    double probeFilterSel = (double) probeScan.getOutputPositions()
+                          / probeScan.getRawInputPositions();
+    double buildFilterSel = (double) buildScan.getOutputPositions()
+                          / buildScan.getRawInputPositions();
+
+    // 3. Compute observed fanouts
+    double observedLR = (double) joinOutput / probeInput;
+    double observedRL = (double) joinOutput / buildInput;
+
+    // 4. Correct to get BASE fanouts (predicate-free)
+    double baseLR = observedLR / buildFilterSel;
+    double baseRL = observedRL / probeFilterSel;
+
+    // 5. Store the corrected base fanouts
+    hboCache.put(canonicalJoinKey, new JoinFanout(baseLR, baseRL));
+}
+```
+
+**Verification with Example**:
+- Base data: 100K customers, 1M orders, base_lr = 1.0
+- Filter: `status = 'ACTIVE'` (s_B = 0.6)
+- Observed: output=600K, probe=1M, observed_lr = 0.6
+- Correction: base_lr = 0.6 / 0.6 = **1.0** ✓
+
+**Critical Assumption: Independence**
+
+This correction assumes the filter is **independent** of the join relationship. It works well for:
+```sql
+WHERE c.status = 'ACTIVE'      -- Customer attribute, independent of order count
+WHERE c.created_date > '2024'  -- Customer attribute, independent of order count
+```
+
+It breaks for correlated filters:
+```sql
+WHERE c.total_orders > 100     -- Directly correlated with join fanout!
+```
+
+For correlated filters, the correction will give wrong results. This is a known limitation - the independence assumption is standard in query optimization but not always valid.
+
 ### Future Enhancements
 
 1. **Predicate-qualified stats**: Key by (tables, columns, predicate_hash)

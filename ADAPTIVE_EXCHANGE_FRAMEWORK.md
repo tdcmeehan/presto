@@ -3107,6 +3107,55 @@ Filter Selectivity Cache:
 Total: ~2.1 MB (very manageable)
 ```
 
+**Correcting Observed Fanout During Collection**:
+
+When collecting join fanout from a query that has filters applied, the observed fanout is NOT the base (predicate-free) fanout. We must correct for the build-side filter to recover the base fanout.
+
+**The Math**:
+```
+Let s_A = probe filter selectivity, s_B = build filter selectivity
+Let X = base matching pairs (no filters), base_lr = X / |A|
+
+With filters (assuming independence):
+  output ≈ X × s_A × s_B
+  probe_input = |A| × s_A
+  observed_lr = output / probe_input
+             = (X × s_A × s_B) / (|A| × s_A)
+             = (X / |A|) × s_B
+             = base_lr × s_B
+
+Key insight: Probe filter cancels out. Only build filter affects observed LR fanout.
+```
+
+**Correction Formulas**:
+```
+base_lr_fanout = observed_lr_fanout / build_filter_selectivity
+base_rl_fanout = observed_rl_fanout / probe_filter_selectivity
+```
+
+**Implementation**:
+```java
+void collectJoinFanout(JoinNode join, OperatorStats probeStats, OperatorStats buildStats) {
+    // Get filter selectivities from TableScan stats
+    double buildFilterSel = (double) buildTableScan.getOutputPositions()
+                          / buildTableScan.getRawInputPositions();
+    double probeFilterSel = (double) probeTableScan.getOutputPositions()
+                          / probeTableScan.getRawInputPositions();
+
+    // Compute observed fanouts
+    double observedLR = (double) probeStats.getOutputPositions() / probeStats.getInputPositions();
+    double observedRL = (double) probeStats.getOutputPositions() / buildStats.getInputPositions();
+
+    // Correct to get BASE fanouts (predicate-free)
+    double baseLR = observedLR / buildFilterSel;
+    double baseRL = observedRL / probeFilterSel;
+
+    joinFanoutCache.put(canonicalKey, new JoinFanout(baseLR, baseRL));
+}
+```
+
+**Critical Assumption**: This assumes filters are **independent** of the join relationship. Correlated filters (e.g., `WHERE total_orders > 100`) will produce incorrect corrections. This is a known limitation of the independence assumption in query optimization.
+
 #### Summary
 
 | Scenario | Before HBO Integration | After HBO Integration |
