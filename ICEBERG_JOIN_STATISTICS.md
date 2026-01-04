@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.5
+**Version**: 0.6
 
 ---
 
@@ -993,30 +993,214 @@ LIMIT 20;
 -- └─────────────────┴─────────────┴───────────────────┴─────────────┴─────────────────────┴──────────────────────┴──────────────┘
 ```
 
-### 11.9 Integration with HBO
+### 11.9 Stateless Prioritization with ANALYZE Status
 
-The regret tracking can integrate with Presto's existing History-Based Optimization:
+The regret-based approach in sections 11.2-11.8 has a statefulness problem: once you ANALYZE a column, its regret drops, requiring you to track historical regret to maintain prioritization. A simpler approach embeds the **ANALYZE status** directly in query logs, making prioritization completely stateless.
+
+#### Statistics Status Categories
+
+| Status | Definition | Weight |
+|--------|------------|--------|
+| `NEVER` | No statistics file exists for this column | 10.0 |
+| `PARTIAL` | Statistics exist but are missing frequency sketch | 5.0 |
+| `STALE` | Statistics snapshot differs from current snapshot by >N rows or >M days | 2.0 |
+| `FRESH` | Statistics from current or very recent snapshot | 0.1 |
+
+#### Status Determination at Query Time
 
 ```java
-// Extend HistoryBasedPlanStatisticsProvider to also track regret
-public interface RegretAwareStatisticsProvider
+public enum StatsStatus { NEVER, PARTIAL, STALE, FRESH }
+
+public class JoinColumnStatsStatus {
+    private static final Duration STALENESS_THRESHOLD = Duration.ofDays(7);
+    private static final double ROW_CHANGE_THRESHOLD = 0.2; // 20%
+
+    public StatsStatus determineStatus(
+            SchemaTableName table,
+            String columnName,
+            Table icebergTable,
+            Snapshot currentSnapshot) {
+
+        // 1. Find statistics file for this table
+        Optional<StatisticsFile> statsFile = getClosestStatisticsFile(
+                icebergTable, currentSnapshot);
+        if (statsFile.isEmpty()) {
+            return StatsStatus.NEVER;
+        }
+
+        // 2. Check if column has required blobs (Theta + Frequency)
+        int columnId = getColumnId(icebergTable, columnName);
+        boolean hasTheta = hasBlobForColumn(statsFile.get(),
+                "apache-datasketches-theta-v1", columnId);
+        boolean hasFrequency = hasBlobForColumn(statsFile.get(),
+                "apache-datasketches-fi-longs-v1", columnId);
+
+        if (!hasTheta || !hasFrequency) {
+            return StatsStatus.PARTIAL;
+        }
+
+        // 3. Check staleness
+        Snapshot statsSnapshot = icebergTable.snapshot(statsFile.get().snapshotId());
+        Duration age = Duration.between(
+                Instant.ofEpochMilli(statsSnapshot.timestampMillis()),
+                Instant.ofEpochMilli(currentSnapshot.timestampMillis()));
+
+        double rowChange = Math.abs(
+                (double) (currentSnapshot.summary().get("total-records") -
+                         statsSnapshot.summary().get("total-records")) /
+                statsSnapshot.summary().get("total-records"));
+
+        if (age.compareTo(STALENESS_THRESHOLD) > 0 || rowChange > ROW_CHANGE_THRESHOLD) {
+            return StatsStatus.STALE;
+        }
+
+        return StatsStatus.FRESH;
+    }
+}
+```
+
+#### Stateless Priority Metric
+
+With status embedded in query logs, priority becomes a simple aggregation:
+
+```
+Priority(column) = Σ(cpu_time × status_weight) for queries in window
+```
+
+This is **self-correcting**:
+- If you ANALYZE a column, its status changes from `NEVER`/`STALE` to `FRESH`
+- Future queries have `status_weight = 0.1` instead of `10.0`
+- Priority automatically drops by 100x without any state tracking
+- If data changes and stats become stale, weight increases again automatically
+
+#### Query Log Schema with Status
+
+```sql
+-- Extended query log / system table
+CREATE TABLE system.runtime.join_column_metrics (
+    query_id         VARCHAR,
+    query_time       TIMESTAMP,
+    catalog_name     VARCHAR,
+    schema_name      VARCHAR,
+    table_name       VARCHAR,
+    column_name      VARCHAR,
+    stats_status     VARCHAR,    -- NEVER, PARTIAL, STALE, FRESH
+    stats_snapshot_id BIGINT,    -- Snapshot ID of statistics used (NULL if NEVER)
+    current_snapshot_id BIGINT,  -- Current table snapshot
+    cpu_time_ms      BIGINT,
+    wall_time_ms     BIGINT,
+    estimated_rows   BIGINT,
+    actual_rows      BIGINT,
+    estimation_error DOUBLE      -- actual / estimated
+);
+```
+
+#### Priority Calculation Query
+
+```sql
+-- Stateless priority calculation - no regret accumulation needed
+SELECT
+    table_name,
+    column_name,
+    SUM(cpu_time_ms * CASE stats_status
+        WHEN 'NEVER' THEN 10.0
+        WHEN 'PARTIAL' THEN 5.0
+        WHEN 'STALE' THEN 2.0
+        WHEN 'FRESH' THEN 0.1
+    END) as priority_score,
+    COUNT(*) as query_count,
+    COUNT(CASE WHEN stats_status = 'NEVER' THEN 1 END) as never_count,
+    COUNT(CASE WHEN stats_status = 'STALE' THEN 1 END) as stale_count,
+    AVG(estimation_error) as avg_error
+FROM system.runtime.join_column_metrics
+WHERE query_time > current_timestamp - INTERVAL '7' DAY
+GROUP BY table_name, column_name
+ORDER BY priority_score DESC
+LIMIT 20;
+
+-- Example output:
+-- ┌─────────────────┬─────────────┬────────────────┬─────────────┬─────────────┬─────────────┬───────────┐
+-- │ table_name      │ column_name │ priority_score │ query_count │ never_count │ stale_count │ avg_error │
+-- ├─────────────────┼─────────────┼────────────────┼─────────────┼─────────────┼─────────────┼───────────┤
+-- │ sales.lineitem  │ order_id    │ 45,678,901     │ 2,345       │ 2,345       │ 0           │ 12.8      │
+-- │ sales.orders    │ customer_id │ 23,456,789     │ 1,234       │ 0           │ 1,234       │ 47.3      │
+-- │ analytics.events│ user_id     │ 1,234,567      │ 567         │ 0           │ 0           │ 1.2       │
+-- └─────────────────┴─────────────┴────────────────┴─────────────┴─────────────┴─────────────┴───────────┘
+```
+
+#### Auto-ANALYZE Integration
+
+```java
+public class StatelessAutoAnalyzeScheduler {
+
+    public List<AnalyzeTask> getPriorityColumns(Duration window, int limit) {
+        // Simple query - no state management needed
+        return queryRunner.execute("""
+            SELECT catalog_name, schema_name, table_name, column_name,
+                   SUM(cpu_time_ms * status_weight) as priority
+            FROM (
+                SELECT *,
+                    CASE stats_status
+                        WHEN 'NEVER' THEN 10.0
+                        WHEN 'PARTIAL' THEN 5.0
+                        WHEN 'STALE' THEN 2.0
+                        ELSE 0.1
+                    END as status_weight
+                FROM system.runtime.join_column_metrics
+                WHERE query_time > current_timestamp - ?
+            )
+            GROUP BY catalog_name, schema_name, table_name, column_name
+            HAVING SUM(cpu_time_ms * status_weight) > ?
+            ORDER BY priority DESC
+            LIMIT ?
+            """, window, PRIORITY_THRESHOLD, limit);
+    }
+
+    public void runAutoAnalyze() {
+        for (AnalyzeTask task : getPriorityColumns(Duration.ofDays(7), 10)) {
+            // After ANALYZE, future queries will have FRESH status
+            // Priority automatically drops without any state update
+            analyzeColumn(task);
+        }
+    }
+}
+```
+
+#### Advantages of Stateless Approach
+
+| Aspect | Stateful Regret | Stateless Status |
+|--------|-----------------|------------------|
+| **State management** | Must track regret history | Query logs are ephemeral |
+| **Self-correction** | Need to clear regret after ANALYZE | Automatic via status change |
+| **Distributed execution** | Regret state needs coordination | No coordination needed |
+| **Recovery after restart** | Must persist regret state | Just replay recent logs |
+| **Staleness detection** | Inferred from regret spikes | Explicit in each record |
+| **Debugging** | "Why is regret high?" | "Status is STALE because X" |
+
+### 11.10 Integration with HBO
+
+The stateless approach integrates cleanly with Presto's existing History-Based Optimization:
+
+```java
+// Extend HistoryBasedPlanStatisticsProvider to emit status with each query
+public interface StatsStatusAwareProvider
         extends HistoryBasedPlanStatisticsProvider {
 
-    // Record regret after query completion
-    void recordJoinRegret(
+    // Emit join column metrics with status at query completion
+    void recordJoinColumnMetrics(
             PlanNodeId joinNodeId,
             JoinColumns columns,
+            StatsStatus status,         // Status at query time
+            long statsSnapshotId,       // Which stats were used
+            long currentSnapshotId,     // Current table snapshot
             long estimatedRows,
             long actualRows,
             Duration cpuTime);
 
-    // Get columns ranked by regret for ANALYZE prioritization
-    List<ColumnRegretSummary> getHighRegretColumns(
+    // Get columns ranked by priority (stateless calculation)
+    List<ColumnPriority> getAnalyzePriorities(
             Duration window,
             int limit);
-
-    // Check if a column's statistics are likely stale based on regret
-    boolean isStatsSuspect(SchemaTableName table, String column);
 }
 ```
 
@@ -1031,12 +1215,12 @@ public interface RegretAwareStatisticsProvider
 - [ ] Add frequency blob type (`apache-datasketches-fi-longs-v1`) to Puffin writer/reader
 - [ ] Wire frequency sketch into ANALYZE
 
-### Phase 2: Regret-Based Query Analysis
-- [ ] Implement `JoinRegretEventListener` to capture estimation errors
-- [ ] Create `system.runtime.join_column_regret` system table
-- [ ] Implement regret formula (configurable: CPU time, wall time, memory)
-- [ ] Add directional penalty (underestimates worse than overestimates)
-- [ ] Track regret aggregated by (table, column) over sliding window
+### Phase 2: Stateless Query Analysis
+- [ ] Implement `JoinColumnStatsStatus` to determine NEVER/PARTIAL/STALE/FRESH at query time
+- [ ] Create `system.runtime.join_column_metrics` system table with status field
+- [ ] Emit join column metrics at query completion (status, cpu_time, estimation_error)
+- [ ] Implement stateless priority calculation: `Σ(cpu_time × status_weight)`
+- [ ] No regret accumulation needed - status is self-correcting
 
 ### Phase 3: Optimizer Integration
 - [ ] Fetch sketches in optimizer rules
@@ -1044,10 +1228,10 @@ public interface RegretAwareStatisticsProvider
 - [ ] Add session property to enable/disable
 
 ### Phase 4: Auto-ANALYZE
-- [ ] Background job triggered by regret threshold
-- [ ] Priority queue based on total regret (not frequency)
-- [ ] Automatic staleness detection via regret spikes
-- [ ] Integration with HBO for statistics refresh
+- [ ] Background job triggered by priority threshold
+- [ ] Priority queue based on `Σ(cpu_time × status_weight)` (stateless)
+- [ ] Automatic staleness detection via status field (STALE/FRESH)
+- [ ] Self-correcting: priority drops after ANALYZE without state update
 
 ### Phase 5: Join Ordering (Optional)
 - [ ] Intermediate sketch computation
@@ -1105,5 +1289,5 @@ public interface RegretAwareStatisticsProvider
 
 ---
 
-*Document Version: 0.5*
+*Document Version: 0.6*
 *Last Updated: January 2025*
