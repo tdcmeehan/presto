@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.9
+**Version**: 1.0
 
 ---
 
@@ -1178,6 +1178,167 @@ public class StatelessAutoAnalyzeScheduler {
 | **Staleness detection** | Inferred from regret spikes | Explicit in each record |
 | **Debugging** | "Why is regret high?" | "Status is STALE because X" |
 
+#### End-to-End Auto-ANALYZE Flow
+
+Here's how the complete system works step by step:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Query Execution                                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   User submits: SELECT * FROM orders o JOIN customers c                     │
+│                 ON o.customer_id = c.id                                     │
+│                                                                             │
+│   Optimizer calls: getTableStatistics(orders, [customer_id])                │
+│                    getTableStatistics(customers, [id])                      │
+│                                                                             │
+│   Iceberg connector returns ColumnStatistics with metadata:                 │
+│     orders.customer_id:   status=STALE, lastAnalyzed=2024-12-15            │
+│     customers.id:         status=FRESH, lastAnalyzed=2024-12-28            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Query Completes - Emit Metrics                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   QueryCompletedEvent fires with:                                           │
+│     - Actual row counts from OperatorStats                                  │
+│     - CPU time, wall time                                                   │
+│     - Join columns used                                                     │
+│                                                                             │
+│   JoinMetricsEventListener emits to system.runtime.join_column_metrics:     │
+│                                                                             │
+│   INSERT INTO join_column_metrics VALUES                                    │
+│     ('query-123', NOW(), 'iceberg', 'sales', 'orders', 'customer_id',       │
+│      'STALE', '2024-12-15 10:00:00', '{"snapshotId":100,...}',             │
+│      45000, 52000, 1000000, 5000000, 5.0),                                  │
+│     ('query-123', NOW(), 'iceberg', 'sales', 'customers', 'id',             │
+│      'FRESH', '2024-12-28 14:30:00', '{"snapshotId":200,...}',             │
+│      45000, 52000, 50000, 48000, 0.96);                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 3: Metrics Accumulate Over Time                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   After 1000s of queries, system table contains:                            │
+│                                                                             │
+│   │ table_name   │ column_name  │ stats_status │ cpu_time_ms │ ...        │
+│   ├──────────────┼──────────────┼──────────────┼─────────────┤            │
+│   │ orders       │ customer_id  │ STALE        │ 45000       │            │
+│   │ orders       │ customer_id  │ STALE        │ 38000       │            │
+│   │ orders       │ customer_id  │ STALE        │ 52000       │            │
+│   │ lineitem     │ order_id     │ NEVER        │ 120000      │ ← No stats │
+│   │ lineitem     │ order_id     │ NEVER        │ 95000       │            │
+│   │ customers    │ id           │ FRESH        │ 45000       │            │
+│   │ ...          │ ...          │ ...          │ ...         │            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 4: Scheduler Queries for Priority Columns                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Background job runs every N minutes:                                      │
+│                                                                             │
+│   SELECT table_name, column_name,                                           │
+│          SUM(cpu_time_ms * CASE stats_status                                │
+│              WHEN 'NEVER' THEN 10.0      -- Highest priority               │
+│              WHEN 'PARTIAL' THEN 5.0                                        │
+│              WHEN 'STALE' THEN 2.0                                          │
+│              WHEN 'FRESH' THEN 0.1       -- Lowest priority                │
+│          END) as priority                                                   │
+│   FROM system.runtime.join_column_metrics                                   │
+│   WHERE query_time > NOW() - INTERVAL '7' DAY                               │
+│   GROUP BY table_name, column_name                                          │
+│   ORDER BY priority DESC                                                    │
+│   LIMIT 10;                                                                 │
+│                                                                             │
+│   Result:                                                                   │
+│   │ table_name │ column_name  │ priority    │                              │
+│   ├────────────┼──────────────┼─────────────┤                              │
+│   │ lineitem   │ order_id     │ 21,500,000  │ ← NEVER × 10.0              │
+│   │ orders     │ customer_id  │ 2,700,000   │ ← STALE × 2.0               │
+│   │ customers  │ id           │ 45,000      │ ← FRESH × 0.1               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Trigger ANALYZE for Top Priority Columns                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Scheduler executes:                                                       │
+│                                                                             │
+│   ANALYZE iceberg.sales.lineitem                                            │
+│       WITH (columns = ARRAY['order_id']);                                   │
+│                                                                             │
+│   This collects:                                                            │
+│     - Theta sketch (NDV) → blob type "apache-datasketches-theta-v1"        │
+│     - Frequency sketch  → blob type "apache-datasketches-fi-longs-v1"      │
+│     - Writes to Puffin file in table metadata                              │
+│                                                                             │
+│   Then:                                                                     │
+│   ANALYZE iceberg.sales.orders                                              │
+│       WITH (columns = ARRAY['customer_id']);                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 6: Self-Correction - Priority Automatically Drops                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Next query: SELECT * FROM lineitem l JOIN orders o ON l.order_id = o.id  │
+│                                                                             │
+│   Optimizer calls getTableStatistics(lineitem, [order_id])                  │
+│   Iceberg sees: statistics file exists with Theta + Frequency blobs        │
+│   Returns: status=FRESH, lastAnalyzed=NOW()                                 │
+│                                                                             │
+│   Metric emitted:                                                           │
+│     lineitem.order_id: status=FRESH, cpu_time=8000ms                       │
+│                                                                             │
+│   Priority calculation:                                                     │
+│     Before ANALYZE: 120000ms × 10.0 (NEVER) = 1,200,000                    │
+│     After ANALYZE:  8000ms × 0.1 (FRESH)    = 800                          │
+│                                                                             │
+│   Priority dropped 1500x automatically, no state update needed!            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 7: Cycle Continues - Data Changes, Stats Become Stale                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Two weeks later, Spark job appends 50M rows to lineitem                   │
+│                                                                             │
+│   Next query to lineitem:                                                   │
+│     Iceberg checks: statsSnapshot.rows=100M, currentSnapshot.rows=150M     │
+│     Row change = 50% > 20% threshold                                        │
+│     Returns: status=STALE                                                   │
+│                                                                             │
+│   Metrics accumulate with status=STALE (weight=2.0)                        │
+│   Priority climbs back up                                                   │
+│   Eventually triggers re-ANALYZE                                            │
+│                                                                             │
+│   The cycle is self-maintaining with zero manual intervention!              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Properties:**
+1. **Stateless**: No regret accumulation - priority is computed fresh from logs each time
+2. **Self-correcting**: ANALYZE → FRESH → low weight → priority drops automatically
+3. **Adaptive**: Data changes → STALE → high weight → priority rises automatically
+4. **No coordination**: Each query independently logs its status, scheduler just queries
+
 ### 11.10 Integration with HBO
 
 The stateless approach integrates cleanly with Presto's existing History-Based Optimization:
@@ -1566,5 +1727,5 @@ Phase 2 should include:
 
 ---
 
-*Document Version: 0.9*
+*Document Version: 1.0*
 *Last Updated: January 2025*
