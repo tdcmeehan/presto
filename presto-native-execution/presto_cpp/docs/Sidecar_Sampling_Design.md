@@ -409,6 +409,71 @@ public class JoinSamplingStatsRule extends SimpleStatsRule<JoinNode> {
 
 ### Caching Strategy
 
+#### Key Design Principle: Separation of Join Containment and Filter Selectivity
+
+Following Axiom's approach, we cache **join fanout** and **filter selectivity** as independent variables. This is critical for cache efficiency:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    INDEPENDENT CACHING PRINCIPLE                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Join Fanout Cache (filters EXCLUDED from key):                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  "orders:custkey | customer:custkey"  →  (lr: 1.0, rl: 15.2)    │    │
+│  │  "lineitem:orderkey | orders:orderkey" →  (lr: 4.2, rl: 1.0)    │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  Filter Selectivity Cache (predicate-specific):                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  "orders[total > 1000]"           →  0.15                       │    │
+│  │  "orders[status = 'PENDING']"     →  0.08                       │    │
+│  │  "customer[nation = 'US']"        →  0.22                       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  At query time, COMBINE:                                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  output_rows = left_rows × left_selectivity ×                    │    │
+│  │                right_selectivity × join_fanout                   │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why this matters for cache coverage:**
+
+| Scenario | Combined Cache | Separated Caches |
+|----------|---------------|------------------|
+| 10 filters on `orders` | - | 10 selectivity entries |
+| 5 join patterns with `orders` | - | 5 fanout entries |
+| All combinations | 50 entries needed | 15 entries (10 + 5) |
+| New filter added | 5 new entries | 1 new entry |
+| New join added | 10 new entries | 1 new entry |
+
+**Cache warm-up acceleration:**
+- Query 1: `orders JOIN customer WHERE orders.total > 1000`
+  - Caches: `orders:custkey|customer:custkey` fanout + `orders[total>1000]` selectivity
+- Query 2: `orders JOIN customer WHERE orders.status = 'PENDING'`
+  - Reuses: `orders:custkey|customer:custkey` fanout (cache HIT)
+  - Caches: `orders[status='PENDING']` selectivity
+- Query 3: `orders JOIN lineitem WHERE orders.total > 1000`
+  - Reuses: `orders[total>1000]` selectivity (cache HIT)
+  - Caches: `orders:orderkey|lineitem:orderkey` fanout
+
+With combined caching, all three queries would require full sampling. With separated caching, queries 2 and 3 each get partial cache hits.
+
+#### Independence Assumption
+
+This approach assumes filter selectivity and join behavior are **statistically independent**:
+- Filtering on `orders.total > 1000` doesn't change which `custkey` values are present
+- The join fanout between filtered orders and customers equals base fanout × selectivity
+
+**When this breaks down:**
+- Filter on join key: `orders WHERE custkey < 1000` - affects join containment
+- Correlated filters: `orders WHERE region = 'US'` joined with `customers WHERE country = 'US'`
+
+For correlated cases, the separated caches may underestimate or overestimate. Future work could detect correlations and fall back to combined sampling.
+
 #### Cache Hierarchy
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -476,6 +541,8 @@ CREATE TABLE system.sampling.stored_samples (
 ## Approximate Data Structures for Join Fanout
 
 Computing join fanout requires tracking both **key membership** (which keys exist) and **key frequency** (how many rows per key). For distributed/mergeable sampling, we need approximate data structures.
+
+**Critical:** Join fanout sketches are built on **unfiltered base tables**. Filter selectivity is computed and cached separately. This enables maximum cache reuse across queries with different predicates (see "Separation of Join Containment and Filter Selectivity" above).
 
 ### Requirements
 
