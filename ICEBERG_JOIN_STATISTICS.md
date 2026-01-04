@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.4
+**Version**: 0.5
 
 ---
 
@@ -711,7 +711,318 @@ This would require tracking which files contributed to existing statistics.
 
 ---
 
-## 10. Implementation Phases
+## 11. Query Log Analysis and Regret Metrics
+
+### 11.1 Why Not Just Frequency?
+
+Simple frequency-based column selection is naive:
+
+```
+Column A: 1000 queries/day, each takes 100ms  → 100 sec/day total
+Column B: 10 queries/day, each takes 1 hour   → 10 hours/day total
+
+Frequency says: Analyze A first (1000 > 10)
+Impact says:    Analyze B first (100× more wall time)
+```
+
+We need a metric that captures the **cost of poor optimization**, not just usage frequency.
+
+### 11.2 Defining "Regret"
+
+**Regret** = The additional resources consumed due to suboptimal query planning caused by missing or inaccurate statistics.
+
+```
+Regret = (Actual_Cost - Optimal_Cost) × Frequency
+```
+
+Since we can't know `Optimal_Cost`, we approximate it using **estimation error** as a proxy for plan quality:
+
+```
+Regret ≈ Estimation_Error_Factor × Resource_Consumption × Frequency
+```
+
+### 11.3 Available Metrics from Presto
+
+Presto already collects both estimated and actual statistics:
+
+| Metric | Estimated (Plan Time) | Actual (Runtime) | Source |
+|--------|----------------------|------------------|--------|
+| Row count | `PlanNodeStatsEstimate.outputRowCount` | `planNodeOutputPositions` | `OperatorStats` |
+| Join build keys | `JoinNodeStatsEstimate.joinBuildKeyCount` | `joinBuildKeyCount` | `OperatorStats` |
+| Join probe keys | `JoinNodeStatsEstimate.joinProbeKeyCount` | `joinProbeKeyCount` | `OperatorStats` |
+| CPU time | - | `cpuTime` | `OperatorStats` |
+| Wall time | - | `wallTime` | `QueryStats` |
+| Memory | - | `peakUserMemory` | `OperatorStats` |
+
+These are available via:
+- `EXPLAIN ANALYZE` output
+- `QueryCompletedEvent` in event listeners
+- HBO infrastructure (`HistoryBasedPlanStatisticsProvider`)
+
+### 11.4 Regret Formulas
+
+#### Option A: Simple Error × Cost (Configurable)
+
+```java
+public class JoinRegretCalculator {
+    enum CostMetric { WALL_TIME, CPU_TIME, MEMORY_PEAK }
+
+    public double computeRegret(
+            JoinOperatorStats stats,
+            long estimatedRows,
+            long actualRows,
+            CostMetric metric) {
+
+        // Symmetric error ratio: handles both over and underestimates
+        double errorFactor = Math.max(
+            (double) actualRows / estimatedRows,
+            (double) estimatedRows / actualRows);
+
+        double cost = switch (metric) {
+            case WALL_TIME -> stats.getWallTimeMillis();
+            case CPU_TIME -> stats.getCpuTimeMillis();
+            case MEMORY_PEAK -> stats.getPeakMemoryBytes() / 1_000_000.0; // MB
+        };
+
+        return errorFactor * cost;
+    }
+}
+```
+
+#### Option B: Directional Regret (Underestimates Are Worse)
+
+Underestimates cause more damage because they lead to:
+- Wrong join order (small table used as probe instead of build)
+- Insufficient memory allocation → spilling
+- Poor parallelism decisions
+
+```java
+public double computeDirectionalRegret(
+        long estimatedRows,
+        long actualRows,
+        double cpuTimeMs) {
+
+    double errorRatio = (double) actualRows / estimatedRows;
+
+    if (errorRatio > 1.0) {
+        // Underestimate: actual > estimated (BAD)
+        // Penalty grows quadratically with error magnitude
+        return Math.pow(errorRatio, 2) * cpuTimeMs;
+    } else {
+        // Overestimate: estimated > actual (less bad)
+        // Linear penalty only
+        return (1.0 / errorRatio) * cpuTimeMs * 0.5;
+    }
+}
+```
+
+#### Option C: Resource-Normalized Regret
+
+Normalize by expected cost to make regret comparable across different query sizes:
+
+```java
+public double computeNormalizedRegret(
+        long estimatedRows,
+        long actualRows,
+        double actualCpuTimeMs,
+        double expectedCpuTimeMs) {
+
+    double errorFactor = Math.max(
+        (double) actualRows / estimatedRows,
+        (double) estimatedRows / actualRows);
+
+    // How much more CPU than expected?
+    double costOverrun = actualCpuTimeMs / expectedCpuTimeMs;
+
+    // Regret is high when: (1) estimation was wrong AND (2) query was expensive
+    return errorFactor * costOverrun;
+}
+```
+
+### 11.5 Aggregating Regret by Column
+
+To prioritize which columns to ANALYZE, aggregate regret per join column:
+
+```java
+public class ColumnRegretTracker {
+    // Table → Column → Aggregated Regret
+    private final Map<SchemaTableName, Map<String, ColumnRegret>> regretByColumn;
+
+    public void recordJoinRegret(
+            SchemaTableName table,
+            String columnName,
+            double regret,
+            Instant queryTime) {
+        regretByColumn
+            .computeIfAbsent(table, k -> new ConcurrentHashMap<>())
+            .computeIfAbsent(columnName, k -> new ColumnRegret())
+            .add(regret, queryTime);
+    }
+
+    public List<ColumnPriority> getAnalyzePriorities(Duration window) {
+        return regretByColumn.entrySet().stream()
+            .flatMap(tableEntry -> tableEntry.getValue().entrySet().stream()
+                .map(colEntry -> new ColumnPriority(
+                    tableEntry.getKey(),
+                    colEntry.getKey(),
+                    colEntry.getValue().getTotalRegret(window),
+                    colEntry.getValue().getQueryCount(window))))
+            .sorted(Comparator.comparing(ColumnPriority::totalRegret).reversed())
+            .collect(toList());
+    }
+}
+
+public class ColumnRegret {
+    private final List<RegretEntry> entries = new ArrayList<>();
+
+    public void add(double regret, Instant time) {
+        entries.add(new RegretEntry(regret, time));
+    }
+
+    public double getTotalRegret(Duration window) {
+        Instant cutoff = Instant.now().minus(window);
+        return entries.stream()
+            .filter(e -> e.time().isAfter(cutoff))
+            .mapToDouble(RegretEntry::regret)
+            .sum();
+    }
+}
+```
+
+### 11.6 Data Collection Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Query Execution                            │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Plan generated with estimates                               │
+│  2. Query executed, actual stats collected                      │
+│  3. QueryCompletedEvent fired                                   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 JoinRegretEventListener                         │
+├─────────────────────────────────────────────────────────────────┤
+│  For each JoinNode in query plan:                               │
+│    - Extract estimated vs actual row counts                     │
+│    - Identify join columns (table, column name)                 │
+│    - Compute regret = f(error, cpu_time|wall_time|memory)       │
+│    - Record to ColumnRegretTracker                              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   System Table / Storage                        │
+├─────────────────────────────────────────────────────────────────┤
+│  system.runtime.join_column_regret                              │
+│  ┌──────────────┬────────────┬─────────────┬─────────────────┐  │
+│  │ table_name   │ column     │ total_regret│ query_count     │  │
+│  ├──────────────┼────────────┼─────────────┼─────────────────┤  │
+│  │ orders       │ customer_id│ 1,234,567   │ 5,432           │  │
+│  │ lineitem     │ order_id   │ 987,654     │ 3,210           │  │
+│  │ ...          │ ...        │ ...         │ ...             │  │
+│  └──────────────┴────────────┴─────────────┴─────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   Auto-ANALYZE Scheduler                        │
+├─────────────────────────────────────────────────────────────────┤
+│  SELECT table_name, column_name                                 │
+│  FROM system.runtime.join_column_regret                         │
+│  WHERE total_regret > threshold                                 │
+│  ORDER BY total_regret DESC                                     │
+│  LIMIT 10;                                                      │
+│                                                                 │
+│  → Trigger ANALYZE for top regret columns                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 11.7 Configuration Options
+
+```java
+// In IcebergSessionProperties or global config
+
+// Which cost metric to use for regret calculation
+public static final String REGRET_COST_METRIC = "join_regret_cost_metric";
+// Options: WALL_TIME, CPU_TIME, MEMORY_PEAK
+// Default: CPU_TIME
+
+// Penalty multiplier for underestimates vs overestimates
+public static final String REGRET_UNDERESTIMATE_PENALTY = "join_regret_underestimate_penalty";
+// Default: 2.0 (underestimates penalized 2x)
+
+// Time window for aggregating regret
+public static final String REGRET_WINDOW_HOURS = "join_regret_window_hours";
+// Default: 168 (7 days)
+
+// Minimum regret threshold to trigger auto-ANALYZE
+public static final String REGRET_ANALYZE_THRESHOLD = "join_regret_analyze_threshold";
+// Default: 1000000 (1M cpu-ms equivalent)
+```
+
+### 11.8 Example: Identifying High-Regret Columns
+
+```sql
+-- Query the regret tracking system table
+SELECT
+    table_name,
+    column_name,
+    total_regret_cpu_ms,
+    query_count,
+    avg_estimation_error,
+    last_analyzed,
+    CASE
+        WHEN last_analyzed IS NULL THEN 'NEVER'
+        WHEN last_analyzed < current_timestamp - INTERVAL '7' DAY THEN 'STALE'
+        ELSE 'FRESH'
+    END as stats_status
+FROM system.runtime.join_column_regret
+WHERE total_regret_cpu_ms > 100000  -- 100 CPU-seconds
+ORDER BY total_regret_cpu_ms DESC
+LIMIT 20;
+
+-- Example output:
+-- ┌─────────────────┬─────────────┬───────────────────┬─────────────┬─────────────────────┬──────────────────────┬──────────────┐
+-- │ table_name      │ column_name │ total_regret_cpu_ms│ query_count │ avg_estimation_error│ last_analyzed        │ stats_status │
+-- ├─────────────────┼─────────────┼───────────────────┼─────────────┼─────────────────────┼──────────────────────┼──────────────┤
+-- │ sales.orders    │ customer_id │ 45,678,901        │ 1,234       │ 47.3                │ 2024-12-15 10:00:00  │ STALE        │
+-- │ sales.lineitem  │ order_id    │ 23,456,789        │ 2,345       │ 12.8                │ NULL                 │ NEVER        │
+-- │ analytics.events│ user_id     │ 12,345,678        │ 567         │ 156.2               │ 2024-12-28 14:30:00  │ FRESH        │
+-- └─────────────────┴─────────────┴───────────────────┴─────────────┴─────────────────────┴──────────────────────┴──────────────┘
+```
+
+### 11.9 Integration with HBO
+
+The regret tracking can integrate with Presto's existing History-Based Optimization:
+
+```java
+// Extend HistoryBasedPlanStatisticsProvider to also track regret
+public interface RegretAwareStatisticsProvider
+        extends HistoryBasedPlanStatisticsProvider {
+
+    // Record regret after query completion
+    void recordJoinRegret(
+            PlanNodeId joinNodeId,
+            JoinColumns columns,
+            long estimatedRows,
+            long actualRows,
+            Duration cpuTime);
+
+    // Get columns ranked by regret for ANALYZE prioritization
+    List<ColumnRegretSummary> getHighRegretColumns(
+            Duration window,
+            int limit);
+
+    // Check if a column's statistics are likely stale based on regret
+    boolean isStatsSuspect(SchemaTableName table, String column);
+}
+```
+
+---
+
+## 12. Implementation Phases
 
 ### Phase 1: Foundation ⬅️ **Start Here**
 - [x] Theta sketch already in Puffin
@@ -720,10 +1031,12 @@ This would require tracking which files contributed to existing statistics.
 - [ ] Add frequency blob type (`apache-datasketches-fi-longs-v1`) to Puffin writer/reader
 - [ ] Wire frequency sketch into ANALYZE
 
-### Phase 2: Query Log Integration
-- [ ] Build query log analyzer for join column frequency
-- [ ] Store frequency data in system table
-- [ ] Track which columns participate in joins
+### Phase 2: Regret-Based Query Analysis
+- [ ] Implement `JoinRegretEventListener` to capture estimation errors
+- [ ] Create `system.runtime.join_column_regret` system table
+- [ ] Implement regret formula (configurable: CPU time, wall time, memory)
+- [ ] Add directional penalty (underestimates worse than overestimates)
+- [ ] Track regret aggregated by (table, column) over sliding window
 
 ### Phase 3: Optimizer Integration
 - [ ] Fetch sketches in optimizer rules
@@ -731,9 +1044,10 @@ This would require tracking which files contributed to existing statistics.
 - [ ] Add session property to enable/disable
 
 ### Phase 4: Auto-ANALYZE
-- [ ] Background job using frequency data
-- [ ] Automatic staleness refresh
-- [ ] Priority queue based on query frequency
+- [ ] Background job triggered by regret threshold
+- [ ] Priority queue based on total regret (not frequency)
+- [ ] Automatic staleness detection via regret spikes
+- [ ] Integration with HBO for statistics refresh
 
 ### Phase 5: Join Ordering (Optional)
 - [ ] Intermediate sketch computation
@@ -742,7 +1056,7 @@ This would require tracking which files contributed to existing statistics.
 
 ---
 
-## 11. Open Questions
+## 13. Open Questions
 
 1. ~~**Frequency library choice**: stream-lib CMS vs DataSketches?~~
    - **RESOLVED**: Use DataSketches `LongsSketch` for cross-platform binary compatibility (Java/C++/Python)
@@ -765,7 +1079,7 @@ This would require tracking which files contributed to existing statistics.
 
 ---
 
-## 12. References
+## 14. References
 
 1. [Apache DataSketches](https://datasketches.apache.org/)
 2. [DataSketches Frequent Items Overview](https://datasketches.apache.org/docs/Frequency/FrequentItemsOverview.html)
@@ -791,5 +1105,5 @@ This would require tracking which files contributed to existing statistics.
 
 ---
 
-*Document Version: 0.4*
+*Document Version: 0.5*
 *Last Updated: January 2025*
