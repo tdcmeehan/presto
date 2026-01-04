@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.7
+**Version**: 0.8
 
 ---
 
@@ -1084,9 +1084,8 @@ CREATE TABLE system.runtime.join_column_metrics (
     schema_name      VARCHAR,
     table_name       VARCHAR,
     column_name      VARCHAR,
-    stats_status     VARCHAR,    -- NEVER, PARTIAL, STALE, FRESH
-    stats_snapshot_id BIGINT,    -- Snapshot ID of statistics used (NULL if NEVER)
-    current_snapshot_id BIGINT,  -- Current table snapshot
+    stats_status     VARCHAR,    -- NEVER, PARTIAL, STALE, FRESH (typed in SPI)
+    connector_info   VARCHAR,    -- Opaque JSON from connector (e.g., snapshot IDs, sketch types)
     cpu_time_ms      BIGINT,
     wall_time_ms     BIGINT,
     estimated_rows   BIGINT,
@@ -1247,9 +1246,10 @@ public class ColumnStatisticsMetadata {
     }
 
     private final StatisticsStatus status;
-    private final Optional<Long> statisticsSnapshotId;  // For tracking which stats were used
-    private final Optional<Instant> collectedAt;        // When stats were collected
-    private final Set<String> availableSketchTypes;     // e.g., {"theta", "frequency"}
+
+    // Opaque connector-specific info, JSON-serialized by connector
+    // Follows Puffin blob properties pattern: connector owns serialization
+    private final Optional<String> connectorInfo;
 
     // Constructor, getters, builder...
 }
@@ -1273,29 +1273,28 @@ public final class ColumnStatistics {
 
 **Iceberg Implementation:**
 
+The Iceberg connector serializes its specific metadata (snapshot IDs, available sketches) into the opaque `connectorInfo` string, following the Puffin blob properties pattern:
+
 ```java
-// In TableStatisticsMaker.java - when building ColumnStatistics
-private ColumnStatistics buildColumnStatistics(
-        ConnectorSession session,
-        Table icebergTable,
-        Snapshot currentSnapshot,
-        IcebergColumnHandle column,
-        Optional<StatisticsFile> statsFile) {
+// Iceberg-specific info, JSON-serialized into connectorInfo
+@JsonSerialize
+public class IcebergStatisticsInfo {
+    private final long statisticsSnapshotId;
+    private final long currentSnapshotId;
+    private final long collectedAtMillis;
+    private final Set<String> availableSketchTypes;  // e.g., {"theta", "frequency"}
 
-    ColumnStatistics.Builder builder = ColumnStatistics.builder();
+    // This gets serialized to the opaque connectorInfo string
+    public String toJson() {
+        return OBJECT_MAPPER.writeValueAsString(this);
+    }
 
-    // Existing logic for NDV, range, etc...
-    builder.setDistinctValuesCount(...);
-    builder.setRange(...);
-
-    // NEW: Compute and attach metadata
-    ColumnStatisticsMetadata metadata = computeColumnMetadata(
-            column, statsFile, currentSnapshot);
-    builder.setMetadata(Optional.of(metadata));
-
-    return builder.build();
+    public static IcebergStatisticsInfo fromJson(String json) {
+        return OBJECT_MAPPER.readValue(json, IcebergStatisticsInfo.class);
+    }
 }
 
+// In TableStatisticsMaker.java
 private ColumnStatisticsMetadata computeColumnMetadata(
         IcebergColumnHandle column,
         Optional<StatisticsFile> statsFile,
@@ -1304,9 +1303,7 @@ private ColumnStatisticsMetadata computeColumnMetadata(
     if (statsFile.isEmpty()) {
         return new ColumnStatisticsMetadata(
                 StatisticsStatus.NEVER,
-                Optional.empty(),
-                Optional.empty(),
-                ImmutableSet.of());
+                Optional.empty());
     }
 
     int columnId = column.getId();
@@ -1322,33 +1319,36 @@ private ColumnStatisticsMetadata computeColumnMetadata(
 
     if (availableTypes.isEmpty()) {
         return new ColumnStatisticsMetadata(
-                StatisticsStatus.NEVER, ...);
+                StatisticsStatus.NEVER, Optional.empty());
     }
 
-    if (!hasTheta || !hasFrequency) {
-        return new ColumnStatisticsMetadata(
-                StatisticsStatus.PARTIAL, ...);
-    }
-
-    // Check staleness
+    // Build connector-specific info
     Snapshot statsSnapshot = icebergTable.snapshot(statsFile.get().snapshotId());
-    if (isStale(statsSnapshot, currentSnapshot)) {
-        return new ColumnStatisticsMetadata(
-                StatisticsStatus.STALE,
-                Optional.of(statsFile.get().snapshotId()),
-                Optional.of(Instant.ofEpochMilli(statsSnapshot.timestampMillis())),
-                availableTypes);
+    IcebergStatisticsInfo info = new IcebergStatisticsInfo(
+            statsFile.get().snapshotId(),
+            currentSnapshot.snapshotId(),
+            statsSnapshot.timestampMillis(),
+            availableTypes);
+
+    StatisticsStatus status;
+    if (!hasTheta || !hasFrequency) {
+        status = StatisticsStatus.PARTIAL;
+    } else if (isStale(statsSnapshot, currentSnapshot)) {
+        status = StatisticsStatus.STALE;
+    } else {
+        status = StatisticsStatus.FRESH;
     }
 
-    return new ColumnStatisticsMetadata(
-            StatisticsStatus.FRESH, ...);
+    return new ColumnStatisticsMetadata(status, Optional.of(info.toJson()));
 }
 ```
 
 **Query Logging (presto-main):**
 
+The query logger extracts the typed `StatisticsStatus` and logs the opaque `connectorInfo` as-is. Connectors own the interpretation of their info:
+
 ```java
-// In JoinRegretEventListener or similar
+// In JoinMetricsEventListener or similar
 public void recordJoinMetrics(
         JoinNode joinNode,
         TableStatistics leftStats,
@@ -1359,19 +1359,20 @@ public void recordJoinMetrics(
         ColumnStatistics colStats = leftStats.getColumnStatistics()
                 .get(column.getHandle());
 
-        // Extract status from SPI - no connector-specific code needed
+        // Extract typed status from SPI - no connector-specific code needed
         StatisticsStatus status = colStats.getMetadata()
                 .map(ColumnStatisticsMetadata::getStatus)
                 .orElse(StatisticsStatus.NEVER);
 
-        Optional<Long> statsSnapshotId = colStats.getMetadata()
-                .flatMap(ColumnStatisticsMetadata::getStatisticsSnapshotId);
+        // Opaque connector info logged as-is (for debugging/analysis)
+        Optional<String> connectorInfo = colStats.getMetadata()
+                .flatMap(ColumnStatisticsMetadata::getConnectorInfo);
 
         emitMetric(JoinColumnMetric.builder()
                 .table(column.getTable())
                 .column(column.getName())
                 .statsStatus(status.name())
-                .statsSnapshotId(statsSnapshotId.orElse(null))
+                .connectorInfo(connectorInfo.orElse(null))  // Opaque string
                 .cpuTimeMs(runtimeStats.getCpuTime().toMillis())
                 .estimatedRows(joinNode.getEstimatedRows())
                 .actualRows(runtimeStats.getOutputPositions())
@@ -1379,6 +1380,12 @@ public void recordJoinMetrics(
     }
 }
 ```
+
+**Advantage of opaque connectorInfo:**
+- SPI only defines what presto-main needs (`StatisticsStatus`)
+- Connector-specific details (snapshot IDs, sketch types) are encapsulated
+- No SPI changes when Iceberg adds more metadata
+- Follows established Puffin blob properties pattern
 
 #### Option B: Use Existing ConfidenceLevel (Simpler, Less Granular)
 
@@ -1539,5 +1546,5 @@ Phase 2 should include:
 
 ---
 
-*Document Version: 0.7*
+*Document Version: 0.8*
 *Last Updated: January 2025*
