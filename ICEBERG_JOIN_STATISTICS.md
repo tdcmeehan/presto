@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.8
+**Version**: 0.9
 
 ---
 
@@ -1085,6 +1085,7 @@ CREATE TABLE system.runtime.join_column_metrics (
     table_name       VARCHAR,
     column_name      VARCHAR,
     stats_status     VARCHAR,    -- NEVER, PARTIAL, STALE, FRESH (typed in SPI)
+    last_analyzed    TIMESTAMP,  -- When ANALYZE was last run for this column (NULL if NEVER)
     connector_info   VARCHAR,    -- Opaque JSON from connector (e.g., snapshot IDs, sketch types)
     cpu_time_ms      BIGINT,
     wall_time_ms     BIGINT,
@@ -1110,6 +1111,7 @@ SELECT
     COUNT(*) as query_count,
     COUNT(CASE WHEN stats_status = 'NEVER' THEN 1 END) as never_count,
     COUNT(CASE WHEN stats_status = 'STALE' THEN 1 END) as stale_count,
+    MAX(last_analyzed) as last_analyzed,  -- When was ANALYZE last run?
     AVG(estimation_error) as avg_error
 FROM system.runtime.join_column_metrics
 WHERE query_time > current_timestamp - INTERVAL '7' DAY
@@ -1118,13 +1120,13 @@ ORDER BY priority_score DESC
 LIMIT 20;
 
 -- Example output:
--- ┌─────────────────┬─────────────┬────────────────┬─────────────┬─────────────┬─────────────┬───────────┐
--- │ table_name      │ column_name │ priority_score │ query_count │ never_count │ stale_count │ avg_error │
--- ├─────────────────┼─────────────┼────────────────┼─────────────┼─────────────┼─────────────┼───────────┤
--- │ sales.lineitem  │ order_id    │ 45,678,901     │ 2,345       │ 2,345       │ 0           │ 12.8      │
--- │ sales.orders    │ customer_id │ 23,456,789     │ 1,234       │ 0           │ 1,234       │ 47.3      │
--- │ analytics.events│ user_id     │ 1,234,567      │ 567         │ 0           │ 0           │ 1.2       │
--- └─────────────────┴─────────────┴────────────────┴─────────────┴─────────────┴─────────────┴───────────┘
+-- ┌─────────────────┬─────────────┬────────────────┬─────────────┬─────────────┬─────────────┬──────────────────────┬───────────┐
+-- │ table_name      │ column_name │ priority_score │ query_count │ never_count │ stale_count │ last_analyzed        │ avg_error │
+-- ├─────────────────┼─────────────┼────────────────┼─────────────┼─────────────┼─────────────┼──────────────────────┼───────────┤
+-- │ sales.lineitem  │ order_id    │ 45,678,901     │ 2,345       │ 2,345       │ 0           │ NULL                 │ 12.8      │
+-- │ sales.orders    │ customer_id │ 23,456,789     │ 1,234       │ 0           │ 1,234       │ 2024-12-15 10:00:00  │ 47.3      │
+-- │ analytics.events│ user_id     │ 1,234,567      │ 567         │ 0           │ 0           │ 2024-12-28 14:30:00  │ 1.2       │
+-- └─────────────────┴─────────────┴────────────────┴─────────────┴─────────────┴─────────────┴──────────────────────┴───────────┘
 ```
 
 #### Auto-ANALYZE Integration
@@ -1247,6 +1249,10 @@ public class ColumnStatisticsMetadata {
 
     private final StatisticsStatus status;
 
+    // When ANALYZE was last run for this column (empty if NEVER)
+    // Typed field since it's universally useful across all connectors
+    private final Optional<Instant> lastAnalyzed;
+
     // Opaque connector-specific info, JSON-serialized by connector
     // Follows Puffin blob properties pattern: connector owns serialization
     private final Optional<String> connectorInfo;
@@ -1277,11 +1283,11 @@ The Iceberg connector serializes its specific metadata (snapshot IDs, available 
 
 ```java
 // Iceberg-specific info, JSON-serialized into connectorInfo
+// Note: lastAnalyzed is now a typed SPI field, not in connectorInfo
 @JsonSerialize
 public class IcebergStatisticsInfo {
     private final long statisticsSnapshotId;
     private final long currentSnapshotId;
-    private final long collectedAtMillis;
     private final Set<String> availableSketchTypes;  // e.g., {"theta", "frequency"}
 
     // This gets serialized to the opaque connectorInfo string
@@ -1303,7 +1309,8 @@ private ColumnStatisticsMetadata computeColumnMetadata(
     if (statsFile.isEmpty()) {
         return new ColumnStatisticsMetadata(
                 StatisticsStatus.NEVER,
-                Optional.empty());
+                Optional.empty(),    // lastAnalyzed
+                Optional.empty());   // connectorInfo
     }
 
     int columnId = column.getId();
@@ -1319,15 +1326,19 @@ private ColumnStatisticsMetadata computeColumnMetadata(
 
     if (availableTypes.isEmpty()) {
         return new ColumnStatisticsMetadata(
-                StatisticsStatus.NEVER, Optional.empty());
+                StatisticsStatus.NEVER,
+                Optional.empty(),
+                Optional.empty());
     }
 
-    // Build connector-specific info
+    // Get when ANALYZE was run (from statistics file's snapshot timestamp)
     Snapshot statsSnapshot = icebergTable.snapshot(statsFile.get().snapshotId());
+    Instant lastAnalyzed = Instant.ofEpochMilli(statsSnapshot.timestampMillis());
+
+    // Build connector-specific info (snapshot IDs for debugging)
     IcebergStatisticsInfo info = new IcebergStatisticsInfo(
             statsFile.get().snapshotId(),
             currentSnapshot.snapshotId(),
-            statsSnapshot.timestampMillis(),
             availableTypes);
 
     StatisticsStatus status;
@@ -1339,13 +1350,16 @@ private ColumnStatisticsMetadata computeColumnMetadata(
         status = StatisticsStatus.FRESH;
     }
 
-    return new ColumnStatisticsMetadata(status, Optional.of(info.toJson()));
+    return new ColumnStatisticsMetadata(
+            status,
+            Optional.of(lastAnalyzed),
+            Optional.of(info.toJson()));
 }
 ```
 
 **Query Logging (presto-main):**
 
-The query logger extracts the typed `StatisticsStatus` and logs the opaque `connectorInfo` as-is. Connectors own the interpretation of their info:
+The query logger extracts typed fields (`StatisticsStatus`, `lastAnalyzed`) and logs the opaque `connectorInfo` as-is:
 
 ```java
 // In JoinMetricsEventListener or similar
@@ -1359,20 +1373,26 @@ public void recordJoinMetrics(
         ColumnStatistics colStats = leftStats.getColumnStatistics()
                 .get(column.getHandle());
 
-        // Extract typed status from SPI - no connector-specific code needed
-        StatisticsStatus status = colStats.getMetadata()
+        Optional<ColumnStatisticsMetadata> metadata = colStats.getMetadata();
+
+        // Extract typed fields from SPI - no connector-specific code needed
+        StatisticsStatus status = metadata
                 .map(ColumnStatisticsMetadata::getStatus)
                 .orElse(StatisticsStatus.NEVER);
 
+        Optional<Instant> lastAnalyzed = metadata
+                .flatMap(ColumnStatisticsMetadata::getLastAnalyzed);
+
         // Opaque connector info logged as-is (for debugging/analysis)
-        Optional<String> connectorInfo = colStats.getMetadata()
+        Optional<String> connectorInfo = metadata
                 .flatMap(ColumnStatisticsMetadata::getConnectorInfo);
 
         emitMetric(JoinColumnMetric.builder()
                 .table(column.getTable())
                 .column(column.getName())
                 .statsStatus(status.name())
-                .connectorInfo(connectorInfo.orElse(null))  // Opaque string
+                .lastAnalyzed(lastAnalyzed.orElse(null))
+                .connectorInfo(connectorInfo.orElse(null))
                 .cpuTimeMs(runtimeStats.getCpuTime().toMillis())
                 .estimatedRows(joinNode.getEstimatedRows())
                 .actualRows(runtimeStats.getOutputPositions())
@@ -1381,10 +1401,10 @@ public void recordJoinMetrics(
 }
 ```
 
-**Advantage of opaque connectorInfo:**
-- SPI only defines what presto-main needs (`StatisticsStatus`)
-- Connector-specific details (snapshot IDs, sketch types) are encapsulated
-- No SPI changes when Iceberg adds more metadata
+**SPI design:**
+- **Typed fields** (`StatisticsStatus`, `lastAnalyzed`): Universally useful across all connectors
+- **Opaque field** (`connectorInfo`): Connector-specific details (snapshot IDs, sketch types)
+- No SPI changes when connectors add more metadata
 - Follows established Puffin blob properties pattern
 
 #### Option B: Use Existing ConfidenceLevel (Simpler, Less Granular)
@@ -1546,5 +1566,5 @@ Phase 2 should include:
 
 ---
 
-*Document Version: 0.8*
+*Document Version: 0.9*
 *Last Updated: January 2025*
