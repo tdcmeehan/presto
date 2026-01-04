@@ -5,7 +5,7 @@
 **Status**: Draft
 **Authors**: Tim Meehan
 **Date**: January 2025
-**Version**: 0.6
+**Version**: 0.7
 
 ---
 
@@ -1204,6 +1204,255 @@ public interface StatsStatusAwareProvider
 }
 ```
 
+### 11.11 Surfacing Connector-Specific Status Through SPI
+
+The statistics status (NEVER/PARTIAL/STALE/FRESH) requires connector-specific knowledge—Iceberg knows about Puffin files and blob types, but query logging happens in presto-main. Here's how to bridge this gap through the SPI layer.
+
+#### Challenge
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ presto-main (query logging)                                             │
+│   - Needs to record stats_status for join columns                       │
+│   - Connector-agnostic                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼ How?
+┌─────────────────────────────────────────────────────────────────────────┐
+│ presto-spi (connector interface)                                        │
+│   - TableStatistics, ColumnStatistics                                   │
+│   - Already has ConfidenceLevel (LOW, HIGH, FACT)                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ presto-iceberg (connector implementation)                               │
+│   - Knows about Puffin files, blob types, snapshot IDs                  │
+│   - Can determine NEVER/PARTIAL/STALE/FRESH                            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Option A: Extend ColumnStatistics with Metadata (Recommended)
+
+Add per-column statistics metadata to the existing SPI types:
+
+```java
+// New SPI class: presto-spi/.../statistics/ColumnStatisticsMetadata.java
+public class ColumnStatisticsMetadata {
+    public enum StatisticsStatus {
+        NEVER,      // No statistics collected for this column
+        PARTIAL,    // Some statistics exist but not all (e.g., NDV but no frequency)
+        STALE,      // Statistics exist but are outdated
+        FRESH       // Statistics are current
+    }
+
+    private final StatisticsStatus status;
+    private final Optional<Long> statisticsSnapshotId;  // For tracking which stats were used
+    private final Optional<Instant> collectedAt;        // When stats were collected
+    private final Set<String> availableSketchTypes;     // e.g., {"theta", "frequency"}
+
+    // Constructor, getters, builder...
+}
+
+// Extend ColumnStatistics to include metadata
+public final class ColumnStatistics {
+    // Existing fields...
+    private final Estimate nullsFraction;
+    private final Estimate distinctValuesCount;
+    private final Optional<ConnectorHistogram> histogram;
+
+    // NEW: Optional metadata about statistics quality
+    private final Optional<ColumnStatisticsMetadata> metadata;
+
+    @JsonProperty
+    public Optional<ColumnStatisticsMetadata> getMetadata() {
+        return metadata;
+    }
+}
+```
+
+**Iceberg Implementation:**
+
+```java
+// In TableStatisticsMaker.java - when building ColumnStatistics
+private ColumnStatistics buildColumnStatistics(
+        ConnectorSession session,
+        Table icebergTable,
+        Snapshot currentSnapshot,
+        IcebergColumnHandle column,
+        Optional<StatisticsFile> statsFile) {
+
+    ColumnStatistics.Builder builder = ColumnStatistics.builder();
+
+    // Existing logic for NDV, range, etc...
+    builder.setDistinctValuesCount(...);
+    builder.setRange(...);
+
+    // NEW: Compute and attach metadata
+    ColumnStatisticsMetadata metadata = computeColumnMetadata(
+            column, statsFile, currentSnapshot);
+    builder.setMetadata(Optional.of(metadata));
+
+    return builder.build();
+}
+
+private ColumnStatisticsMetadata computeColumnMetadata(
+        IcebergColumnHandle column,
+        Optional<StatisticsFile> statsFile,
+        Snapshot currentSnapshot) {
+
+    if (statsFile.isEmpty()) {
+        return new ColumnStatisticsMetadata(
+                StatisticsStatus.NEVER,
+                Optional.empty(),
+                Optional.empty(),
+                ImmutableSet.of());
+    }
+
+    int columnId = column.getId();
+    Set<String> availableTypes = new HashSet<>();
+
+    boolean hasTheta = hasBlobForColumn(statsFile.get(),
+            "apache-datasketches-theta-v1", columnId);
+    if (hasTheta) availableTypes.add("theta");
+
+    boolean hasFrequency = hasBlobForColumn(statsFile.get(),
+            "apache-datasketches-fi-longs-v1", columnId);
+    if (hasFrequency) availableTypes.add("frequency");
+
+    if (availableTypes.isEmpty()) {
+        return new ColumnStatisticsMetadata(
+                StatisticsStatus.NEVER, ...);
+    }
+
+    if (!hasTheta || !hasFrequency) {
+        return new ColumnStatisticsMetadata(
+                StatisticsStatus.PARTIAL, ...);
+    }
+
+    // Check staleness
+    Snapshot statsSnapshot = icebergTable.snapshot(statsFile.get().snapshotId());
+    if (isStale(statsSnapshot, currentSnapshot)) {
+        return new ColumnStatisticsMetadata(
+                StatisticsStatus.STALE,
+                Optional.of(statsFile.get().snapshotId()),
+                Optional.of(Instant.ofEpochMilli(statsSnapshot.timestampMillis())),
+                availableTypes);
+    }
+
+    return new ColumnStatisticsMetadata(
+            StatisticsStatus.FRESH, ...);
+}
+```
+
+**Query Logging (presto-main):**
+
+```java
+// In JoinRegretEventListener or similar
+public void recordJoinMetrics(
+        JoinNode joinNode,
+        TableStatistics leftStats,
+        TableStatistics rightStats,
+        OperatorStats runtimeStats) {
+
+    for (JoinColumn column : joinNode.getJoinColumns()) {
+        ColumnStatistics colStats = leftStats.getColumnStatistics()
+                .get(column.getHandle());
+
+        // Extract status from SPI - no connector-specific code needed
+        StatisticsStatus status = colStats.getMetadata()
+                .map(ColumnStatisticsMetadata::getStatus)
+                .orElse(StatisticsStatus.NEVER);
+
+        Optional<Long> statsSnapshotId = colStats.getMetadata()
+                .flatMap(ColumnStatisticsMetadata::getStatisticsSnapshotId);
+
+        emitMetric(JoinColumnMetric.builder()
+                .table(column.getTable())
+                .column(column.getName())
+                .statsStatus(status.name())
+                .statsSnapshotId(statsSnapshotId.orElse(null))
+                .cpuTimeMs(runtimeStats.getCpuTime().toMillis())
+                .estimatedRows(joinNode.getEstimatedRows())
+                .actualRows(runtimeStats.getOutputPositions())
+                .build());
+    }
+}
+```
+
+#### Option B: Use Existing ConfidenceLevel (Simpler, Less Granular)
+
+Map statistics status to existing `ConfidenceLevel`:
+
+| Status | ConfidenceLevel | Meaning |
+|--------|-----------------|---------|
+| NEVER | LOW | No reliable statistics |
+| PARTIAL | LOW | Some stats missing |
+| STALE | HIGH | Stats exist but may be outdated |
+| FRESH | FACT | Stats are current and trustworthy |
+
+```java
+// Iceberg sets confidence based on statistics status
+TableStatistics.Builder builder = TableStatistics.builder();
+if (statsFile.isEmpty()) {
+    builder.setConfidenceLevel(ConfidenceLevel.LOW);
+} else if (isStale(statsFile)) {
+    builder.setConfidenceLevel(ConfidenceLevel.HIGH);
+} else {
+    builder.setConfidenceLevel(ConfidenceLevel.FACT);
+}
+```
+
+**Limitations:**
+- No per-column granularity (table-level only)
+- Can't distinguish NEVER vs PARTIAL
+- Can't include snapshot IDs
+
+#### Option C: New SPI Method for Statistics Metadata
+
+Add a dedicated method to `ConnectorMetadata`:
+
+```java
+// In ConnectorMetadata.java
+default Map<ColumnHandle, ColumnStatisticsMetadata> getColumnStatisticsMetadata(
+        ConnectorSession session,
+        ConnectorTableHandle tableHandle,
+        List<ColumnHandle> columnHandles) {
+    // Default: no metadata available
+    return ImmutableMap.of();
+}
+```
+
+**Advantages:**
+- No changes to existing `TableStatistics`/`ColumnStatistics`
+- Explicit opt-in for connectors that support it
+- Can be called separately from `getTableStatistics()`
+
+**Disadvantages:**
+- Two round-trips to connector (stats + metadata)
+- Metadata may become inconsistent with stats
+
+#### Recommendation: Option A
+
+Option A (extending `ColumnStatistics`) is recommended because:
+
+1. **Atomic**: Stats and metadata are returned together, always consistent
+2. **Per-column**: Each column can have different status (FRESH for `id`, STALE for `name`)
+3. **Extensible**: `ColumnStatisticsMetadata` can grow with new fields
+4. **Backward compatible**: `Optional<ColumnStatisticsMetadata>` defaults to empty
+5. **Connector-agnostic**: presto-main works with any connector that populates metadata
+
+#### Implementation Checklist for Option A
+
+Phase 2 should include:
+
+- [ ] Add `ColumnStatisticsMetadata` class to presto-spi
+- [ ] Add `Optional<ColumnStatisticsMetadata> metadata` field to `ColumnStatistics`
+- [ ] Implement `computeColumnMetadata()` in Iceberg's `TableStatisticsMaker`
+- [ ] Update `getTableStatistics()` to populate metadata for each column
+- [ ] Update query event listener to extract status from `ColumnStatistics.getMetadata()`
+- [ ] Emit status to `system.runtime.join_column_metrics` system table
+
 ---
 
 ## 12. Implementation Phases
@@ -1216,11 +1465,12 @@ public interface StatsStatusAwareProvider
 - [ ] Wire frequency sketch into ANALYZE
 
 ### Phase 2: Stateless Query Analysis
-- [ ] Implement `JoinColumnStatsStatus` to determine NEVER/PARTIAL/STALE/FRESH at query time
+- [ ] Add `ColumnStatisticsMetadata` class to presto-spi with `StatisticsStatus` enum
+- [ ] Extend `ColumnStatistics` with `Optional<ColumnStatisticsMetadata> metadata`
+- [ ] Implement `computeColumnMetadata()` in Iceberg's `TableStatisticsMaker`
 - [ ] Create `system.runtime.join_column_metrics` system table with status field
 - [ ] Emit join column metrics at query completion (status, cpu_time, estimation_error)
 - [ ] Implement stateless priority calculation: `Σ(cpu_time × status_weight)`
-- [ ] No regret accumulation needed - status is self-correcting
 
 ### Phase 3: Optimizer Integration
 - [ ] Fetch sketches in optimizer rules
@@ -1289,5 +1539,5 @@ public interface StatsStatusAwareProvider
 
 ---
 
-*Document Version: 0.6*
+*Document Version: 0.7*
 *Last Updated: January 2025*
