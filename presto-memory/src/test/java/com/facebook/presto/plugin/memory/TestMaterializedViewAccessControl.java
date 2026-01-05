@@ -27,11 +27,13 @@ import java.util.Optional;
 
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.CREATE_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.CREATE_VIEW;
+import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.CREATE_VIEW_WITH_SELECT_COLUMNS;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.DELETE_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.DROP_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.DROP_VIEW;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.INSERT_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.SELECT_COLUMN;
+import static com.facebook.presto.testing.TestingAccessControlManager.TestingPrivilegeType.SHOW_CREATE_TABLE;
 import static com.facebook.presto.testing.TestingAccessControlManager.privilege;
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
 import static org.testng.Assert.assertTrue;
@@ -661,6 +663,327 @@ public class TestMaterializedViewAccessControl
 
             assertUpdate("DROP MATERIALIZED VIEW alice_mv");
             assertUpdate("DROP TABLE sensitive_data");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testShowCreateMaterializedViewAccessDenied()
+    {
+        // Test that SHOW CREATE MATERIALIZED VIEW can be denied with SHOW_CREATE_TABLE privilege
+        // This mirrors the regular view test in AbstractTestDistributedQueries.testViewAccessControl()
+        Session adminSession = createSessionForUser("admin");
+        Session restrictedSession = createSessionForUser("restricted_user");
+
+        assertUpdate(adminSession, "CREATE TABLE show_create_base (id BIGINT, value VARCHAR)");
+        assertUpdate(adminSession, "INSERT INTO show_create_base VALUES (1, 'test')", 1);
+
+        try {
+            assertUpdate(adminSession,
+                    "CREATE MATERIALIZED VIEW mv_show_create_test SECURITY DEFINER AS " +
+                    "SELECT id, value FROM show_create_base");
+
+            // Admin can show create
+            String showCreate = (String) computeScalar(adminSession, "SHOW CREATE MATERIALIZED VIEW mv_show_create_test");
+            assertTrue(showCreate.contains("mv_show_create_test"));
+
+            // Deny SHOW_CREATE_TABLE for restricted user on the MV
+            getQueryRunner().getAccessControl().deny(privilege("restricted_user", "mv_show_create_test", SHOW_CREATE_TABLE));
+
+            // Restricted user should be denied
+            assertQueryFails(restrictedSession,
+                    "SHOW CREATE MATERIALIZED VIEW mv_show_create_test",
+                    ".*Cannot show create table.*mv_show_create_test.*");
+
+            assertUpdate(adminSession, "DROP MATERIALIZED VIEW mv_show_create_test");
+            assertUpdate(adminSession, "DROP TABLE show_create_base");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testCreateMaterializedViewRequiresViewWithSelectColumnsPrivilege()
+    {
+        // Test that MV creation requires CREATE_VIEW_WITH_SELECT_COLUMNS privilege on the base table
+        // This mirrors the regular view test in AbstractTestDistributedQueries.testViewAccessControl()
+        Session viewOwnerSession = createSessionForUser("view_owner");
+
+        assertUpdate("CREATE TABLE view_select_base (id BIGINT, secret VARCHAR, value BIGINT)");
+        assertUpdate("INSERT INTO view_select_base VALUES (1, 'confidential', 100), (2, 'classified', 200)", 2);
+
+        try {
+            // Deny CREATE_VIEW_WITH_SELECT_COLUMNS for view_owner on the base table
+            getQueryRunner().getAccessControl().deny(privilege("view_owner", "view_select_base", CREATE_VIEW_WITH_SELECT_COLUMNS));
+
+            // MV creation should succeed (permissions are checked at query time, not creation time)
+            assertUpdate(viewOwnerSession,
+                    "CREATE MATERIALIZED VIEW mv_view_select_test SECURITY DEFINER AS " +
+                    "SELECT id, secret, value FROM view_select_base");
+
+            // Refresh should succeed (definer's permissions are not checked via CREATE_VIEW_WITH_SELECT_COLUMNS for refresh)
+            assertUpdate(viewOwnerSession, "REFRESH MATERIALIZED VIEW mv_view_select_test", 2);
+
+            // Query should fail because view owner lacks CREATE_VIEW_WITH_SELECT_COLUMNS
+            assertQueryFails(viewOwnerSession, "SELECT COUNT(*) FROM mv_view_select_test",
+                    ".*View owner 'view_owner' cannot create view that selects from.*view_select_base.*");
+
+            // Another user should also fail for the same reason
+            Session otherSession = createSessionForUser("other_user");
+            assertQueryFails(otherSession, "SELECT COUNT(*) FROM mv_view_select_test",
+                    ".*View owner 'view_owner' cannot create view that selects from.*view_select_base.*");
+
+            assertUpdate(viewOwnerSession, "DROP MATERIALIZED VIEW mv_view_select_test");
+            assertUpdate("DROP TABLE view_select_base");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testMvOwnerCanQueryWithoutCreateViewWithSelectColumnsPrivilege()
+    {
+        // Test that the MV owner can query their own MV even without CREATE_VIEW_WITH_SELECT_COLUMNS
+        // on the base table (for SECURITY DEFINER MVs)
+        // This mirrors AbstractTestDistributedQueries.testViewAccessControl() lines 1291-1294
+        Session mvOwnerSession = createSessionForUser("mv_owner");
+        Session otherSession = createSessionForUser("other_user");
+
+        assertUpdate("CREATE TABLE owner_query_base (id BIGINT, value VARCHAR)");
+        assertUpdate("INSERT INTO owner_query_base VALUES (1, 'test1'), (2, 'test2')", 2);
+
+        try {
+            // Create MV as mv_owner
+            assertUpdate(mvOwnerSession,
+                    "CREATE MATERIALIZED VIEW mv_owner_query SECURITY DEFINER AS " +
+                    "SELECT id, value FROM owner_query_base");
+
+            assertUpdate(mvOwnerSession, "REFRESH MATERIALIZED VIEW mv_owner_query", 2);
+
+            // Deny CREATE_VIEW_WITH_SELECT_COLUMNS for mv_owner (after creation)
+            getQueryRunner().getAccessControl().deny(privilege("mv_owner", "owner_query_base", CREATE_VIEW_WITH_SELECT_COLUMNS));
+
+            // MV owner should still be able to query their own MV
+            assertQuery(mvOwnerSession, "SELECT COUNT(*) FROM mv_owner_query", "SELECT 2");
+
+            // Other users should NOT be able to query (owner lacks CREATE_VIEW_WITH_SELECT_COLUMNS)
+            assertQueryFails(otherSession, "SELECT COUNT(*) FROM mv_owner_query",
+                    ".*View owner 'mv_owner' cannot create view that selects from.*owner_query_base.*");
+
+            assertUpdate(mvOwnerSession, "DROP MATERIALIZED VIEW mv_owner_query");
+            assertUpdate("DROP TABLE owner_query_base");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testSessionUserDoesNotNeedSelectOnBaseTableForDefinerMv()
+    {
+        // Test that session user doesn't need SELECT or CREATE_VIEW_WITH_SELECT_COLUMNS
+        // on underlying table for SECURITY DEFINER MVs
+        // This mirrors AbstractTestDistributedQueries.testViewAccessControl() lines 1297-1302
+        Session mvOwnerSession = createSessionForUser("mv_owner");
+        Session queryingSession = createSessionForUser("querying_user");
+
+        assertUpdate("CREATE TABLE session_user_base (id BIGINT, secret VARCHAR)");
+        assertUpdate("INSERT INTO session_user_base VALUES (1, 'secret1'), (2, 'secret2')", 2);
+
+        try {
+            // Create SECURITY DEFINER MV
+            assertUpdate(mvOwnerSession,
+                    "CREATE MATERIALIZED VIEW mv_session_user SECURITY DEFINER AS " +
+                    "SELECT id, secret FROM session_user_base");
+
+            assertUpdate(mvOwnerSession, "REFRESH MATERIALIZED VIEW mv_session_user", 2);
+
+            // Deny SELECT and CREATE_VIEW_WITH_SELECT_COLUMNS for the querying user on base table
+            getQueryRunner().getAccessControl().deny(privilege("querying_user", "session_user_base", SELECT_COLUMN));
+            getQueryRunner().getAccessControl().deny(privilege("querying_user", "session_user_base", CREATE_VIEW_WITH_SELECT_COLUMNS));
+
+            // Querying user should still be able to query the DEFINER MV
+            assertQuery(queryingSession, "SELECT COUNT(*) FROM mv_session_user", "SELECT 2");
+            assertQuery(queryingSession, "SELECT id, secret FROM mv_session_user ORDER BY id",
+                    "VALUES (1, 'secret1'), (2, 'secret2')");
+
+            assertUpdate(mvOwnerSession, "DROP MATERIALIZED VIEW mv_session_user");
+            assertUpdate("DROP TABLE session_user_base");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testNestedMaterializedViewsWithDifferentOwners()
+    {
+        // Test nested MVs where outer MV selects from inner MV with different owners
+        // This mirrors AbstractTestDistributedQueries.testViewAccessControl() lines 1304-1328
+        Session innerOwnerSession = createSessionForUser("inner_owner");
+        Session outerOwnerSession = createSessionForUser("outer_owner");
+        Session queryingSession = createSessionForUser("querying_user");
+
+        assertUpdate("CREATE TABLE nested_mv_base (id BIGINT, value VARCHAR)");
+        assertUpdate("INSERT INTO nested_mv_base VALUES (1, 'a'), (2, 'b'), (3, 'c')", 3);
+
+        try {
+            // Inner MV created by inner_owner
+            assertUpdate(innerOwnerSession,
+                    "CREATE MATERIALIZED VIEW mv_inner SECURITY DEFINER AS " +
+                    "SELECT id, value FROM nested_mv_base");
+            assertUpdate(innerOwnerSession, "REFRESH MATERIALIZED VIEW mv_inner", 3);
+
+            // Outer MV created by outer_owner that selects from inner MV
+            assertUpdate(outerOwnerSession,
+                    "CREATE MATERIALIZED VIEW mv_outer SECURITY DEFINER AS " +
+                    "SELECT id, value FROM mv_inner");
+            assertUpdate(outerOwnerSession, "REFRESH MATERIALIZED VIEW mv_outer", 3);
+
+            // Verify querying the outer MV works
+            assertQuery(queryingSession, "SELECT COUNT(*) FROM mv_outer", "SELECT 3");
+
+            // Deny CREATE_VIEW_WITH_SELECT_COLUMNS for outer_owner on the inner MV
+            getQueryRunner().getAccessControl().deny(privilege("outer_owner", "mv_inner", CREATE_VIEW_WITH_SELECT_COLUMNS));
+
+            // Querying the outer MV should fail because outer_owner can't create view on inner MV
+            assertQueryFails(queryingSession, "SELECT COUNT(*) FROM mv_outer",
+                    ".*View owner 'outer_owner' cannot create view that selects from.*mv_inner.*");
+
+            // Outer owner should still be able to query (they're the owner)
+            assertQuery(outerOwnerSession, "SELECT COUNT(*) FROM mv_outer", "SELECT 3");
+
+            assertUpdate(outerOwnerSession, "DROP MATERIALIZED VIEW mv_outer");
+            assertUpdate(innerOwnerSession, "DROP MATERIALIZED VIEW mv_inner");
+            assertUpdate("DROP TABLE nested_mv_base");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testNestedMvDefinerOuterInvokerInner()
+    {
+        // Test nested MV where outer has SECURITY DEFINER and inner has SECURITY INVOKER
+        // This tests a different combination than testNestedViewsWithDifferentSecurityModes
+        Session adminSession = createSessionForUser("admin");
+        Session restrictedSession = createSessionForUser("restricted_user");
+
+        assertUpdate(adminSession, "CREATE TABLE nested_definer_invoker_base (id BIGINT, data VARCHAR)");
+        assertUpdate(adminSession, "INSERT INTO nested_definer_invoker_base VALUES (1, 'd1'), (2, 'd2')", 2);
+
+        try {
+            // Inner MV with SECURITY INVOKER
+            assertUpdate(adminSession,
+                    "CREATE MATERIALIZED VIEW mv_inner_invoker SECURITY INVOKER AS " +
+                    "SELECT id, data FROM nested_definer_invoker_base");
+            assertUpdate(adminSession, "REFRESH MATERIALIZED VIEW mv_inner_invoker", 2);
+
+            // Outer MV with SECURITY DEFINER that selects from inner INVOKER MV
+            assertUpdate(adminSession,
+                    "CREATE MATERIALIZED VIEW mv_outer_definer SECURITY DEFINER AS " +
+                    "SELECT id, data FROM mv_inner_invoker");
+            assertUpdate(adminSession, "REFRESH MATERIALIZED VIEW mv_outer_definer", 2);
+
+            // Deny restricted_user access to the base table
+            getQueryRunner().getAccessControl().deny(privilege("restricted_user", "nested_definer_invoker_base", SELECT_COLUMN));
+
+            // With DEFINER outer MV, restricted_user should be able to query
+            // because the outer MV runs as admin who has access
+            assertQuery(restrictedSession, "SELECT COUNT(*) FROM mv_outer_definer", "SELECT 2");
+
+            // But restricted_user cannot query the inner INVOKER MV directly
+            assertQueryFails(restrictedSession, "SELECT COUNT(*) FROM mv_inner_invoker",
+                    ".*Access Denied.*nested_definer_invoker_base.*");
+
+            assertUpdate(adminSession, "DROP MATERIALIZED VIEW mv_outer_definer");
+            assertUpdate(adminSession, "DROP MATERIALIZED VIEW mv_inner_invoker");
+            assertUpdate(adminSession, "DROP TABLE nested_definer_invoker_base");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testNestedMvInvokerOuterDefinerInner()
+    {
+        // Test nested MV where outer has SECURITY INVOKER and inner has SECURITY DEFINER
+        // (complement to testNestedMvDefinerOuterInvokerInner)
+        Session adminSession = createSessionForUser("admin");
+        Session restrictedSession = createSessionForUser("restricted_user");
+
+        assertUpdate(adminSession, "CREATE TABLE nested_invoker_definer_base (id BIGINT, data VARCHAR)");
+        assertUpdate(adminSession, "INSERT INTO nested_invoker_definer_base VALUES (1, 'd1'), (2, 'd2')", 2);
+
+        try {
+            // Inner MV with SECURITY DEFINER
+            assertUpdate(adminSession,
+                    "CREATE MATERIALIZED VIEW mv_inner_definer SECURITY DEFINER AS " +
+                    "SELECT id, data FROM nested_invoker_definer_base");
+            assertUpdate(adminSession, "REFRESH MATERIALIZED VIEW mv_inner_definer", 2);
+
+            // Outer MV with SECURITY INVOKER that selects from inner DEFINER MV
+            assertUpdate(adminSession,
+                    "CREATE MATERIALIZED VIEW mv_outer_invoker SECURITY INVOKER AS " +
+                    "SELECT id, data FROM mv_inner_definer");
+            assertUpdate(adminSession, "REFRESH MATERIALIZED VIEW mv_outer_invoker", 2);
+
+            // Deny restricted_user access to the base table
+            getQueryRunner().getAccessControl().deny(privilege("restricted_user", "nested_invoker_definer_base", SELECT_COLUMN));
+
+            // With INVOKER outer MV, restricted_user should still be able to query
+            // because the inner DEFINER MV provides access to the base table data
+            assertQuery(restrictedSession, "SELECT COUNT(*) FROM mv_outer_invoker", "SELECT 2");
+
+            // And restricted_user can also query the inner DEFINER MV directly
+            assertQuery(restrictedSession, "SELECT COUNT(*) FROM mv_inner_definer", "SELECT 2");
+
+            assertUpdate(adminSession, "DROP MATERIALIZED VIEW mv_outer_invoker");
+            assertUpdate(adminSession, "DROP MATERIALIZED VIEW mv_inner_definer");
+            assertUpdate(adminSession, "DROP TABLE nested_invoker_definer_base");
+        }
+        finally {
+            getQueryRunner().getAccessControl().reset();
+        }
+    }
+
+    @Test
+    public void testColumnLevelAccessControlWithSecurityInvoker()
+    {
+        // Test column-level access control with SECURITY INVOKER
+        // Invoker should need access to specific columns being queried
+        Session adminSession = createSessionForUser("admin");
+        Session restrictedSession = createSessionForUser("restricted_user");
+
+        assertUpdate(adminSession, "CREATE TABLE column_level_base (id BIGINT, public_col VARCHAR, secret_col VARCHAR)");
+        assertUpdate(adminSession, "INSERT INTO column_level_base VALUES (1, 'public1', 'secret1'), (2, 'public2', 'secret2')", 2);
+
+        try {
+            // Create INVOKER MV selecting all columns
+            assertUpdate(adminSession,
+                    "CREATE MATERIALIZED VIEW mv_column_level SECURITY INVOKER AS " +
+                    "SELECT id, public_col, secret_col FROM column_level_base");
+            assertUpdate(adminSession, "REFRESH MATERIALIZED VIEW mv_column_level", 2);
+
+            // Admin can query all columns
+            assertQuery(adminSession, "SELECT id, public_col, secret_col FROM mv_column_level WHERE id = 1",
+                    "VALUES (1, 'public1', 'secret1')");
+
+            // Deny restricted_user access to column_level_base entirely
+            getQueryRunner().getAccessControl().deny(privilege("restricted_user", "column_level_base", SELECT_COLUMN));
+
+            // Restricted user should be denied access to the INVOKER MV
+            assertQueryFails(restrictedSession, "SELECT id FROM mv_column_level",
+                    ".*Access Denied.*column_level_base.*");
+
+            assertUpdate(adminSession, "DROP MATERIALIZED VIEW mv_column_level");
+            assertUpdate(adminSession, "DROP TABLE column_level_base");
         }
         finally {
             getQueryRunner().getAccessControl().reset();
