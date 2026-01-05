@@ -62,184 +62,117 @@ snapshot, but HBO may override them with potentially stale historical estimates.
 
 ## Design
 
-### Two-Level Matching with Connector-Driven Selection
+### Core Principles
 
-#### Phase 1: Version-Agnostic Lookup
-
-Compute a version-agnostic hash that excludes the table version from the plan canonical form:
-
-```
-Original hash: hash(plan_structure + table_id + snapshot_id + predicates)
-Version-agnostic hash: hash(plan_structure + table_id + predicates)
-```
-
-This allows retrieving all historical statistics entries across multiple table versions with
-a single lookup.
-
-#### Phase 2: Connector-Driven Selection
-
-The engine passes ALL candidates to the connector. The connector owns all validation logic:
-
-- Version/ancestry validation (is this an ancestor snapshot?)
-- Drift checking (has data changed too much?)
-- Branch awareness (reject stats from different branches)
-- Tag handling (reject stats for old tagged versions querying recent data)
-- Compensation calculation (adjust stats based on row count changes)
-
-The engine does NOT pre-filter candidates. This consolidates all drift/version logic in one place.
+1. **HBO for current snapshot only** - Time-travel queries skip HBO entirely
+2. **Version-agnostic hashing** - Remove snapshot ID from plan hash for better hit rate
+3. **Manifest stats for TableScan** - Use FACT confidence so connector stats win
 
 ### SPI Changes
 
-#### ConnectorMetadata Extension
+Two simple methods added to `ConnectorMetadata`:
 
 ```java
-/**
- * Select the best historical statistics match for the current table version.
- * Connector handles all version semantics (ancestry, drift, branches, tags).
- *
- * The engine passes ALL candidates from version-agnostic lookup without
- * pre-filtering. The connector owns all validation and drift checking.
- *
- * @param session The current session
- * @param tableHandle The table handle for the current query (includes current version)
- * @param candidates All historical statistics entries from version-agnostic lookup
- * @return Best match with optional compensation, or empty if none suitable
- */
-default Optional<HistoricalStatisticsMatch> selectHistoricalStatistics(
-    ConnectorSession session,
-    ConnectorTableHandle tableHandle,
-    List<HistoricalStatisticsEntry> candidates)
-{
-    // Default: exact match only (preserves current behavior for non-versioned connectors)
-    return candidates.stream()
-        .filter(e -> e.getTableHandle().equals(tableHandle))
-        .findFirst()
-        .map(e -> new HistoricalStatisticsMatch(e, Optional.empty()));
-}
+interface ConnectorMetadata {
 
-/**
- * Returns a version-agnostic identifier for the table, used for HBO hash computation.
- * Two handles for the same table at different versions should return equal identifiers.
- *
- * @param tableHandle The table handle (may include version info)
- * @return Identifier excluding version, or the handle itself if not versioned
- */
-default Object getTableIdentifier(ConnectorTableHandle tableHandle)
-{
-    return tableHandle;  // Default: use full handle (current behavior)
-}
-```
+    /**
+     * Returns a version-agnostic identifier for the table, used for HBO hash computation.
+     * Two handles for the same table at different versions should return equal identifiers.
+     *
+     * This enables HBO hits across snapshot changes for current-snapshot queries.
+     *
+     * @param tableHandle The table handle (may include version info)
+     * @return Identifier excluding version, or the handle itself if not versioned
+     */
+    default Object getTableIdentifier(ConnectorTableHandle tableHandle) {
+        return tableHandle;  // Default: use full handle (current behavior)
+    }
 
-#### Supporting Classes
-
-```java
-/**
- * An entry from HBO storage representing statistics captured at a specific table version.
- */
-public class HistoricalStatisticsEntry {
-    private final ConnectorTableHandle tableHandle;  // Includes version info
-    private final PlanStatistics statistics;
-
-    public ConnectorTableHandle getTableHandle() { return tableHandle; }
-    public PlanStatistics getStatistics() { return statistics; }
-}
-
-/**
- * Result of connector's historical statistics selection.
- */
-public class HistoricalStatisticsMatch {
-    private final HistoricalStatisticsEntry entry;
-    private final Optional<Double> rowCountCompensation;  // e.g., 1.15 for 15% more rows
-
-    public HistoricalStatisticsEntry getEntry() { return entry; }
-    public Optional<Double> getRowCountCompensation() { return rowCountCompensation; }
+    /**
+     * Returns true if the table handle refers to the current/latest version.
+     *
+     * HBO only persists and retrieves statistics for current-version queries.
+     * Time-travel queries (explicit snapshot, tag, timestamp) skip HBO and
+     * rely on connector-provided statistics instead.
+     *
+     * @param tableHandle The table handle to check
+     * @return true if this is the current version, false for time-travel queries
+     */
+    default boolean isCurrentVersion(ConnectorTableHandle tableHandle) {
+        return true;  // Default: assume current (non-versioned connectors)
+    }
 }
 ```
 
 ### Engine Flow
 
 ```
-1. CANONICALIZATION
+1. CHECK VERSION
+   - Call connector.isCurrentVersion(handle) for each table
+   - If ANY table is not current version → skip HBO entirely for this query
+
+2. CANONICALIZATION (if current version)
    - Call connector.getTableIdentifier(handle) for each table
    - Iceberg returns table UUID (excludes snapshot ID)
    - Build canonical plan hash using version-agnostic identifiers
 
-2. HBO LOOKUP
+3. HBO LOOKUP
    - Query HBO store with version-agnostic hash
-   - Returns List<HistoricalStatisticsEntry> (all versions)
+   - Hit rate improved: snapshot_100 and snapshot_101 share same hash
 
-3. CONNECTOR SELECTION
-   - Call connector.selectHistoricalStatistics(currentHandle, allCandidates)
-   - Connector validates ancestry, drift, branches, tags
-   - Connector returns best match or empty
+4. HBO WRITE (after query execution)
+   - Only if isCurrentVersion() was true
+   - Persist stats with version-agnostic hash
+   - Overwrites previous entry (no accumulation needed)
+```
 
-4. APPLY STATISTICS
-   - If match returned, use stats with optional compensation
-   - If empty, no HBO stats for this node (fall back to connector stats)
+### Example Flow
+
+```
+Day 1: Query on snapshot_100 (latest)
+  ├─ isCurrentVersion() → true
+  ├─ Hash: hash(plan + table_uuid)     ← no snapshot ID
+  ├─ HBO lookup: MISS
+  ├─ Execute query
+  └─ HBO write: persist stats
+
+Day 2: Query on snapshot_101 (latest)
+  ├─ isCurrentVersion() → true
+  ├─ Hash: hash(plan + table_uuid)     ← same hash!
+  ├─ HBO lookup: HIT (day 1 stats)
+  ├─ Execute query
+  └─ HBO write: update stats
+
+Day 2: Time-travel query FOR VERSION AS OF 'snapshot_100'
+  ├─ isCurrentVersion() → false
+  ├─ HBO: skipped entirely
+  └─ Uses manifest stats (FACT confidence)
 ```
 
 ### Iceberg Implementation
 
 ```java
 @Override
-public Object getTableIdentifier(ConnectorTableHandle tableHandle)
-{
+public Object getTableIdentifier(ConnectorTableHandle tableHandle) {
     IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
     // Return identifier without snapshot - table UUID or schema.table path
     return handle.getSchemaTableName();
 }
 
 @Override
-public Optional<HistoricalStatisticsMatch> selectHistoricalStatistics(
-    ConnectorSession session,
-    ConnectorTableHandle tableHandle,
-    List<HistoricalStatisticsEntry> candidates)
-{
-    IcebergTableHandle current = (IcebergTableHandle) tableHandle;
-    long currentSnapshotId = current.getSnapshotId().orElse(-1);
+public boolean isCurrentVersion(ConnectorTableHandle tableHandle) {
+    IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
 
-    Table table = loadTable(current);
-    Snapshot currentSnapshot = table.snapshot(currentSnapshotId);
-
-    // Build ancestor set for current snapshot
-    Set<Long> ancestorIds = new HashSet<>();
-    for (Snapshot s = currentSnapshot; s != null;
-         s = s.parentId() != null ? table.snapshot(s.parentId()) : null) {
-        ancestorIds.add(s.snapshotId());
+    // No explicit snapshot = querying current
+    if (handle.getSnapshotId().isEmpty()) {
+        return true;
     }
 
-    // Find best ancestor match
-    return candidates.stream()
-        .filter(e -> {
-            IcebergTableHandle h = (IcebergTableHandle) e.getTableHandle();
-            long snapshotId = h.getSnapshotId().orElse(-1);
-            // Only accept ancestors (handles branches, old tags correctly)
-            return ancestorIds.contains(snapshotId);
-        })
-        .min(Comparator.comparingLong(e -> {
-            // Prefer closest ancestor by snapshot distance
-            IcebergTableHandle h = (IcebergTableHandle) e.getTableHandle();
-            return snapshotDistance(table, currentSnapshotId, h.getSnapshotId().orElse(-1));
-        }))
-        .map(matched -> {
-            // Compute compensation from manifest row counts
-            double compensation = computeRowCountCompensation(
-                table,
-                ((IcebergTableHandle) matched.getTableHandle()).getSnapshotId().orElse(-1),
-                currentSnapshotId);
-            return new HistoricalStatisticsMatch(matched, Optional.of(compensation));
-        });
-}
-
-private double computeRowCountCompensation(Table table, long fromSnapshot, long toSnapshot)
-{
-    Snapshot from = table.snapshot(fromSnapshot);
-    Snapshot to = table.snapshot(toSnapshot);
-
-    long fromRows = Long.parseLong(from.summary().get("total-records"));
-    long toRows = Long.parseLong(to.summary().get("total-records"));
-
-    return (double) toRows / fromRows;
+    // Explicit snapshot - check if it matches current
+    Table table = loadTable(handle);
+    Snapshot current = table.currentSnapshot();
+    return current != null
+        && current.snapshotId() == handle.getSnapshotId().get();
 }
 ```
 
@@ -337,22 +270,22 @@ PlanStatistics {
 
 ### Non-Versioned Connectors (Hive, etc.)
 
-- `selectHistoricalStatistics()` default returns exact match only
-- `getTableIdentifier()` default returns full handle
+- `getTableIdentifier()` default returns full handle (current behavior)
+- `isCurrentVersion()` default returns true (HBO always enabled)
 - Behavior identical to current implementation
 - No changes required
 
 ### Versioned Connectors (Iceberg, Delta, Hudi)
 
-- Opt-in by implementing both methods
-- Connector owns all version semantics
-- Can be as simple or sophisticated as needed
+- Implement `getTableIdentifier()` to exclude version from hash
+- Implement `isCurrentVersion()` to detect time-travel queries
+- HBO automatically works better with no other changes
 
 ### Migration
 
 - Existing HBO statistics remain valid
-- Version-agnostic hashes are new keys; old versioned hashes still work
-- Gradual adoption as connectors implement the new interface
+- New version-agnostic hashes will gradually replace old entries
+- No explicit migration needed
 
 ## Implementation Plan
 
@@ -364,27 +297,16 @@ PlanStatistics {
 
 ### Phase 2: SPI Extension
 
-1. Add `HistoricalStatisticsEntry` and `HistoricalStatisticsMatch` to SPI
-2. Add `selectHistoricalStatistics()` and `getTableIdentifier()` to `ConnectorMetadata`
-3. Update HBO to compute version-agnostic hashes using `getTableIdentifier()`
-4. Update HBO lookup to pass all candidates to connector
-5. Remove engine-side row count similarity check when connector implements selection
+1. Add `getTableIdentifier()` to `ConnectorMetadata` with default implementation
+2. Add `isCurrentVersion()` to `ConnectorMetadata` with default implementation
+3. Update HBO canonicalization to use `getTableIdentifier()`
+4. Update HBO read/write to check `isCurrentVersion()`
 
 ### Phase 3: Iceberg Implementation
 
-1. Implement `getTableIdentifier()` - return table UUID/path without snapshot
-2. Implement `selectHistoricalStatistics()`:
-   - Build ancestor chain from current snapshot
-   - Filter candidates to ancestors only
-   - Rank by snapshot distance
-   - Compute row count compensation
-3. Add unit tests for branch and tag scenarios
-
-### Phase 4: Observability
-
-1. Add metrics for match types (exact, ancestor, none)
-2. Add metrics for compensation factors applied
-3. Add debug logging for troubleshooting
+1. Implement `getTableIdentifier()` - return schema.table (no snapshot)
+2. Implement `isCurrentVersion()` - check if snapshot matches current
+3. Add unit tests for time-travel scenarios
 
 ## Metrics and Observability
 
@@ -392,21 +314,35 @@ PlanStatistics {
 
 | Metric | Description |
 |--------|-------------|
-| `hbo.version_match.exact` | Count of exact version matches |
-| `hbo.version_match.ancestor` | Count of ancestor version matches |
-| `hbo.version_match.none` | Count of no matches (connector returned empty) |
-| `hbo.compensation.factor` | Distribution of compensation factors applied |
+| `hbo.skipped.time_travel` | Count of queries skipping HBO due to time-travel |
+| `hbo.hit.cross_version` | Count of HBO hits where stats came from different snapshot |
 | `hbo.confidence.override` | Count of connector stats overriding HBO |
 
 ### Logging
 
 ```
-DEBUG: HBO statistics selection for table iceberg.db.events:
-  Current snapshot: 102
-  Candidates: [snapshot_100, snapshot_95, snapshot_80]
-  Selected: snapshot_100 (ancestor, distance=2)
-  Compensation: rowCount *= 1.15
+DEBUG: HBO for table iceberg.db.events:
+  isCurrentVersion: true
+  tableIdentifier: iceberg.db.events (version-agnostic)
+  HBO lookup: HIT
+
+DEBUG: HBO skipped for table iceberg.db.events:
+  isCurrentVersion: false (time-travel query)
+  Using connector stats (FACT confidence)
 ```
+
+## Summary
+
+This design achieves version-aware HBO with minimal changes:
+
+| Aspect | Approach |
+|--------|----------|
+| Storage model | Unchanged (no accumulation) |
+| Hash computation | Version-agnostic via `getTableIdentifier()` |
+| Time-travel queries | Skip HBO via `isCurrentVersion()` |
+| TableScan accuracy | Manifest FACT confidence wins |
+| Join/Agg accuracy | HBO provides historical stats |
+| Backwards compatibility | Full (defaults preserve current behavior) |
 
 ## References
 
