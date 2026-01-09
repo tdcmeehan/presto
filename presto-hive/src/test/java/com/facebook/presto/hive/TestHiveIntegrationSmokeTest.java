@@ -355,6 +355,80 @@ public class TestHiveIntegrationSmokeTest
     }
 
     @Test
+    public void testIOExplainWithTimestampPartition()
+    {
+        // Test IO explain with timestamp partition column
+        computeActual("CREATE TABLE test_timestamp_io_explain " +
+                "WITH (partitioned_by = ARRAY['ts']) " +
+                "AS SELECT orderkey, CAST('2020-01-15 10:30:45.000' AS TIMESTAMP) AS ts FROM orders WHERE orderkey = 1");
+
+        MaterializedResult result = computeActual("EXPLAIN (TYPE IO, FORMAT JSON) SELECT * FROM test_timestamp_io_explain WHERE ts = TIMESTAMP '2020-01-15 10:30:45.000'");
+
+        // The result should contain a properly formatted timestamp string
+        String jsonOutput = (String) getOnlyElement(result.getOnlyColumnAsSet());
+        IOPlan ioPlan = jsonCodec(IOPlan.class).fromJson(jsonOutput);
+
+        // Verify we got a result with input table info
+        assertEquals(ioPlan.getInputTableColumnInfos().size(), 1);
+
+        // Verify the timestamp column constraint is present and formatted correctly
+        TableColumnInfo tableInfo = ioPlan.getInputTableColumnInfos().iterator().next();
+        assertEquals(tableInfo.getTable(), new CatalogSchemaTableName(catalog, "tpch", "test_timestamp_io_explain"));
+
+        // Find the ts column constraint
+        Optional<ColumnConstraint> tsConstraint = tableInfo.getColumnConstraints().stream()
+                .filter(c -> c.getColumnName().equals("ts"))
+                .findFirst();
+        assertTrue(tsConstraint.isPresent(), "Expected timestamp column constraint");
+
+        // Verify the timestamp value is formatted correctly (yyyy-MM-dd HH:mm:ss.SSS format)
+        FormattedDomain domain = tsConstraint.get().getDomain();
+        assertEquals(domain.getRanges().size(), 1);
+        FormattedRange range = domain.getRanges().iterator().next();
+        assertEquals(range.getLow().getValue().get(), "2020-01-15 10:30:45.000");
+        assertEquals(range.getHigh().getValue().get(), "2020-01-15 10:30:45.000");
+
+        assertUpdate("DROP TABLE test_timestamp_io_explain");
+    }
+
+    @Test
+    public void testIOExplainWithDatePartition()
+    {
+        // Test IO explain with date partition column
+        computeActual("CREATE TABLE test_date_io_explain " +
+                "WITH (partitioned_by = ARRAY['dt']) " +
+                "AS SELECT orderkey, CAST('2020-03-25' AS DATE) AS dt FROM orders WHERE orderkey = 1");
+
+        MaterializedResult result = computeActual("EXPLAIN (TYPE IO, FORMAT JSON) SELECT * FROM test_date_io_explain WHERE dt = DATE '2020-03-25'");
+
+        // The result should contain a properly formatted date string
+        String jsonOutput = (String) getOnlyElement(result.getOnlyColumnAsSet());
+        IOPlan ioPlan = jsonCodec(IOPlan.class).fromJson(jsonOutput);
+
+        // Verify we got a result with input table info
+        assertEquals(ioPlan.getInputTableColumnInfos().size(), 1);
+
+        // Verify the date column constraint is present and formatted correctly
+        TableColumnInfo tableInfo = ioPlan.getInputTableColumnInfos().iterator().next();
+        assertEquals(tableInfo.getTable(), new CatalogSchemaTableName(catalog, "tpch", "test_date_io_explain"));
+
+        // Find the dt column constraint
+        Optional<ColumnConstraint> dtConstraint = tableInfo.getColumnConstraints().stream()
+                .filter(c -> c.getColumnName().equals("dt"))
+                .findFirst();
+        assertTrue(dtConstraint.isPresent(), "Expected date column constraint");
+
+        // Verify the date value is formatted correctly (yyyy-MM-dd format)
+        FormattedDomain domain = dtConstraint.get().getDomain();
+        assertEquals(domain.getRanges().size(), 1);
+        FormattedRange range = domain.getRanges().iterator().next();
+        assertEquals(range.getLow().getValue().get(), "2020-03-25");
+        assertEquals(range.getHigh().getValue().get(), "2020-03-25");
+
+        assertUpdate("DROP TABLE test_date_io_explain");
+    }
+
+    @Test
     public void testReadNoColumns()
     {
         testWithAllStorageFormats(this::testReadNoColumns);

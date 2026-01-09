@@ -20,8 +20,10 @@ import com.facebook.presto.common.predicate.Marker.Bound;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.BigintType;
 import com.facebook.presto.common.type.BooleanType;
+import com.facebook.presto.common.type.DateType;
 import com.facebook.presto.common.type.IntegerType;
 import com.facebook.presto.common.type.SmallintType;
+import com.facebook.presto.common.type.TimestampType;
 import com.facebook.presto.common.type.TinyintType;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeSignature;
@@ -39,6 +41,7 @@ import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
+import com.facebook.presto.util.DateTimeUtils;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.IOPlan.IOPlanBuilder;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -564,6 +567,12 @@ public class IOPlanPrinter
             }
             if (type instanceof BooleanType) {
                 return ((Boolean) value).toString();
+            }
+            if (type instanceof TimestampType) {
+                return DateTimeUtils.printTimestampWithoutTimeZone((Long) value);
+            }
+            if (type instanceof DateType) {
+                return DateTimeUtils.printDate(((Long) value).intValue());
             }
             throw new PrestoException(NOT_SUPPORTED, format("Unsupported data type in EXPLAIN (TYPE IO): %s", type.getDisplayName()));
         }
