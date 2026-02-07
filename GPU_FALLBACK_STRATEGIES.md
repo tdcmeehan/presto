@@ -312,6 +312,57 @@ ordering. Transfer sections are lightweight scan-only stages — no hash tables,
 shuffle (bloom filters are aggregated at the coordinator). For star schemas (depth 1),
 only 3 transfer sections are needed.
 
+**RPT transfer sections run on CPU, not GPU**. The BF-build pass is pure CPU work:
+read Parquet metadata, decompress, decode the **join key column only** (column pruning),
+hash keys into a bloom filter. This is critical for two reasons:
+
+1. **Column pruning drastically reduces I/O**: The BF-build pass only needs the join
+   key column, not the full row. For a typical fact table row (~150 bytes across 16
+   columns), the join key is ~8 bytes — roughly 5% of the data. Parquet's columnar
+   layout makes this addressable: only the key column's pages are read, all other
+   column chunks are skipped.
+
+2. **CPU has abundant parallel decode throughput**: On a 128-core server (e.g., 2x AMD
+   EPYC 7763), single-core Parquet decode runs at ~1-2 GB/s. For key-only decode + BF
+   hash, effective throughput is ~2-4 GB/s per core. With 128 cores: 256-512 GB/s
+   aggregate CPU decode throughput — far exceeding typical storage read rates
+   (~170 GB/s from NVMe). The BF-build pass is **storage-bound, not CPU-bound**.
+
+**Cost model** (reference hardware: 2x EPYC 7763, 170 GB/s NVMe, 8x A100 80GB):
+
+```
+RPT BF-build pass on 400GB fact table (SF-1000 lineitem):
+  Key column data: 400GB × 5% = ~20GB
+  Storage read: 20GB / 170 GB/s = 0.12s
+  CPU decode + hash: 128 cores × 3 GB/s = 384 GB/s (not the bottleneck)
+  Time per table: ~0.12s
+
+Star schema (1 fact + 3 dims), forward + backward:
+  Forward dims (small, concurrent):   ~0.1s
+  Forward fact (key-only scan):       ~0.12s
+  Backward dims (BF-filtered, small): ~0.05s
+  Total RPT overhead:                 ~0.3s
+
+Main query scan (full columns, with DF row-group pruning):
+  Effective data after pruning: ~100GB
+  Storage read: 100GB / 170 GB/s = 0.6s
+  CPU full decode: storage-bound = 0.6s
+  GPU join + agg: ~0.5s (8x A100 at full throughput)
+  Total main query: ~1.1s
+
+Total with RPT:    ~1.4s (0.3s overhead + 1.1s main)
+Total without RPT: ~1.1s main + potential GPU OOM on hash build
+RPT overhead:      ~25% on this short query, but guarantees VRAM safety
+```
+
+For longer queries (>10s), RPT overhead drops below 3%. The cost is front-loaded
+scan latency; the payoff is bounded VRAM usage and 10-100x smaller hash tables.
+
+**When to skip RPT**: The planner should estimate RPT cost vs. benefit:
+- If `join_build_estimated_size < VRAM_budget`: skip RPT (hash table fits anyway)
+- If query is scan-dominant with trivial joins: skip RPT (overhead > benefit)
+- If join selectivity is low (most keys match): skip RPT (BF won't filter much)
+
 **Integration with Dynamic Filtering RFC**: RFC-0022 already provides:
 - Filter collection infrastructure (`DynamicFilterFetcher`, long-polling)
 - Filter merging (`CoordinatorDynamicFilter`, `TupleDomain.columnWiseUnion()`)
@@ -482,15 +533,19 @@ Planning:
   │ 5. Generate transfer sections + main query sections         │
   └──────────────────────────────────────────────────────────────┘
 
-Transfer Sections (RPT — bloom filter passes):
+Transfer Sections (RPT — CPU-based bloom filter passes):
   ┌──────────────────────────────────────────────────────────────┐
-  │ Section 0: Scan leaves → build BFs (GPU-parallel)           │
-  │ Section 1: Scan root + apply BFs → build BF (GPU-parallel)  │
-  │ Section 2: Backward pass → tighter BFs                      │
+  │ Section 0: Scan leaves → build BFs                           │
+  │ Section 1: Scan root + apply BFs → build BF                  │
+  │ Section 2: Backward pass → tighter BFs                       │
+  │                                                              │
+  │ Runs entirely on CPU (no GPU involvement):                   │
+  │   Parquet key-column-only scan (column pruning: ~5% of data) │
+  │   128 CPU cores decode at ~384 GB/s (storage-bound)          │
+  │   BF build: hash keys into bit array (trivial per-key cost)  │
+  │   Star schema: ~0.3s total overhead                          │
   │                                                              │
   │ BFs distributed via Dynamic Filtering infrastructure         │
-  │ Each section: scan + BF build only, no hash tables           │
-  │ BF probing on GPU: billions of probes/sec                    │
   └──────────────────────────────────────────────────────────────┘
 
 Main Query Section (joins + aggregations on reduced data):
