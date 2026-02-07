@@ -396,6 +396,62 @@ statistics. For the common case of a dimension table with >10K join keys:
 
 Both are needed. The range filter eliminates I/O; the bloom filter eliminates rows.
 
+**Progressive split pruning across RPT sections**: Each RPT section's BF-build pass
+scans the join key column. With negligible extra overhead (tracking a running min/max),
+it can also produce a **`TupleDomain` summary** (min/max range, and discrete value set
+if cardinality ≤ threshold). The coordinator uses these to prune subsequent sections'
+splits at multiple levels before any data is read:
+
+```
+RPT Section 0 (forward — dims):
+  Scan dim_c WHERE region='US'
+  Output: BF_c (row-level) + TD_c (min=100, max=5000) + Discrete_c ({102, 205, ...})
+
+RPT Section 1 (forward — fact):
+  Coordinator receives TD_c, BF_c, Discrete_c BEFORE assigning fact splits:
+
+  Level 1 — Partition pruning (coordinator):
+    Hive partitions / Iceberg partition specs checked against TD_c.
+    Skip partitions where key range has no overlap.
+
+  Level 2 — File/manifest pruning (coordinator, Iceberg):
+    Iceberg manifest per-file column stats checked against TD_c.
+    Skip files where key min/max has no overlap.
+    e.g., 1000 files → 200 survive.
+
+  Level 3 — Row group pruning (worker, CPU):
+    Parquet row group min/max checked against TD_c.
+    Skip row groups with no overlap.
+    e.g., 5000 RGs → 800 survive.
+
+  Level 4 — Row-level filtering (worker, GPU):
+    Decode surviving row groups.
+    Probe BF_c against each key. Eliminate non-matching rows.
+
+  Workers scan 800 RGs (not 5000), build BF_fact + TD_fact.
+
+RPT Section 2 (backward — dims):
+  Coordinator prunes dim splits using TD_fact:
+    dim_a: 100 files → 30 survive.
+  Workers scan surviving files → tighter BFs.
+
+Section 3 (main query):
+  Coordinator has ALL accumulated filters from ALL passes.
+  Maximum pruning at every level for every table.
+  Minimal data read → CPU decode → GPU/CPU compute.
+```
+
+Each level is a coarser-to-finer sieve. Levels 1-3 use `TupleDomain` ranges (not BFs
+— BFs can't do range checks). Level 4 uses BFs. The coordinator never assigns splits
+that can't match, so workers never read eliminated files. This is where the dominant
+I/O savings come from — not from row-level BF filtering, but from **never reading
+entire files and row groups in the first place**.
+
+The BF-build pass already scans the key column — collecting min/max for `TupleDomain`
+output adds one comparison per key per column. RFC-0022's filter distribution
+infrastructure already supports `TupleDomain` serialization and coordinator-side
+application via `CoordinatorDynamicFilter` and split-level pruning.
+
 ### 4.3 NVLink-Aware Overpartitioning
 
 **Complexity**: Medium | **Impact**: Eliminates skew, bounds per-GPU memory
@@ -533,45 +589,91 @@ Planning:
   │ 5. Generate transfer sections + main query sections         │
   └──────────────────────────────────────────────────────────────┘
 
-Transfer Sections (RPT — CPU-based bloom filter passes):
+Transfer Sections (RPT — CPU-based bloom filter + TupleDomain passes):
   ┌──────────────────────────────────────────────────────────────┐
-  │ Section 0: Scan leaves → build BFs                           │
-  │ Section 1: Scan root + apply BFs → build BF                  │
-  │ Section 2: Backward pass → tighter BFs                       │
+  │ Section 0: Scan leaves → build BFs + TupleDomains            │
+  │   CPU: key-column-only scan (column pruning: ~5% of data)    │
+  │   Output: BF (row-level) + TD (min/max) + discrete values    │
   │                                                              │
-  │ Runs entirely on CPU (no GPU involvement):                   │
-  │   Parquet key-column-only scan (column pruning: ~5% of data) │
-  │   128 CPU cores decode at ~384 GB/s (storage-bound)          │
-  │   BF build: hash keys into bit array (trivial per-key cost)  │
-  │   Star schema: ~0.3s total overhead                          │
+  │ Section 1: Scan root with progressive split pruning          │
+  │   Coordinator receives TD + discrete from Section 0:         │
+  │     → Prune partitions (Hive/Iceberg partition specs)        │
+  │     → Prune files (Iceberg manifest column stats)            │
+  │     → Skip eliminated splits entirely (no I/O)               │
+  │   Workers scan surviving splits only:                        │
+  │     → Row group pruning via TD range (min/max check)         │
+  │     → Key-only decode + BF build on surviving RGs            │
+  │   Output: BF_fact + TD_fact                                  │
   │                                                              │
-  │ BFs distributed via Dynamic Filtering infrastructure         │
+  │ Section 2: Backward pass with progressive pruning            │
+  │   Coordinator prunes dim splits using TD_fact                │
+  │   Workers scan only surviving files → tighter BFs + TDs      │
+  │                                                              │
+  │ Total overhead: ~0.3s (star schema SF-1000)                  │
+  │ BFs + TDs distributed via Dynamic Filtering infrastructure   │
   └──────────────────────────────────────────────────────────────┘
 
-Main Query Section (joins + aggregations on reduced data):
+Main Query Section (joins + aggregations on maximally reduced data):
   ┌──────────────────────────────────────────────────────────────┐
-  │ Scan (CPU prefetch/decode → GPU compute pipeline):           │
-  │   CPU: read Parquet metadata                                 │
-  │   CPU: row group pruning via TupleDomain range (RFC-0022)    │
+  │ Coordinator has ALL filters from ALL RPT passes:             │
+  │   → Maximum partition/file/manifest pruning for every table  │
+  │   → Only assigns splits that survived all filter levels      │
+  │                                                              │
+  │ Scan (CPU prefetch/decode pipeline):                         │
+  │   CPU: row group pruning via accumulated TDs                 │
   │   CPU: read + decompress + decode surviving pages → Arrow    │
-  │   PCIe/NVLink-C2C: decoded Arrow batches → GPU VRAM          │
-  │   GPU: BF probe on join keys (row-level, RPT)                │
-  │   GPU: filter pushdown predicates, project                   │
   │                                                              │
-  │ Hash Join (build tables 10-100x smaller after RPT):          │
-  │   Fits in VRAM → standard GPU hash join                      │
-  │   Doesn't fit → Grace hash join on GPU (partition to host)   │
-  │   Skewed → salted join via NVLink overpartitioning            │
+  │ Compute (CPU or GPU — per-fragment decision):                │
+  │   GPU path (join-heavy/agg-heavy queries):                   │
+  │     PCIe/NVLink-C2C: decoded Arrow batches → GPU VRAM        │
+  │     GPU: BF probe on join keys (row-level, RPT)              │
+  │     GPU: filter, project, hash join, aggregation             │
+  │   CPU path (scan-dominant/simple queries):                   │
+  │     CPU: BF probe, filter, project, join, aggregation        │
+  │     (no PCIe transfer overhead)                              │
   │                                                              │
-  │ Aggregation (cascading partial agg):                         │
-  │   PARTIAL agg per split (GPU) → NVLink shuffle               │
-  │   INTERMEDIATE agg per partition (GPU) → NVLink shuffle      │
-  │   FINAL agg (GPU)                                            │
-  │   OOM safety: sort-based streaming agg fallback              │
+  │ Per-fragment device decision (NativePlanChecker V0):          │
+  │   estimated_gpu_compute_savings > pcie_transfer_cost → GPU   │
+  │   otherwise → CPU                                            │
   │                                                              │
   │ Safety net: exchange buffer replay → CPU fallback             │
   └──────────────────────────────────────────────────────────────┘
 ```
+
+### 5.1 Final Phase: CPU vs GPU Decision
+
+After RPT reduction and progressive split pruning, the data reaching the final phase
+is a small fraction of the original tables. Whether this final phase should execute on
+CPU or GPU depends on the query's compute intensity:
+
+**GPU wins** when post-scan compute dominates:
+- Multi-way joins with large build sides (even after RPT, 4-way join is complex)
+- Heavy aggregations with many groups
+- Complex filter/project expressions evaluated per-row
+- Queries where GPU parallelism on join probe / aggregation / sorting matters
+
+**CPU wins** when data volume is already small:
+- Simple scans with trivial aggregation (TPC-H Q1 style)
+- Single join with small build side that already fits after RPT
+- Queries where PCIe transfer overhead exceeds GPU compute savings
+
+**The decision is per-fragment** via the NativePlanChecker V0 mechanism. Fragments with
+complex joins + aggregations → GPU. Fragments with simple scans → CPU. Both can coexist
+in the same query, connected by exchanges.
+
+**Cost heuristic**:
+```
+pcie_cost = reduced_data_size / pcie_bandwidth
+gpu_savings = (cpu_compute_time - gpu_compute_time)
+
+If gpu_savings > pcie_cost → execute on GPU
+Otherwise → execute on CPU
+```
+
+For the reference hardware (8x A100, 128 CPU cores, 200 GB/s aggregate PCIe):
+- Join build + probe on 5GB: CPU ~2s, GPU ~0.1s → savings = 1.9s, transfer = 0.2s → **GPU**
+- Simple COUNT(*) on 5GB: CPU ~0.3s, GPU ~0.05s → savings = 0.25s, transfer = 0.2s → **marginal, CPU ok**
+- 5-way join on 20GB reduced: CPU ~30s, GPU ~1.5s → savings = 28.5s, transfer = 0.8s → **GPU by 35x**
 
 ---
 
