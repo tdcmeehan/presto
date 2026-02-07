@@ -66,20 +66,38 @@ Then: join the reduced tables (hash tables are dramatically smaller).
 VRAM) and parallel scans (GPU-native). After reduction, hash tables shrink 10-100x,
 making them fit in VRAM without OOM fallback.
 
-### 2.3 GPU Data Ingestion
+### 2.3 GPU Data Ingestion — The Parquet Reality
 
-Modern GPU data paths eliminate CPU bottlenecks:
+**The ideal** (custom columnar format): GPUDirect Storage (GDS) DMA from NVMe directly
+to VRAM at ~22 GB/s, bypassing CPU entirely. Once in VRAM, HBM bandwidth is 2-3.35 TB/s
+(H100/H200/B100).
 
-- **GPUDirect Storage (GDS)**: DMA from NVMe directly to VRAM, bypassing CPU bounce
-  buffers. ~26 GB/s on PCIe Gen4, ~64 GB/s on Gen5.
-- **GPU-native decompression**: cuDF decompresses Parquet/ORC pages on GPU (NVComp).
-  Blackwell adds hardware decompression engines on-die.
-- **GPU-native decode**: Dictionary, RLE, DELTA decoding all run as CUDA kernels.
-  Microkernel architecture (specialized per data type) maximizes GPU occupancy.
-- **HBM bandwidth**: Once in VRAM, scan throughput is 2-3.35 TB/s (H100/H200/B100).
+**The Parquet problem**: Real-world data lives in Parquet, whose hierarchical metadata
+is interleaved with data, requires sequential interpretation to decode, and prevents
+GPU threads from reading consecutive addresses in parallel. cuDF's Parquet reader
+achieves ~10x less than theoretical I/O throughput because GPU kernels stall on
+decompress/decode of metadata-heavy page structures.
 
-The CPU's only role in the scan path is reading Parquet metadata (kilobytes) for
-partition/page pruning decisions.
+**The pragmatic architecture** (CPU prefetch/decode): CPU threads handle what they're
+good at — sequential metadata parsing, decompression (Snappy/LZ4/ZSTD), and page
+decoding (DICT, RLE, DELTA). Decoded Arrow columnar batches are transferred to GPU
+via PCIe/NVLink-C2C. The GPU handles parallel compute: filtering, joining, aggregating.
+
+```
+CPU (sequential, metadata-friendly):     GPU (parallel, compute-friendly):
+  Read Parquet metadata
+  Row group pruning (TupleDomain range)
+  Read + decompress + decode pages
+  Assemble Arrow batches
+       ──── PCIe/NVLink-C2C ────→         BF probe (row-level)
+                                           Filter, Project
+                                           Hash Join, Aggregation
+  Double-buffer: prepare N+1              Process N
+```
+
+The `CudfHiveConnector` in Velox implements this pattern — it accepts splits,
+uses the cuDF Parquet reader to produce `cudf::table` objects wrapped in `CudfVector`,
+and feeds them into the GPU-side operator pipeline.
 
 ---
 
@@ -309,8 +327,23 @@ The RPT transfer sections extend this infrastructure by:
 **GPU-specific benefits**: Bloom filter construction and probing are embarrassingly
 parallel — among the fastest operations on GPU. Bloom filters (~150MB) always fit in
 VRAM. The row-level BF probing happens on GPU after decode, at billions of probes/sec.
-CPU-side page metadata can also be checked against BFs for I/O elimination before GDS
-transfers data to VRAM.
+
+**Interaction with Dynamic Filtering (RFC-0022)**: RPT bloom filters and dynamic filter
+`TupleDomain` ranges serve **complementary roles** at different pipeline levels:
+
+| Filter Type | Row Group/Page Skip (I/O elimination) | Row-Level Filter (post-decode) |
+|---|---|---|
+| TupleDomain range (min/max) | Yes — range overlap with row group stats | Coarse (only outside range) |
+| TupleDomain discrete (≤10K values) | Yes — set overlap with range | Yes — exact membership |
+| Bloom filter (RPT) | **No** — BFs only support point queries | Yes — any cardinality |
+
+Bloom filters answer "is key X in the set?" but cannot answer "does range [min,max]
+overlap with the set?" — so they cannot prune row groups using Parquet min/max
+statistics. For the common case of a dimension table with >10K join keys:
+- RFC-0022's `TupleDomain` provides the range for **I/O elimination** (row group skip)
+- RPT's bloom filter provides fine-grained **row-level filtering** after decode
+
+Both are needed. The range filter eliminates I/O; the bloom filter eliminates rows.
 
 ### 4.3 NVLink-Aware Overpartitioning
 
@@ -462,10 +495,13 @@ Transfer Sections (RPT — bloom filter passes):
 
 Main Query Section (joins + aggregations on reduced data):
   ┌──────────────────────────────────────────────────────────────┐
-  │ Scan with BFs + partition/page pruning:                      │
-  │   CPU: metadata pruning (page skip via BF + min/max)         │
-  │   GDS: surviving pages → VRAM directly                       │
-  │   GPU: decompress → decode → BF probe → filter → project    │
+  │ Scan (CPU prefetch/decode → GPU compute pipeline):           │
+  │   CPU: read Parquet metadata                                 │
+  │   CPU: row group pruning via TupleDomain range (RFC-0022)    │
+  │   CPU: read + decompress + decode surviving pages → Arrow    │
+  │   PCIe/NVLink-C2C: decoded Arrow batches → GPU VRAM          │
+  │   GPU: BF probe on join keys (row-level, RPT)                │
+  │   GPU: filter pushdown predicates, project                   │
   │                                                              │
   │ Hash Join (build tables 10-100x smaller after RPT):          │
   │   Fits in VRAM → standard GPU hash join                      │
