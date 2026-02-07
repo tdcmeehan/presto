@@ -96,7 +96,20 @@ Presto's GPU support (`PRESTO_ENABLE_CUDF`) works at build time:
   (via Velox `DriverAdapter` rewriting)
 - GPU disabled by default; enabled via `CudfConfig`
 
-### 3.2 Sections for Staged Execution
+### 3.2 NativePlanChecker (Sidecar-Based Plan Validation)
+
+The `NativePlanChecker` (`presto-native-sidecar-plugin`) validates whether plan
+fragments can execute on native workers:
+- Serializes each `SimplePlanFragment` to JSON and POSTs to a native sidecar process
+  at `/v1/velox/plan`
+- The sidecar runs the actual `PrestoToVeloxQueryPlan` conversion — catching
+  unsupported functions, types, expressions, and operator combinations
+- Runs per-fragment (via `PlanCheckerProvider.getFragmentPlanCheckers()`)
+- Skips coordinator-only fragments and internal system connector scans
+- Loaded via the `PlanCheckerProviderManager` plugin SPI from config directory
+- Today: failure throws `PrestoException`, killing the query
+
+### 3.3 Sections for Staged Execution
 
 Presto "sections" (`StreamingPlanSection`) group stages for ordered execution:
 - **Child sections must complete before parent sections start** — the scheduler's
@@ -105,7 +118,7 @@ Presto "sections" (`StreamingPlanSection`) group stages for ordered execution:
 - **Section boundaries are defined by `REMOTE_MATERIALIZED` exchanges**
 - The scheduler already orchestrates section ordering without modification needed
 
-### 3.3 Dynamic Filtering RFC (In Progress)
+### 3.4 Dynamic Filtering RFC (In Progress)
 
 [RFC-0022](https://github.com/prestodb/rfcs/pull/54) proposes distributed dynamic
 partition pruning:
@@ -118,7 +131,7 @@ partition pruning:
   filter extension)
 - Uses sections to gate build completion before probe split scheduling
 
-### 3.4 Intermediate Aggregations (Off by Default)
+### 3.5 Intermediate Aggregations (Off by Default)
 
 `AddIntermediateAggregations` rule (`enable_intermediate_aggregations` session property,
 default `false`) inserts extra INTERMEDIATE aggregation stages:
@@ -139,7 +152,7 @@ This adds cascading partial aggregation — reducing data volume at each stage. 
 only applies to un-grouped aggregations without ORDER BY. For GPU, this is critical:
 each aggregation stage operates on a smaller working set.
 
-### 3.5 Adaptive Exchange Framework (Prior Design)
+### 3.6 Adaptive Exchange Framework (Prior Design)
 
 The [Adaptive Exchange Framework](ADAPTIVE_EXCHANGE_FRAMEWORK.md) introduces:
 - Exchanges buffer initial rows (~100K) and collect runtime statistics
@@ -154,23 +167,92 @@ The [Adaptive Exchange Framework](ADAPTIVE_EXCHANGE_FRAMEWORK.md) introduces:
 The following strategies compose into a layered system. Each layer independently
 improves GPU execution; together they form a comprehensive solution.
 
-### 4.1 Static Plan Inspection (Polars-Style)
+### 4.1 Static Plan Inspection via NativePlanChecker (V0 — Polars-Style)
 
-**Complexity**: Low | **Impact**: Prevents unsupported-op failures
+**Complexity**: Low | **Impact**: Prevents unsupported-op failures | **Builds on**: existing infrastructure
 
-Before executing a fragment on a worker, inspect the Velox plan tree via the cuDF
-`DriverAdapter` to determine whether all operators are GPU-supported. If any operator
-is unsupported, execute the entire fragment on CPU.
+Presto already has a `NativePlanChecker` in the `presto-native-sidecar-plugin` that
+validates whether a plan fragment can run on Prestissimo/Velox. It works by sending
+each fragment to a **native sidecar process** via `POST /v1/velox/plan`, which
+attempts the real `PrestoToVeloxQueryPlan` conversion. If conversion fails (unsupported
+function, type, expression), the sidecar returns a detailed error.
+
+Today, a failed plan check throws `PrestoException` and kills the query. For GPU
+fallback, we repurpose this mechanism:
 
 ```
-Coordinator sends plan → Worker receives plan
-                         → [DriverAdapter] checks all operators
-                         → If all supported: rewrite plan for GPU
-                         → If any unsupported: execute on CPU
+Coordinator                          Native Sidecar (with cuDF)
+    │                                        │
+    │  POST /v1/velox/plan?device=gpu        │
+    │  {serialized PlanFragment}  ──────────→│
+    │                                        │  Attempt plan conversion
+    │                                        │  WITH cuDF DriverAdapter rewriting
+    │                                        │
+    │  200 OK                     ←──────────│  Fragment is GPU-capable
+    │  OR                                    │
+    │  Error + details            ←──────────│  Fragment not GPU-capable
+    │                                        │  (e.g., unsupported function X)
+    │                                        │
+    │  Based on result:                      │
+    │  GPU-capable → schedule on GPU workers │
+    │  Not GPU    → schedule on CPU workers  │
+    │                                        │
+    │  Query never fails.                    │
 ```
 
-This is essentially what Velox's `DriverAdapter` already does during plan rewriting —
-the gap is graceful fallback when rewriting fails, rather than query failure.
+**Why this approach is superior to a static registry of GPU-supported operations**:
+
+1. **Uses the real conversion code** — if cuDF's `DriverAdapter` can rewrite it, the
+   sidecar says yes. No registry to maintain, no drift between what's actually
+   supported and what a list claims.
+
+2. **Catches complex interactions** — a function might be supported for `BIGINT` but
+   not `DECIMAL(38,18)`. Type-dependent support, expression nesting, operator
+   combinations — the real converter handles all of this.
+
+3. **Per-fragment granularity** — different fragments in the same query can get
+   different GPU/CPU decisions. A scan+filter+aggregate fragment runs on GPU while
+   a window function fragment runs on CPU.
+
+4. **Auto-evolves** — as cuDF support expands (more functions, types, operators), the
+   fallback automatically knows about it. No code changes on the coordinator when new
+   GPU operators are added to Velox.
+
+**Existing infrastructure reused**:
+- `NativePlanChecker` (`presto-native-sidecar-plugin/...nativechecker/NativePlanChecker.java`):
+  Serializes `SimplePlanFragment`, sends to sidecar, processes response
+- `NativePlanCheckerProvider`: Fragment-level plan checker loaded via plugin SPI
+- `PlanCheckerProviderManager`: Loads plan checkers from config directory at startup
+- `PlanChecker.validatePlanFragment()`: Invocation point — runs after plan optimization,
+  before scheduling
+- Sidecar process: Already deployed alongside Prestissimo workers, already has the
+  `/v1/velox/plan` endpoint
+
+**Implementation delta**:
+
+1. **Sidecar endpoint change**: Add `device` query parameter to `/v1/velox/plan`.
+   When `device=gpu`, attempt plan conversion with cuDF `DriverAdapter` enabled.
+   When `device=cpu` (or absent), use standard Velox conversion (today's behavior).
+
+2. **Change failure semantics**: Instead of throwing `PrestoException` on GPU plan
+   check failure, annotate the fragment with a device capability:
+   ```java
+   public enum DeviceCapability { GPU_CAPABLE, CPU_ONLY }
+   ```
+   The `NativePlanChecker` returns this annotation rather than throwing.
+
+3. **Fragment routing in scheduler**: `SqlQueryScheduler` uses the annotation when
+   creating `SectionExecution` — GPU-capable fragments are scheduled on GPU workers,
+   CPU-only fragments on CPU workers (or GPU workers running CPU fallback path).
+
+4. **Dual-mode workers** (optional, Phase 2): Workers that have both GPU and CPU
+   execution paths available, selected per-fragment based on the plan check result.
+   Initially, heterogeneous clusters (some GPU-only, some CPU-only workers) are simpler.
+
+**Cost**: One HTTP round-trip per fragment to the sidecar during planning. Plan
+fragments are typically small (kilobytes of JSON). The sidecar plan conversion is
+fast (milliseconds). For a query with 5-10 fragments, this adds ~10-50ms to planning
+time — negligible for analytical queries.
 
 ### 4.2 RPT via Sections (Bloom Filter Pre-Reduction)
 
@@ -404,11 +486,18 @@ Main Query Section (joins + aggregations on reduced data):
 
 ## 6. Implementation Phases
 
-### Phase 1: Foundations (Static Fallback + Dynamic Filtering)
-- Implement graceful CPU fallback in `DriverAdapter` when GPU rewriting fails
+### Phase 1: V0 GPU Fallback via NativePlanChecker (Lowest Effort)
+- Extend sidecar `/v1/velox/plan` endpoint with `device=gpu` mode that attempts
+  cuDF `DriverAdapter` plan rewriting
+- Change `NativePlanChecker` to return a `DeviceCapability` annotation instead of
+  throwing `PrestoException` on GPU check failure
+- Add fragment-level device routing in `SqlQueryScheduler` (GPU-capable → GPU workers,
+  CPU-only → CPU workers)
 - Land Dynamic Filtering RFC (RFC-0022) for coordinator-side partition pruning
 - Enable `enable_intermediate_aggregations` for GPU workloads
-- **Result**: Unsupported ops fall back to CPU; partition pruning reduces scan volume
+- **Result**: Queries with unsupported GPU operations gracefully fall back to CPU
+  per-fragment. No query ever fails due to GPU limitations. As cuDF support expands,
+  more fragments automatically route to GPU with zero coordinator changes.
 
 ### Phase 2: RPT Transfer Sections
 - Extend Dynamic Filtering with bloom filter support (`filterType: "bloomFilter"`)
@@ -471,6 +560,9 @@ Main Query Section (joins + aggregations on reduced data):
 - [Velox cuDF Backend](https://github.com/facebookincubator/velox/tree/main/velox/experimental/cudf)
 - [Extending Velox with cuDF](https://velox-lib.io/blog/extending-velox-with-cudf/)
 - [GPU-Native Velox and cuDF (IBM/NVIDIA)](https://developer.nvidia.com/blog/accelerating-large-scale-data-analytics-with-gpu-native-velox-and-nvidia-cudf/)
+- `NativePlanChecker`: `presto-native-sidecar-plugin/.../nativechecker/NativePlanChecker.java`
+- `NativePlanCheckerProvider`: `presto-native-sidecar-plugin/.../nativechecker/NativePlanCheckerProvider.java`
+- `PlanCheckerProviderManager`: `presto-main-base/.../sanity/PlanCheckerProviderManager.java`
 - `AddIntermediateAggregations`: `presto-main-base/.../iterative/rule/AddIntermediateAggregations.java`
 
 ### GPU Data Path
