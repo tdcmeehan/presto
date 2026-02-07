@@ -1,6 +1,6 @@
 # GPU Execution Strategies for Presto
 
-## Status: Draft v0.2
+## Status: Draft v0.3
 ## Authors: Auto-generated design exploration
 ## Date: 2026-02-07
 
@@ -720,6 +720,110 @@ For the reference hardware (8x A100, 128 CPU cores, 200 GB/s aggregate PCIe):
 
 ---
 
+## 6. Commodity GPU Economics
+
+### 6.1 The Secondary Market Thesis
+
+As AI training clusters upgrade from one GPU generation to the next (H100 → B200 →
+next), older GPUs enter the secondary market at dramatically lower prices. A fleet of
+ex-training H100s becomes available at a fraction of their original cost. This changes
+the economic calculus for GPU-accelerated analytics:
+
+- **Supply**: Retired AI training clusters release tens of thousands of GPUs per cycle
+- **Price**: 2-3 year old GPUs at 20-30% of original cost, still with full HBM and
+  NVLink capabilities
+- **Capability**: These aren't weak GPUs — an H100 with 80GB HBM3 and 3.35 TB/s memory
+  bandwidth is massively overpowered for analytics compared to what it was designed for
+
+The implication: GPU compute stops being a scarce resource to optimize carefully and
+becomes commodity infrastructure to deploy broadly.
+
+### 6.2 Impact on the Architecture
+
+**What changes with commodity GPUs:**
+
+1. **Final phase default shifts to GPU.** The Section 5.1 cost heuristic
+   (`gpu_savings > pcie_cost`) becomes almost universally true when GPU cycles are
+   cheap. The threshold for "GPU-worthy" fragments drops from join-heavy/agg-heavy
+   queries to nearly all compute — even simple filter/project benefits from GPU
+   parallelism when GPUs are abundant and cheap.
+
+2. **NVLink overpartitioning becomes the standard, not the exception.** With
+   commodity GPUs, provisioning 8 GPUs per node is the default. Overpartitioning
+   across all 8 GPUs via NVLink is the standard execution model, not an optimization.
+
+3. **Memory-bounded operators (Phase 4) become less critical.** With 8x 80GB = 640GB
+   of aggregate GPU VRAM per node (plus UVM spill to host memory), many workloads
+   that needed Grace hash join or external sort simply fit. RPT reduction + 640GB
+   VRAM handles the vast majority of analytical joins.
+
+4. **Adaptive fallback (Phase 5) becomes even rarer.** GPU coverage approaches 100%
+   as cuDF support matures. The remaining CPU-only fragments are truly exotic
+   operations (specific UDFs, unsupported types), not common query patterns.
+
+**What does NOT change:**
+
+1. **RPT BF-build passes still run on CPU.** Even with commodity GPUs, the BF-build
+   phase should run on CPU for three reasons:
+
+   - **GPUs are idle during transfer sections anyway.** Transfer phases produce only
+     bloom filters and TupleDomains — no heavy compute for GPUs to accelerate. Using
+     idle CPU cores costs nothing.
+
+   - **The bottleneck is storage I/O, not compute.** BF-build reads ~5% of data (key
+     columns via Parquet column pruning). With 170 GB/s NVMe and 128 CPU cores
+     providing 384 GB/s aggregate decode, the pass is storage-bound. GPU parallelism
+     can't speed up a storage-bound pipeline.
+
+   - **Parquet metadata is structurally CPU-friendly.** The hierarchical
+     metadata/page structure requires sequential interpretation regardless of GPU
+     availability. Even commodity GPUs achieve ~10x less than theoretical on Parquet
+     decode. The data format hasn't changed, just GPU pricing.
+
+   The one scenario where GPU BF-build makes sense: **custom columnar formats**
+   (GPU-native storage) where GDS can DMA directly to VRAM. In that case, GPU
+   builds BFs at HBM bandwidth (3.35 TB/s) — orders of magnitude faster than any
+   CPU approach. This is a future optimization when the ecosystem moves beyond
+   Parquet.
+
+2. **Static fallback via NativePlanChecker (Phase 1) remains essential.** Even
+   commodity GPUs don't support every SQL operation. Per-fragment GPU/CPU routing
+   is still needed for correctness.
+
+3. **Progressive split pruning across RPT sections remains the dominant I/O
+   optimization.** GPU compute speed doesn't change the amount of data read from
+   storage. Pruning partitions, files, and row groups before reading remains the
+   biggest performance lever regardless of compute backend.
+
+### 6.3 Revised Default Execution Model
+
+With commodity GPUs, the default shifts from "CPU by default, GPU where it helps"
+to "GPU by default, CPU where required":
+
+```
+Planning (unchanged):
+  Fragment classification via NativePlanChecker:
+    GPU-capable fragments → GPU (the common case with commodity GPUs)
+    CPU-only fragments    → CPU (exotic ops, unsupported types)
+
+RPT Transfer Sections (unchanged — CPU):
+  CPU key-column scans → BF + TD construction
+  Progressive split pruning at coordinator
+  (GPUs idle — no work for them in transfer phases)
+
+Main Query Execution (GPU by default):
+  CPU: Parquet decode + Arrow batch assembly (CPU-friendly)
+  GPU: Everything else (filter, project, join, agg, sort, window)
+  NVLink: Free shuffle between GPUs in the same node
+  UVM: Transparent spill to host memory for >VRAM working sets
+```
+
+This is the end state: CPU does what it's best at (I/O, metadata, decode), GPU
+does what it's best at (parallel compute), and RPT ensures data volumes are
+minimized before either touches it.
+
+---
+
 ## 7. Open Questions
 
 1. **UVM for Velox**: Should we adopt CUDA Unified Virtual Memory (as Polars did) as a
@@ -742,6 +846,15 @@ For the reference hardware (8x A100, 128 CPU cores, 200 GB/s aggregate PCIe):
 
 6. **Cross-node GPU shuffle**: With NVLink only available within a node, how should the
    planner handle multi-node GPU clusters? RDMA GPU-direct between nodes?
+
+7. **GPU-native storage formats**: When data moves beyond Parquet to GPU-native columnar
+   formats (e.g., GDS-friendly layouts), should RPT BF-build passes move from CPU to GPU?
+   This would enable BF construction at HBM bandwidth (3.35 TB/s) instead of storage
+   bandwidth (170 GB/s), but requires the entire storage stack to change.
+
+8. **Commodity GPU fleet management**: How should Presto manage heterogeneous GPU fleets
+   (mix of H100, A100, older generations) with different VRAM sizes and compute capabilities?
+   Should the cost heuristic adapt per-worker based on GPU generation?
 
 ---
 
