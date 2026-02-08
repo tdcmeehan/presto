@@ -730,77 +730,78 @@ application via `CoordinatorDynamicFilter` and split-level pruning.
 
 Parquet files can contain per-row-group, per-column bloom filters in the file footer
 (Parquet spec 2.10+). These are distinct from RPT's bloom filters — they're pre-built
-at write time and stored in the file metadata. When available, they create three
-optimization opportunities for RPT.
+at write time and stored in the file metadata. The natural question is whether these
+pre-built BFs can replace RPT scan phases, avoiding data page I/O entirely.
 
-**Opportunity 1: Row-group pruning during RPT forward pass (biggest win)**
+**Can we OR-merge Parquet BFs to skip an RPT scan phase? No — FPR saturation.**
 
-RPT's forward pass scans the fact table while applying bloom filters built from
-dimension tables. Currently this filters individual rows after decoding. With Parquet
-BFs on the fact table's join key column, RPT could skip entire row groups before
-reading any data pages:
+The appealing idea: instead of scanning a dimension table to build BF_dim, read the
+Parquet BFs from file metadata, OR-merge them across row groups, and use the result
+as BF_dim. Zero data page I/O for that RPT phase.
+
+This doesn't work because Parquet BFs are **sized per-row-group**. OR-merging stuffs
+the entire table's keys into a BF structure sized for one row group:
 
 ```
-Without Parquet BFs:
-  Read fact row group → decode join key column → check RPT BF → discard non-matching rows
-  (I/O: read all row groups, filter after decode)
+Parquet BF sizing: m bits per row group, optimized for n keys at 1% FPR
+  m ≈ 10n bits (rule of thumb, k=7 hash functions)
 
-With Parquet BFs:
-  Read fact Parquet metadata → get per-row-group BF for join key column
-  For each row group:
-    Check: does Parquet BF overlap with RPT's key set?
-    If no overlap → SKIP entire row group (zero I/O for data pages)
-    If overlap → read and process normally
-  (I/O: skip row groups with no matching keys)
+OR-merge across R row groups (total keys N = R × n):
+  Merged BF: N keys in m = 10n bits (structure sized for n, not N)
+
+  Merged FPR ≈ (1 - e^(-k·N/m))^k = (1 - e^(-0.7·R))^7
+
+  R = 1:    FPR ≈ 1%      (by design — single row group)
+  R = 2:    FPR ≈ 12%     (marginal)
+  R = 5:    FPR ≈ 90%     (useless)
+  R = 10:   FPR ≈ 99.3%   (fully saturated — all bits set)
+  R = 100:  FPR ≈ 100%    (every key "matches")
+```
+
+A typical dimension table has tens to hundreds of row groups. After merging ~10, the
+BF is fully saturated and provides zero filtering. This rules out using merged Parquet
+BFs as a substitute for any RPT scan phase.
+
+A second obstacle: **BFs are not enumerable**. You can ask "is key X in the set?" but
+not "what keys are in the set?" This means you can't directly intersect two BFs to
+check for overlap — unless they share the same size and hash functions (bitwise AND),
+which Parquet BFs across different tables won't.
+
+**What Parquet BFs CAN do: row-group pruning with a concrete key set**
+
+The one place Parquet BFs help RPT is during scan phases where RPT already has a
+**concrete key set** (actual key values materialized during a prior scan, not just a
+bloom filter). During the RPT forward pass, the BF-build scan of each dimension table
+collects the actual key values (to insert into the RPT BF). These concrete keys can
+be probed against Parquet BFs on the OTHER table's join key column to prune row groups:
+
+```
+RPT forward pass — scanning fact table with BF_dim already built:
+
+Standard (Level 3 + Level 4 from hierarchy above):
+  Level 3: prune fact row groups using TD_dim min/max range
+  Level 4: decode surviving row groups, BF-filter individual rows
+
+With Parquet BFs on fact join key (new Level 3.5):
+  Level 3:   prune fact row groups using TD_dim min/max range
+  Level 3.5: for each surviving row group, read its Parquet BF (from metadata)
+             probe a sample of dim keys against it
+             if NO dim keys are possibly present → skip this row group
+  Level 4:   decode remaining row groups, BF-filter individual rows
 ```
 
 This is tighter than min/max statistics when value ranges are wide but actual values
-are sparse. Example: a row group might have `customer_id` ranging from 1 to 1M
-(min/max says "might match"), but the Parquet BF reveals that none of the specific
-RPT keys are present. This adds a filtering level between the existing Level 2
-(row-group range pruning) and Level 4 (row-level BF filtering) in the multi-level
-pruning hierarchy above.
+are sparse. Example: a row group has `customer_id` ranging 1 to 1M (min/max says
+"might match"), but its Parquet BF reveals that none of the 50K surviving dimension
+keys are present → skip the entire row group.
 
-**Opportunity 2: Accelerating RPT backward-pass BF construction**
-
-RPT's backward pass reads dimension key columns to build bloom filters. If the
-dimension table already has Parquet BFs on those key columns, RPT could read the
-pre-built BFs from metadata instead of scanning data pages:
-
-```
-Without Parquet BFs:
-  Scan dim key column → read all data pages → build RPT BF
-  Cost: full column I/O + BF construction
-
-With Parquet BFs:
-  Read dim Parquet metadata → extract per-row-group BFs → bitwise-OR merge
-  Cost: metadata I/O only (tiny) + OR operations
-```
-
-Caveat: merging BFs across N row groups via bitwise OR degrades the false-positive
-rate. If each row group BF has FPR = p, merging N row groups gives effective
-FPR ≈ 1 - (1-p)^N. For p=1% and N=100 row groups, effective FPR ≈ 63% — too
-coarse for direct use. This works well only when:
-- Few row groups (small dimension tables — but then scanning is cheap anyway)
-- Used as a coarse pre-filter before building a precise RPT BF from surviving rows
-
-**Opportunity 3: Cross-table row-group pruning (metadata-only)**
-
-Use dimension-side Parquet BFs to prune fact-side row groups without building an
-RPT BF at all — a metadata-only optimization:
-
-```
-1. Read dim table's Parquet BFs for join key column (from metadata)
-2. For each fact row group:
-   Read fact row group's Parquet BF for join key
-   Intersect fact BF with union of dim BFs
-   If no overlap → skip fact row group
-3. No data pages read for either table during the pruning phase
-```
-
-This is a pre-RPT optimization that eliminates obviously irrelevant data before
-RPT's scan passes begin. Its effectiveness depends on both tables having BFs on
-the join key columns.
+**Sampling strategy**: Probing ALL dim keys against each row group's Parquet BF may be
+expensive (e.g., 10M dim keys × 1000 row groups = 10B probes). A sampling approach:
+probe a random subset of dim keys (e.g., 1000 keys). If none match, the row group is
+very likely irrelevant. If some match, read the row group normally. False negatives
+(skipping a row group that has matches) are avoided because Parquet BFs have no false
+negatives — only false positives. If ANY probe returns "possibly present," keep the
+row group.
 
 **Velox integration status**: Velox has a complete `BlockSplitBloomFilter`
 implementation (`velox/dwio/parquet/common/BloomFilter.h`) and Thrift metadata
@@ -810,7 +811,7 @@ not bloom filters. `ColumnChunkMetaDataPtr` does not expose the bloom filter off
 Writer support exists only in test code. The work needed:
 1. Expose `bloom_filter_offset` in `ColumnChunkMetaDataPtr`
 2. Add BF reading to `filterRowGroups()` alongside existing statistics checks
-3. Connect to RPT's scan infrastructure so RPT can pass its key set for BF intersection
+3. Connect to RPT's scan infrastructure so RPT can pass dim keys for BF probing
 
 ### 4.3 NVLink-Aware Overpartitioning
 
