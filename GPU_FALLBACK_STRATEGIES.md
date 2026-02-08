@@ -358,6 +358,71 @@ RPT overhead:      ~25% on this short query, but guarantees VRAM safety
 For longer queries (>10s), RPT overhead drops below 3%. The cost is front-loaded
 scan latency; the payoff is bounded VRAM usage and 10-100x smaller hash tables.
 
+**Why RPT isn't broadly adopted — and how Presto can avoid the pitfall**: The RPT
+paper's DuckDB implementation avoids the rescan penalty entirely by **buffering scanned
+data in memory**. The `CreateBF` operator acts as both sink and source: during the Sink
+phase it buffers all data chunks in thread-local memory; during subsequent pipeline
+phases, `GetData` serves the buffered chunks directly without re-reading from disk. This
+is natural for DuckDB (single-node, in-memory) but doesn't directly translate to a
+distributed system where data lives on remote storage.
+
+This is a key reason RPT hasn't been adopted more broadly — systems without in-memory
+buffering or effective caching pay the full storage cost 2-3x (forward scan, backward
+scan, main query scan). Presto can avoid this penalty by leveraging **Velox's existing
+data cache infrastructure** with split-to-worker affinity:
+
+**Velox's tiered caching (already deployed)**:
+- **`AsyncDataCache`** (RAM, **enabled by default**): Caches decoded Parquet
+  pages/column chunks in memory. When the RPT forward pass reads key column pages from
+  a file, they land in the `AsyncDataCache`. Subsequent reads of the same pages (backward
+  pass, main query) hit the cache at memory bandwidth instead of storage bandwidth.
+- **`SsdCache`** (local NVMe, 16 shards for parallel I/O): Overflow tier for data
+  that doesn't fit in RAM cache. Still ~10-20x faster than remote storage (S3/HDFS).
+- Configuration: `async-data-cache-enabled=true` (default), `async-cache-ssd-gb`,
+  `async-cache-ssd-path`, plus TTL and eviction policies.
+
+**Split-to-worker affinity across RPT sections**: The coordinator must assign the same
+table splits to the same workers across RPT sections. This is straightforward — the
+coordinator already tracks which splits went to which workers in Section 0, so
+Section 2 (backward) and Section 3 (main query) reuse the same mapping. This ensures
+cache hits:
+
+```
+Worker W1 processes splits S1..S50 across all RPT sections:
+  Section 0 (forward):  read key column from S1..S50 → AsyncDataCache warm
+  Section 2 (backward): read key column from S1..S50 → cache hit (memory speed)
+  Section 3 (main):     read full columns from S1..S50 → key columns cached,
+                         non-key columns from storage (but these are read only once)
+```
+
+**Revised cost model with caching** (same reference hardware):
+
+```
+Without caching (every scan hits storage):
+  Forward dims:    0.10s (key-only, cold)
+  Forward fact:    0.12s (key-only, cold)
+  Backward dims:   0.10s (key-only, cold — no affinity)
+  Main query scan: 0.60s (full columns, cold)
+  Total I/O:       0.92s
+
+With Velox AsyncDataCache + split affinity:
+  Forward dims:    0.10s (key-only, cold — warms cache)
+  Forward fact:    0.12s (key-only, cold — warms cache)
+  Backward dims:   0.01s (key-only, cache hit — ~200 GB/s memory BW)
+  Main query scan: 0.50s (key columns cached, non-key columns cold)
+  Total I/O:       0.73s
+
+RPT overhead with caching: ~0.23s (forward) + ~0.01s (backward) = ~0.24s
+RPT overhead without:      ~0.22s (forward) + ~0.10s (backward) = ~0.32s
+Backward pass is essentially free with caching.
+```
+
+Key column data is small (~20GB for a 400GB fact table). This fits comfortably in
+the `AsyncDataCache` on any modern server with 128GB+ RAM allocated to the cache.
+The backward pass becomes a memory-speed operation. More importantly, the main query
+scan also benefits: key columns are already warm, so only non-key columns (the bulk
+of the data, but read only once) hit storage.
+
 **When to skip RPT**: The planner should estimate RPT cost vs. benefit:
 - If `join_build_estimated_size < VRAM_budget`: skip RPT (hash table fits anyway)
 - If query is scan-dominant with trivial joins: skip RPT (overhead > benefit)
@@ -870,6 +935,9 @@ minimized before either touches it.
 - `NativePlanCheckerProvider`: `presto-native-sidecar-plugin/.../nativechecker/NativePlanCheckerProvider.java`
 - `PlanCheckerProviderManager`: `presto-main-base/.../sanity/PlanCheckerProviderManager.java`
 - `AddIntermediateAggregations`: `presto-main-base/.../iterative/rule/AddIntermediateAggregations.java`
+- `AsyncDataCache` config: `presto-native-execution/presto_cpp/main/common/Configs.h` (lines 406-468)
+- `SsdCache` setup: `presto-native-execution/presto_cpp/main/PrestoServer.cpp` (`setupSsdCache()`)
+- Alluxio cache: `presto-cache/src/main/java/com/facebook/presto/cache/alluxio/AlluxioCacheConfig.java`
 
 ### GPU Data Path
 - [GPUDirect Storage](https://developer.nvidia.com/blog/gpudirect-storage/)
@@ -879,6 +947,7 @@ minimized before either touches it.
 
 ### Query Optimization
 - [RPT: Debunking the Myth of Join Ordering (SIGMOD'25)](https://arxiv.org/abs/2502.15181)
+- [RPT Source Code (DuckDB-based)](https://github.com/embryo-labs/Robust-Predicate-Transfer)
 - [Predicate Transfer (CIDR'24)](https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf)
 - [Parachute: Single-Pass Bi-Directional Info Passing (VLDB'25)](https://arxiv.org/abs/2506.13670)
 - [Including Bloom Filters in Bottom-up Optimization](https://arxiv.org/pdf/2505.02994)
