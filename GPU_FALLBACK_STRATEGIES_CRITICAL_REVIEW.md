@@ -109,29 +109,88 @@ a reliable middle ground.
 
 ## Issue 5: Section Scheduling Overhead Is Zero in the Cost Model
 
-**Severity**: Missing cost component
+**Severity**: ~~Missing cost component~~ **Mitigated — lower than initially estimated**
 
-The cost model accounts for scan I/O time but completely ignores coordinator
-overhead between sections. Each section transition requires:
+The cost model accounts for scan I/O time but doesn't include coordinator overhead
+between sections. Initial concern was 50-200ms per section transition.
 
-1. Workers report section completion to coordinator
-2. Coordinator collects and merges bloom filters / TupleDomains from all workers
-3. Coordinator generates new split assignments with pruning applied
-4. Coordinator distributes splits and BFs to workers for next section
-5. Workers initialize new stages (task creation, pipeline setup)
+**Code analysis reveals the overhead is much lower than feared:**
 
-In Presto, stage startup alone can be 50-200ms depending on cluster size. For 3
-transfer sections, that's 150-600ms of scheduling overhead.
+1. **All stages are pre-created upfront.** `SqlQueryScheduler` constructor calls
+   `createStageExecutions()` recursively for ALL sections, creating ALL
+   `StageExecutionAndScheduler` objects at query start time. Section transition
+   is just a map lookup via `getStageExecutions()`, not stage creation.
 
-For the cost model's SF-1000 example (total RPT scan time: 0.3s), scheduling
-overhead could **double** the actual RPT latency.
+2. **Split sources are `LazySplitSource`.** `SplitSourceFactory.visitTableScan()`
+   wraps every source in `LazySplitSource` — a lazy proxy that only calls the
+   connector's `getSplits()` on first `getNextBatch()`. Construction is free.
 
-**Impact**: The "25% overhead" claim for RPT on short queries is significantly
-understated. Real overhead may be 50-100% when scheduling is included.
+3. **Section readiness check is pure state inspection.** `isReadyForExecution()`
+   just checks `stageExecution.getState() != PLANNED` and child section states.
+   No I/O, no allocation.
 
-**Resolution needed**: Measure actual section transition latency in Presto. Add
-scheduling overhead to the cost model. This may change the "when to skip RPT"
-thresholds significantly.
+**Actual section transition path:**
+```
+Section N root stage → FINISHED
+  → stateChangeListener calls startScheduling()       (~0ms, callback)
+  → executor.submit(schedule)                          (~1ms, queue)
+  → getSectionsReadyForExecution()                     (~0ms, state checks)
+  → getStageExecutions()                               (~0ms, map lookup)
+  → schedule loop: stageScheduler.schedule()
+    → splitSource.getNextBatch()
+      → LazySplitSource.getDelegate() triggers connector (~10-100ms)
+      → This is the real latency: partition/file listing
+```
+
+**Remaining concern: connector split enumeration latency.** The first
+`getNextBatch()` for each new section hits the connector (Hive metastore,
+Iceberg manifest reads). For large tables this can be 10-100ms. But this is
+**addressable** through eager pre-enumeration:
+
+**Mitigation: eager split pre-enumeration for RPT sections.**
+Since we know at planning time which tables are scanned in Section N+1, the
+`LazySplitSource` can be triggered eagerly during Section N's execution:
+
+```
+Section 0 executing (scanning dims):
+  In parallel: kick off Section 1's LazySplitSource.getDelegate()
+               → Hive/Iceberg enumerates fact table splits in background
+               → Splits buffered, ready for immediate use
+
+Section 0 completes → BFs/TDs arrive at coordinator:
+  → Coordinator prunes pre-enumerated splits using TDs (fast, in-memory)
+  → Section 1 schedule: getNextBatch() returns immediately
+```
+
+Further optimization: **pre-create tasks on workers** using split-to-worker
+affinity from the previous section. `HttpRemoteTaskWithEventLoop.addSplits()`
+supports adding splits to existing tasks. Pattern:
+
+```
+During Section 0:
+  Pre-create tasks on workers with empty split sets (plan fragment only)
+  Workers initialize pipeline, allocate memory
+When Section 0 completes:
+  Coordinator prunes splits → addSplits() to pre-created tasks
+  Workers begin scan immediately (no task startup overhead)
+```
+
+This requires extending `SourcePartitionedScheduler` to support pre-creation
+(currently it couples task creation with split assignment), or using
+`FixedSourcePartitionedScheduler`'s pre-assignment pattern.
+
+**Revised overhead estimate with pre-enumeration:**
+```
+Without pre-enumeration:  ~10-100ms per section transition (connector latency)
+With pre-enumeration:     ~1-5ms per section transition (state check + pruning)
+For 3 RPT sections:       ~3-15ms total (negligible vs. scan time)
+```
+
+**Resolution**: The original 50-200ms estimate was wrong — coordinator overhead
+is near-zero because stages are pre-created. Connector split enumeration is the
+real cost, and it's addressable through eager pre-enumeration during the previous
+section. This should be noted as an optimization in the main design doc rather
+than treated as a blocking issue.
 
 ---
 
