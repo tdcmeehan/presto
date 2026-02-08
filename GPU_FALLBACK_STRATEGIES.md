@@ -769,42 +769,51 @@ which Parquet BFs across different tables won't.
 
 **What Parquet BFs CAN do: row-group pruning with a concrete key set**
 
-The one place Parquet BFs help RPT is during scan phases where RPT already has a
-**concrete key set** (actual key values materialized during a prior scan, not just a
-bloom filter). During the RPT forward pass, the BF-build scan of each dimension table
-collects the actual key values (to insert into the RPT BF). These concrete keys can
-be probed against Parquet BFs on the OTHER table's join key column to prune row groups:
+In theory, Parquet BFs could add a pruning level between Level 3 (min/max range) and
+Level 4 (row-level BF filtering). During the RPT forward pass, the dim scan collects
+concrete key values. These could be probed against each fact row group's Parquet BF
+to skip row groups where no dim keys are present — tighter than min/max when value
+ranges are wide but actual values are sparse.
+
+**Why this is probably not worth it in practice**: Velox uses columnar projection.
+During Level 4, it reads only the join key column first, applies the RPT BF, and
+then reads remaining columns only for surviving rows. So the I/O that row-group-level
+Parquet BF pruning would save is just the **join key column's data pages** for
+skipped row groups — typically a small, narrow integer column. Meanwhile, the cost
+of the Parquet BF check itself (reading each row group's BF from the file footer,
+probing keys against it) may approach or exceed the cost of just reading and
+BF-filtering that narrow column.
 
 ```
-RPT forward pass — scanning fact table with BF_dim already built:
+Cost comparison for a single row group (e.g., 1M rows, int64 join key):
 
-Standard (Level 3 + Level 4 from hierarchy above):
-  Level 3: prune fact row groups using TD_dim min/max range
-  Level 4: decode surviving row groups, BF-filter individual rows
+  Option A — skip via Parquet BF check:
+    Read Parquet BF from footer:  ~4 KB I/O + seek
+    Probe 1000 sampled dim keys:  ~50 μs CPU
+    Total: 4 KB I/O + 50 μs
 
-With Parquet BFs on fact join key (new Level 3.5):
-  Level 3:   prune fact row groups using TD_dim min/max range
-  Level 3.5: for each surviving row group, read its Parquet BF (from metadata)
-             probe a sample of dim keys against it
-             if NO dim keys are possibly present → skip this row group
-  Level 4:   decode remaining row groups, BF-filter individual rows
+  Option B — just read the join key column and BF-filter:
+    Read join key data pages:     ~2-8 MB I/O (compressed int64, 1M rows)
+    Decompress + decode:          ~200 μs CPU
+    BF-probe each row:            ~500 μs CPU
+    Total: 2-8 MB I/O + 700 μs
+
+  Savings from skipping: 2-8 MB I/O + 650 μs per row group
 ```
 
-This is tighter than min/max statistics when value ranges are wide but actual values
-are sparse. Example: a row group has `customer_id` ranging 1 to 1M (min/max says
-"might match"), but its Parquet BF reveals that none of the 50K surviving dimension
-keys are present → skip the entire row group.
+The savings are real but modest per row group. For the Parquet BF approach to
+meaningfully outperform Level 4 alone, you need:
+- High skip rate (>80% of row groups have zero matching keys)
+- Large join key columns (high-cardinality strings, not narrow integers)
+- Expensive decompression (ZSTD at high compression levels)
 
-**Sampling strategy**: Probing ALL dim keys against each row group's Parquet BF may be
-expensive (e.g., 10M dim keys × 1000 row groups = 10B probes). A sampling approach:
-probe a random subset of dim keys (e.g., 1000 keys). If none match, the row group is
-very likely irrelevant. If some match, read the row group normally. False negatives
-(skipping a row group that has matches) are avoided because Parquet BFs have no false
-negatives — only false positives. If ANY probe returns "possibly present," keep the
-row group.
+In the typical star-schema case with integer foreign keys and moderate selectivity,
+Level 4 (read the narrow column, BF-filter, read remaining columns for survivors)
+is already efficient. The Parquet BF check adds complexity for marginal I/O savings.
 
 **Interaction with predicates**: Parquet BFs represent the **unfiltered** contents of
-each row group — they don't know about query predicates. This has two consequences:
+each row group — they don't know about query predicates. This further limits their
+value:
 
 1. **Parquet BFs cannot replace a filtered RPT scan** (additional reason merging fails).
    Even if FPR saturation were somehow solved, the merged BF would contain ALL dim keys,
@@ -814,28 +823,25 @@ each row group — they don't know about query predicates. This has two conseque
    is that predicates on one table reduce the key set used to filter the other table.
    Parquet BFs bypass this filtering entirely.
 
-2. **Parquet BFs on the target table still work fine for Level 3.5 pruning**. The fact
+2. **Parquet BFs on the target table still work for row-group pruning**. The fact
    table's Parquet BFs answer "is customer_id X in this row group?" regardless of what
-   predicates exist on either table. The filtered dim key set (obtained from actually
-   scanning dim with predicates) is probed against each fact row group's BF. Predicates
-   on the dim side make this *more* effective — fewer dim keys means more fact row groups
-   can be ruled out.
+   predicates exist on either table. But as analyzed above, the benefit is marginal
+   when Velox already does columnar projection + Level 4 BF filtering.
 
-| Scenario | Replace dim scan with Parquet BFs? | Level 3.5 pruning on fact? |
-|---|---|---|
-| No predicates on dim | No (FPR saturation) | Yes |
-| Predicate on dim (`region='US'`) | No (FPR saturation + unfiltered keys) | Yes — **more effective** |
-| Predicate on fact (`date > X`) | N/A | Yes — conservative (BF is superset) |
+**Conclusion**: Parquet BFs are not a significant optimization for RPT. The merging
+approach fails (FPR saturation + unfiltered keys). The row-group pruning approach is
+technically sound but provides marginal savings because columnar projection already
+limits the I/O cost of row groups that don't match. RPT's main I/O savings come from
+Levels 1-3 (`TupleDomain` range pruning at partition, file, and row-group granularity)
+and Level 4's efficiency comes from reading only the narrow join key column before
+deciding what else to read. Parquet BFs are not on the critical path for the GPU
+execution strategy.
 
-**Velox integration status**: Velox has a complete `BlockSplitBloomFilter`
+**Velox integration status** (for reference): Velox has a complete `BlockSplitBloomFilter`
 implementation (`velox/dwio/parquet/common/BloomFilter.h`) and Thrift metadata
-support (`bloom_filter_offset` in `ColumnMetaData`). However, reader integration
-is missing — `ParquetData::filterRowGroups()` only uses column statistics (min/max),
-not bloom filters. `ColumnChunkMetaDataPtr` does not expose the bloom filter offset.
-Writer support exists only in test code. The work needed:
-1. Expose `bloom_filter_offset` in `ColumnChunkMetaDataPtr`
-2. Add BF reading to `filterRowGroups()` alongside existing statistics checks
-3. Connect to RPT's scan infrastructure so RPT can pass dim keys for BF probing
+support (`bloom_filter_offset` in `ColumnMetaData`). Reader integration is missing —
+`ParquetData::filterRowGroups()` only uses column statistics. Given the marginal
+benefit analysis above, this is low priority.
 
 ### 4.3 NVLink-Aware Overpartitioning
 
