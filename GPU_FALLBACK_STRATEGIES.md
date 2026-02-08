@@ -728,120 +728,26 @@ application via `CoordinatorDynamicFilter` and split-level pruning.
 
 #### 4.2.8 Parquet Bloom Filters and RPT
 
-Parquet files can contain per-row-group, per-column bloom filters in the file footer
-(Parquet spec 2.10+). These are distinct from RPT's bloom filters — they're pre-built
-at write time and stored in the file metadata. The natural question is whether these
-pre-built BFs can replace RPT scan phases, avoiding data page I/O entirely.
+Parquet files can contain per-row-group, per-column bloom filters (spec 2.10+).
+We investigated whether these could replace or accelerate RPT scan phases.
 
-**Can we OR-merge Parquet BFs to skip an RPT scan phase? No — FPR saturation.**
+**Conclusion: not a significant optimization for RPT.** Two approaches fail:
 
-The appealing idea: instead of scanning a dimension table to build BF_dim, read the
-Parquet BFs from file metadata, OR-merge them across row groups, and use the result
-as BF_dim. Zero data page I/O for that RPT phase.
+1. **OR-merging Parquet BFs to skip a scan phase**: Parquet BFs are sized
+   per-row-group. Merging across R row groups saturates FPR to 99%+ after ~10
+   row groups (the merged BF is completely full). Additionally, merged BFs contain
+   unfiltered keys — useless when the RPT scan applies predicates (the common case).
 
-This doesn't work because Parquet BFs are **sized per-row-group**. OR-merging stuffs
-the entire table's keys into a BF structure sized for one row group:
+2. **Row-group pruning via Parquet BFs**: Technically sound but marginal. Velox
+   already reads only the narrow join key column first (columnar projection), applies
+   the RPT BF, then reads remaining columns for survivors. Parquet BF pruning would
+   only avoid reading that one narrow column for skipped row groups (~2-8 MB per
+   row group for int64 keys). The overhead of the BF check itself approaches this.
 
-```
-Parquet BF sizing: m bits per row group, optimized for n keys at 1% FPR
-  m ≈ 10n bits (rule of thumb, k=7 hash functions)
-
-OR-merge across R row groups (total keys N = R × n):
-  Merged BF: N keys in m = 10n bits (structure sized for n, not N)
-
-  Merged FPR ≈ (1 - e^(-k·N/m))^k = (1 - e^(-0.7·R))^7
-
-  R = 1:    FPR ≈ 1%      (by design — single row group)
-  R = 2:    FPR ≈ 12%     (marginal)
-  R = 5:    FPR ≈ 90%     (useless)
-  R = 10:   FPR ≈ 99.3%   (fully saturated — all bits set)
-  R = 100:  FPR ≈ 100%    (every key "matches")
-```
-
-A typical dimension table has tens to hundreds of row groups. After merging ~10, the
-BF is fully saturated and provides zero filtering. This rules out using merged Parquet
-BFs as a substitute for any RPT scan phase.
-
-A second obstacle: **BFs are not enumerable**. You can ask "is key X in the set?" but
-not "what keys are in the set?" This means you can't directly intersect two BFs to
-check for overlap — unless they share the same size and hash functions (bitwise AND),
-which Parquet BFs across different tables won't.
-
-**What Parquet BFs CAN do: row-group pruning with a concrete key set**
-
-In theory, Parquet BFs could add a pruning level between Level 3 (min/max range) and
-Level 4 (row-level BF filtering). During the RPT forward pass, the dim scan collects
-concrete key values. These could be probed against each fact row group's Parquet BF
-to skip row groups where no dim keys are present — tighter than min/max when value
-ranges are wide but actual values are sparse.
-
-**Why this is probably not worth it in practice**: Velox uses columnar projection.
-During Level 4, it reads only the join key column first, applies the RPT BF, and
-then reads remaining columns only for surviving rows. So the I/O that row-group-level
-Parquet BF pruning would save is just the **join key column's data pages** for
-skipped row groups — typically a small, narrow integer column. Meanwhile, the cost
-of the Parquet BF check itself (reading each row group's BF from the file footer,
-probing keys against it) may approach or exceed the cost of just reading and
-BF-filtering that narrow column.
-
-```
-Cost comparison for a single row group (e.g., 1M rows, int64 join key):
-
-  Option A — skip via Parquet BF check:
-    Read Parquet BF from footer:  ~4 KB I/O + seek
-    Probe 1000 sampled dim keys:  ~50 μs CPU
-    Total: 4 KB I/O + 50 μs
-
-  Option B — just read the join key column and BF-filter:
-    Read join key data pages:     ~2-8 MB I/O (compressed int64, 1M rows)
-    Decompress + decode:          ~200 μs CPU
-    BF-probe each row:            ~500 μs CPU
-    Total: 2-8 MB I/O + 700 μs
-
-  Savings from skipping: 2-8 MB I/O + 650 μs per row group
-```
-
-The savings are real but modest per row group. For the Parquet BF approach to
-meaningfully outperform Level 4 alone, you need:
-- High skip rate (>80% of row groups have zero matching keys)
-- Large join key columns (high-cardinality strings, not narrow integers)
-- Expensive decompression (ZSTD at high compression levels)
-
-In the typical star-schema case with integer foreign keys and moderate selectivity,
-Level 4 (read the narrow column, BF-filter, read remaining columns for survivors)
-is already efficient. The Parquet BF check adds complexity for marginal I/O savings.
-
-**Interaction with predicates**: Parquet BFs represent the **unfiltered** contents of
-each row group — they don't know about query predicates. This further limits their
-value:
-
-1. **Parquet BFs cannot replace a filtered RPT scan** (additional reason merging fails).
-   Even if FPR saturation were somehow solved, the merged BF would contain ALL dim keys,
-   not just those surviving the predicate. Example: `dim WHERE region = 'US'` selects
-   2M of 10M customers. The merged Parquet BF contains all 10M — it's 5x looser than
-   the RPT BF built from actually scanning with the predicate. The whole point of RPT
-   is that predicates on one table reduce the key set used to filter the other table.
-   Parquet BFs bypass this filtering entirely.
-
-2. **Parquet BFs on the target table still work for row-group pruning**. The fact
-   table's Parquet BFs answer "is customer_id X in this row group?" regardless of what
-   predicates exist on either table. But as analyzed above, the benefit is marginal
-   when Velox already does columnar projection + Level 4 BF filtering.
-
-**Conclusion**: Parquet BFs are not a significant optimization for RPT. The merging
-approach fails (FPR saturation + unfiltered keys). The row-group pruning approach is
-technically sound but provides marginal savings because columnar projection already
-limits the I/O cost of row groups that don't match. RPT's main I/O savings come from
-Levels 1-3 (`TupleDomain` range pruning at partition, file, and row-group granularity)
-and Level 4's efficiency comes from reading only the narrow join key column before
-deciding what else to read. Parquet BFs are not on the critical path for the GPU
-execution strategy.
-
-**Velox integration status** (for reference): Velox has a complete `BlockSplitBloomFilter`
-implementation (`velox/dwio/parquet/common/BloomFilter.h`) and Thrift metadata
-support (`bloom_filter_offset` in `ColumnMetaData`). Reader integration is missing —
-`ParquetData::filterRowGroups()` only uses column statistics. Given the marginal
-benefit analysis above, this is low priority.
+RPT's I/O savings come from Levels 1-3 (TupleDomain range pruning at partition, file,
+and row-group granularity) and Level 4's efficiency from columnar projection. Parquet
+BFs are not on the critical path. See `GPU_ALGEBRAIC_MEMORY_TECHNIQUES.md` Section 8
+for the detailed analysis (FPR saturation math, cost comparison, predicate interaction).
 
 ### 4.3 NVLink-Aware Overpartitioning
 
@@ -1298,16 +1204,6 @@ minimized before either touches it.
    works today for LEFT JOINs) handles the critical GPU VRAM constraint. The decomposition
    adds CPU/I/O efficiency on top.
 
-10. **Parquet bloom filter availability in practice**: The Parquet BF + RPT optimizations
-    (Section 4.2.8) depend on Parquet files having bloom filters on join key columns.
-    Key questions:
-    - How common are Parquet BFs in real data lakes? Spark, Trino, and Impala support
-      writing them, but they are opt-in (`parquet.bloom.filter.enabled`).
-    - Should Presto/Velox write BFs on join key columns during CTAS/INSERT? This would
-      benefit future RPT queries but adds ~1-2% write overhead and file size increase.
-    - For tables without BFs, could RPT build and persist BFs as a background maintenance
-      operation (similar to how some databases maintain bloom filter indexes)?
-
 ---
 
 ## 8. References
@@ -1351,12 +1247,6 @@ minimized before either touches it.
 - [Predicate Transfer (CIDR'24)](https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf)
 - [Parachute: Single-Pass Bi-Directional Info Passing (VLDB'25)](https://arxiv.org/abs/2506.13670)
 - [Including Bloom Filters in Bottom-up Optimization](https://arxiv.org/pdf/2505.02994)
-
-### Parquet Bloom Filters
-- [Parquet Bloom Filter Spec](https://parquet.apache.org/docs/file-format/bloomfilter/)
-- Velox `BlockSplitBloomFilter`: `velox/dwio/parquet/common/BloomFilter.h`
-- Velox `filterRowGroups()`: `velox/dwio/parquet/reader/ParquetData.cpp`
-- Velox BF tests: `velox/dwio/parquet/tests/reader/BloomFilterTest.cpp`
 
 ### Polars / cuDF
 - [Polars GPU Engine Release](https://pola.rs/posts/gpu-engine-release/)
