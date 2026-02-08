@@ -726,6 +726,92 @@ output adds one comparison per key per column. RFC-0022's filter distribution
 infrastructure already supports `TupleDomain` serialization and coordinator-side
 application via `CoordinatorDynamicFilter` and split-level pruning.
 
+#### 4.2.8 Parquet Bloom Filters and RPT
+
+Parquet files can contain per-row-group, per-column bloom filters in the file footer
+(Parquet spec 2.10+). These are distinct from RPT's bloom filters — they're pre-built
+at write time and stored in the file metadata. When available, they create three
+optimization opportunities for RPT.
+
+**Opportunity 1: Row-group pruning during RPT forward pass (biggest win)**
+
+RPT's forward pass scans the fact table while applying bloom filters built from
+dimension tables. Currently this filters individual rows after decoding. With Parquet
+BFs on the fact table's join key column, RPT could skip entire row groups before
+reading any data pages:
+
+```
+Without Parquet BFs:
+  Read fact row group → decode join key column → check RPT BF → discard non-matching rows
+  (I/O: read all row groups, filter after decode)
+
+With Parquet BFs:
+  Read fact Parquet metadata → get per-row-group BF for join key column
+  For each row group:
+    Check: does Parquet BF overlap with RPT's key set?
+    If no overlap → SKIP entire row group (zero I/O for data pages)
+    If overlap → read and process normally
+  (I/O: skip row groups with no matching keys)
+```
+
+This is tighter than min/max statistics when value ranges are wide but actual values
+are sparse. Example: a row group might have `customer_id` ranging from 1 to 1M
+(min/max says "might match"), but the Parquet BF reveals that none of the specific
+RPT keys are present. This adds a filtering level between the existing Level 2
+(row-group range pruning) and Level 4 (row-level BF filtering) in the multi-level
+pruning hierarchy above.
+
+**Opportunity 2: Accelerating RPT backward-pass BF construction**
+
+RPT's backward pass reads dimension key columns to build bloom filters. If the
+dimension table already has Parquet BFs on those key columns, RPT could read the
+pre-built BFs from metadata instead of scanning data pages:
+
+```
+Without Parquet BFs:
+  Scan dim key column → read all data pages → build RPT BF
+  Cost: full column I/O + BF construction
+
+With Parquet BFs:
+  Read dim Parquet metadata → extract per-row-group BFs → bitwise-OR merge
+  Cost: metadata I/O only (tiny) + OR operations
+```
+
+Caveat: merging BFs across N row groups via bitwise OR degrades the false-positive
+rate. If each row group BF has FPR = p, merging N row groups gives effective
+FPR ≈ 1 - (1-p)^N. For p=1% and N=100 row groups, effective FPR ≈ 63% — too
+coarse for direct use. This works well only when:
+- Few row groups (small dimension tables — but then scanning is cheap anyway)
+- Used as a coarse pre-filter before building a precise RPT BF from surviving rows
+
+**Opportunity 3: Cross-table row-group pruning (metadata-only)**
+
+Use dimension-side Parquet BFs to prune fact-side row groups without building an
+RPT BF at all — a metadata-only optimization:
+
+```
+1. Read dim table's Parquet BFs for join key column (from metadata)
+2. For each fact row group:
+   Read fact row group's Parquet BF for join key
+   Intersect fact BF with union of dim BFs
+   If no overlap → skip fact row group
+3. No data pages read for either table during the pruning phase
+```
+
+This is a pre-RPT optimization that eliminates obviously irrelevant data before
+RPT's scan passes begin. Its effectiveness depends on both tables having BFs on
+the join key columns.
+
+**Velox integration status**: Velox has a complete `BlockSplitBloomFilter`
+implementation (`velox/dwio/parquet/common/BloomFilter.h`) and Thrift metadata
+support (`bloom_filter_offset` in `ColumnMetaData`). However, reader integration
+is missing — `ParquetData::filterRowGroups()` only uses column statistics (min/max),
+not bloom filters. `ColumnChunkMetaDataPtr` does not expose the bloom filter offset.
+Writer support exists only in test code. The work needed:
+1. Expose `bloom_filter_offset` in `ColumnChunkMetaDataPtr`
+2. Add BF reading to `filterRowGroups()` alongside existing statistics checks
+3. Connect to RPT's scan infrastructure so RPT can pass its key set for BF intersection
+
 ### 4.3 NVLink-Aware Overpartitioning
 
 **Complexity**: Medium | **Impact**: Eliminates skew, bounds per-GPU memory
@@ -1181,6 +1267,16 @@ minimized before either touches it.
    works today for LEFT JOINs) handles the critical GPU VRAM constraint. The decomposition
    adds CPU/I/O efficiency on top.
 
+10. **Parquet bloom filter availability in practice**: The Parquet BF + RPT optimizations
+    (Section 4.2.8) depend on Parquet files having bloom filters on join key columns.
+    Key questions:
+    - How common are Parquet BFs in real data lakes? Spark, Trino, and Impala support
+      writing them, but they are opt-in (`parquet.bloom.filter.enabled`).
+    - Should Presto/Velox write BFs on join key columns during CTAS/INSERT? This would
+      benefit future RPT queries but adds ~1-2% write overhead and file size increase.
+    - For tables without BFs, could RPT build and persist BFs as a background maintenance
+      operation (similar to how some databases maintain bloom filter indexes)?
+
 ---
 
 ## 8. References
@@ -1224,6 +1320,12 @@ minimized before either touches it.
 - [Predicate Transfer (CIDR'24)](https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf)
 - [Parachute: Single-Pass Bi-Directional Info Passing (VLDB'25)](https://arxiv.org/abs/2506.13670)
 - [Including Bloom Filters in Bottom-up Optimization](https://arxiv.org/pdf/2505.02994)
+
+### Parquet Bloom Filters
+- [Parquet Bloom Filter Spec](https://parquet.apache.org/docs/file-format/bloomfilter/)
+- Velox `BlockSplitBloomFilter`: `velox/dwio/parquet/common/BloomFilter.h`
+- Velox `filterRowGroups()`: `velox/dwio/parquet/reader/ParquetData.cpp`
+- Velox BF tests: `velox/dwio/parquet/tests/reader/BloomFilterTest.cpp`
 
 ### Polars / cuDF
 - [Polars GPU Engine Release](https://pola.rs/posts/gpu-engine-release/)
