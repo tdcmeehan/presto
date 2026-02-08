@@ -324,65 +324,36 @@ is handled by `AsyncDataCache` and `FileHandleCache` across RPT sections.
 
 ## Issue 13: Cost Model Assumes Local NVMe — Completely Invalid for S3/HDFS
 
-**Severity**: Fundamental cost model gap
-**Status**: NEW
+**Severity**: ~~Fundamental cost model gap~~ **Addressed — multi-tier model added**
+**Status**: Addressed
 
-The entire quantitative cost model (lines 378-402) is based on a specific hardware
-configuration: "2x EPYC 7763, 170 GB/s NVMe, 8x A100 80GB." This is an on-premise
-setup with local SSDs.
+The main doc now includes a multi-tier storage cost model covering local NVMe, HDFS,
+S3 (CPU instances), and S3 (GPU instances). Key finding: RPT overhead is higher on
+remote storage (~1-4s vs 0.3s), but RPT's value scales proportionally — the main
+query I/O savings also grow with slower storage. Net speedup ratio (~3.5x with 90%
+selectivity) is roughly constant across tiers.
 
-**Most Presto deployments read from remote storage** (S3, GCS, HDFS, ADLS). The
-performance characteristics are radically different:
+Additional insight: GPU instances (p4d, p5) have 400-3200 Gbps network bandwidth to
+S3, making S3 reads on GPU clusters comparable to HDFS on CPU clusters. The RPT skip
+threshold is now storage-aware (~2s for NVMe, ~10s for HDFS, ~30s for S3).
 
-```
-                    Local NVMe    S3 (per-worker)    HDFS (per-worker)
-Sequential read:    170 GB/s      ~0.5-2 GB/s        ~1-5 GB/s
-Request latency:    ~50 μs        ~10-50 ms           ~1-5 ms
-Request cost:       free          $0.40/M GETs        free
-```
-
-The cost model says RPT forward pass reads 20GB of key columns in 0.12s. On S3
-at 1 GB/s per worker with 10 workers, that's 20GB / (10 × 1 GB/s) = 2s — 17x
-longer. More critically, RPT's key-column-only reads generate many small I/O
-requests (one per row group per file), and S3 latency per request is 10-50ms.
-For 5000 row groups across 100 files: 5000 GETs × 30ms = 150s sequentially.
-Even with parallelism and coalescing, S3 request overhead dominates.
-
-**Impact**: The "0.3s total RPT overhead" is specific to local NVMe. On S3, RPT
-overhead could be 5-30s — still potentially worthwhile for long queries, but the
-cost-benefit calculus changes dramatically. The "skip RPT for short queries" threshold
-shifts from <5s to potentially <60s.
-
-**Resolution needed**: Present cost models for at least three storage tiers: local
-NVMe, HDFS, and S3. The RPT skip threshold should be storage-aware. The cost
-heuristic should use actual storage bandwidth (measurable at runtime) rather than
-assuming local NVMe.
+**Remaining gap**: The cost model doesn't account for S3 monetary cost ($0.40/M GETs).
+RPT's extra scan passes generate additional GET requests. For very high query volumes,
+this could matter for cost-conscious deployments.
 
 ---
 
 ## Issue 14: Parquet BF Section Is 115 Lines to Conclude "Not Worth It"
 
-**Severity**: Structural bloat
-**Status**: NEW
+**Severity**: ~~Structural bloat~~ **Resolved**
+**Status**: Resolved
 
-Section 4.2.8 (lines 729-844) spends ~115 lines analyzing Parquet bloom filters
-and their interaction with RPT, including FPR saturation math, cost comparisons,
-and predicate interaction tables. The conclusion: "Parquet BFs are not a significant
-optimization for RPT" and "not on the critical path for the GPU execution strategy."
-
-This is a research dead end documented at the same level of detail as the core
-strategies. It buries the actual conclusion and makes the document harder to read.
-A reader navigating Section 4.2 encounters this long diversion between the important
-progressive split pruning section and Section 4.3.
-
-**Impact**: The doc's signal-to-noise ratio is degraded. Key design decisions
-(NVLink overpartitioning, Grace hash join) get the same page space as this dead end.
-
-**Resolution needed**: Condense Section 4.2.8 to ~15-20 lines: state the question,
-give the two reasons it doesn't work (FPR saturation on merge, marginal savings vs
-columnar projection for row-group pruning), and the conclusion. Move the detailed
-analysis to the research companion doc (`GPU_ALGEBRAIC_MEMORY_TECHNIQUES.md`) or
-an appendix.
+Section 4.2.8 condensed from ~115 lines to ~18 lines. The main doc now states the
+question, gives two-sentence summaries of each failure mode (FPR saturation on merge,
+marginal savings vs columnar projection), and the conclusion. The detailed analysis
+(FPR math, cost comparison, predicate interaction) moved to
+`GPU_ALGEBRAIC_MEMORY_TECHNIQUES.md` Section 8. Open Question 10 (Parquet BF
+availability) removed as moot given the "not worth it" conclusion.
 
 ---
 
@@ -513,14 +484,14 @@ as an independent solution.
 | 10 | Amortization | **OPEN** | HBO inversion problem |
 | 11 | Memory pressure | **OPEN** | Salted joins replicate build side |
 | 12 | Cost model | Resolved | Parquet metadata I/O |
-| 13 | Cost model | **NEW** | S3/HDFS storage invalidates cost numbers |
-| 14 | Structure | **NEW** | 115-line dead-end Parquet BF section |
+| 13 | Cost model | Addressed | S3/HDFS multi-tier cost model added |
+| 14 | Structure | Resolved | Parquet BF section condensed to 18 lines |
 | 15 | Structure | **NEW** | Duplicate section numbering |
 | 16 | Unsupported claim | **NEW** | Superlinear efficiency uncited |
 | 17 | Cost model | **NEW** | CTE materialization cost missing |
 | 18 | Fallback chain | **NEW** | Reduced hash table still > VRAM |
 
-**Open issues**: 12 (7 original + 5 new)
-**Mitigated**: 4 (Issues 1, 3, 5, 7-partial)
-**Resolved**: 1 (Issue 12)
-**Highest priority**: Issues 2 (misleading claims), 13 (S3 cost model), 18 (fallback composition)
+**Open issues**: 10 (7 original + 3 new)
+**Mitigated/Addressed**: 6 (Issues 1, 3, 5, 7-partial, 13)
+**Resolved**: 2 (Issues 12, 14)
+**Highest priority**: Issues 2 (misleading claims), 18 (fallback composition), 15 (section numbering bug)
