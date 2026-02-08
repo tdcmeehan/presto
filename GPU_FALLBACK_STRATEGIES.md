@@ -280,18 +280,35 @@ RPT is not a GPU-specific technique — it is a **general query execution optimi
 that benefits both CPU and GPU execution. The GPU VRAM bounding effect is a bonus on
 top of its primary value:
 
+- **Join operator efficiency (superlinear improvement)**: RPT pre-reduction doesn't
+  just reduce the *number* of rows the join processes — it makes the join faster *per
+  row*. Hash table build and probe cost is superlinear due to collision chains: a hash
+  table at 75% load has ~4x more cache misses per probe than one at 25% load. A 10x
+  smaller table isn't just 10x less work — it's 10x fewer rows each processed
+  significantly faster. Both build and probe sides benefit: fewer build rows → smaller
+  table → fewer collisions; fewer probe rows → fewer lookups → less output to
+  materialize downstream.
 - **CPU cache locality**: A hash table that shrinks from 40GB to 400MB moves from
-  thrashing main memory (~50 GB/s random access) to fitting in L3 cache (hundreds of
-  GB/s effective bandwidth). Join probe throughput improves dramatically.
+  thrashing main memory (~50 GB/s random access, much lower effective bandwidth due to
+  pointer chasing) to fitting in L3 cache (256-384MB on modern servers, hundreds of
+  GB/s effective bandwidth). The throughput difference for random-access hash probes is
+  10-50x faster *per probe*, compounding with the row count reduction.
 - **Eliminates hash join spilling**: Presto's hash join spill-to-disk becomes
   unnecessary for most queries when RPT reduces build sides by 10-100x.
 - **Pipeline-wide data reduction**: Every operator downstream — filter, project,
-  join probe, aggregation, shuffle — processes fewer rows. The savings compound.
+  join probe, aggregation, shuffle — processes fewer rows. The savings compound
+  multiplicatively across a multi-join query.
 - **Join order robustness**: The paper's primary contribution. Bad cardinality
   estimates → bad join order → 100x+ execution time blowup. With RPT, the worst
   join order is only 1.6x slower than the best. This matters for any execution engine.
-- **GPU VRAM bounding**: Reduced hash tables fit in VRAM without OOM, Grace
-  partitioning, or UVM. This is a significant bonus but not the primary motivation.
+- **GPU join efficiency**: On GPU, the effect is even more pronounced. GPU hash joins
+  need the hash table in HBM (High Bandwidth Memory). A compact table stays hot in the
+  GPU's L2 cache (40-50MB on H100), enabling thousands of threads to probe
+  simultaneously without contention. When the table exceeds L2, each probe becomes a
+  random HBM access — still fast (3.35 TB/s) but far slower than L2-resident probes.
+  RPT reduction can mean the difference between L2-resident and HBM-thrashing for many
+  analytical joins. Additionally, a table that fits entirely in VRAM avoids UVM page
+  faulting or Grace partitioning overhead entirely.
 
 The RPT paper's DuckDB evaluation (CPU-only) showed **1.5x geometric mean speedup**
 across TPC-H, JOB, and TPC-DS — with no GPU involved. Combined with Velox's data
