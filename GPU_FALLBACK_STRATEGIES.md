@@ -609,6 +609,50 @@ gating to avoid materializing small subqueries where the overhead exceeds the RP
 parallel — among the fastest operations on GPU. Bloom filters (~150MB) always fit in
 VRAM. The row-level BF probing happens on GPU after decode, at billions of probes/sec.
 
+**RPT join type support**: RPT's BF filtering is only safe on the **non-preserved side**
+of a join. Filtering the preserved side of an outer join would incorrectly eliminate rows
+that should produce NULL-padded output. This yields the following support matrix:
+
+| Join Type | Filter Left w/ BF_right | Filter Right w/ BF_left | RPT Value |
+|---|---|---|---|
+| **INNER** | Yes | Yes | Full — bidirectional reduction |
+| **LEFT OUTER** | **No** (left preserved) | Yes | Partial — right (build) side only |
+| **RIGHT OUTER** | Yes | **No** (right preserved) | Partial — left (probe) side only |
+| **FULL OUTER** | **No** | **No** | None — RPT cannot help |
+| **SEMI** (EXISTS) | Yes | Yes | Full — bidirectional |
+| **ANTI** (NOT EXISTS) | No (BF can't identify definite non-matches) | Yes | Minimal |
+| **CROSS** | N/A (no join keys) | N/A | None |
+
+This is the same constraint Presto's existing dynamic filters follow —
+`PredicatePushDown.createDynamicFilters()` only generates dynamic filters for `INNER`
+and `RIGHT` joins (line 699), because only those allow filtering the probe (left) side.
+
+**LEFT JOIN is the critical limitation for analytics.** Star schema queries often use
+`fact LEFT JOIN dim` to preserve all fact rows. RPT can still filter the dim (build)
+side using BF_fact — reducing the hash table — but **cannot filter the fact (probe)
+side** using selective dimension BFs. The most valuable direction (using
+`dim.region = 'US'` to prune 80% of the fact table) is blocked.
+
+**Mitigations**:
+
+1. **Outer-to-inner conversion** (already implemented): `PredicatePushDown.
+   tryNormalizeToOuterToInnerJoin()` converts LEFT/RIGHT/FULL joins to INNER when a
+   downstream predicate makes the NULL-preserving behavior impossible (e.g.,
+   `WHERE dim.column IS NOT NULL`, `WHERE dim.column > 5`). This is very common in
+   practice — most analytical LEFT JOINs have such predicates. After conversion, RPT
+   has full bidirectional support.
+
+2. **Build-side-only reduction**: Even for true LEFT JOINs where conversion isn't
+   possible, RPT's backward pass (BF_fact → filter dims) still reduces the hash table
+   build side. This provides the superlinear join efficiency benefits (fewer collisions,
+   cache residency) and eliminates spilling. The fact table isn't reduced, but the join
+   operator itself is faster.
+
+3. **RPT-aware join type annotation**: The RPT planner should annotate each join with
+   its BF filtering capability. For INNER/SEMI: bidirectional BF passes. For LEFT/RIGHT:
+   unidirectional BF pass (non-preserved side only). For FULL/CROSS: skip RPT for that
+   join entirely. This avoids wasting BF-build effort on directions that can't be used.
+
 **Interaction with Dynamic Filtering (RFC-0022)**: RPT bloom filters and dynamic filter
 `TupleDomain` ranges serve **complementary roles** at different pipeline levels:
 
