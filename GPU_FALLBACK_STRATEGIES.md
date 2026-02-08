@@ -803,6 +803,30 @@ very likely irrelevant. If some match, read the row group normally. False negati
 negatives — only false positives. If ANY probe returns "possibly present," keep the
 row group.
 
+**Interaction with predicates**: Parquet BFs represent the **unfiltered** contents of
+each row group — they don't know about query predicates. This has two consequences:
+
+1. **Parquet BFs cannot replace a filtered RPT scan** (additional reason merging fails).
+   Even if FPR saturation were somehow solved, the merged BF would contain ALL dim keys,
+   not just those surviving the predicate. Example: `dim WHERE region = 'US'` selects
+   2M of 10M customers. The merged Parquet BF contains all 10M — it's 5x looser than
+   the RPT BF built from actually scanning with the predicate. The whole point of RPT
+   is that predicates on one table reduce the key set used to filter the other table.
+   Parquet BFs bypass this filtering entirely.
+
+2. **Parquet BFs on the target table still work fine for Level 3.5 pruning**. The fact
+   table's Parquet BFs answer "is customer_id X in this row group?" regardless of what
+   predicates exist on either table. The filtered dim key set (obtained from actually
+   scanning dim with predicates) is probed against each fact row group's BF. Predicates
+   on the dim side make this *more* effective — fewer dim keys means more fact row groups
+   can be ruled out.
+
+| Scenario | Replace dim scan with Parquet BFs? | Level 3.5 pruning on fact? |
+|---|---|---|
+| No predicates on dim | No (FPR saturation) | Yes |
+| Predicate on dim (`region='US'`) | No (FPR saturation + unfiltered keys) | Yes — **more effective** |
+| Predicate on fact (`date > X`) | N/A | Yes — conservative (BF is superset) |
+
 **Velox integration status**: Velox has a complete `BlockSplitBloomFilter`
 implementation (`velox/dwio/parquet/common/BloomFilter.h`) and Thrift metadata
 support (`bloom_filter_offset` in `ColumnMetaData`). However, reader integration
