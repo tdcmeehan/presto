@@ -274,7 +274,29 @@ time — negligible for analytical queries.
 
 ### 4.2 RPT via Sections (Bloom Filter Pre-Reduction)
 
-**Complexity**: Medium-High | **Impact**: 10-100x smaller hash tables
+**Complexity**: Medium-High | **Impact**: 10-100x smaller hash tables | **Applies to**: CPU and GPU
+
+RPT is not a GPU-specific technique — it is a **general query execution optimization**
+that benefits both CPU and GPU execution. The GPU VRAM bounding effect is a bonus on
+top of its primary value:
+
+- **CPU cache locality**: A hash table that shrinks from 40GB to 400MB moves from
+  thrashing main memory (~50 GB/s random access) to fitting in L3 cache (hundreds of
+  GB/s effective bandwidth). Join probe throughput improves dramatically.
+- **Eliminates hash join spilling**: Presto's hash join spill-to-disk becomes
+  unnecessary for most queries when RPT reduces build sides by 10-100x.
+- **Pipeline-wide data reduction**: Every operator downstream — filter, project,
+  join probe, aggregation, shuffle — processes fewer rows. The savings compound.
+- **Join order robustness**: The paper's primary contribution. Bad cardinality
+  estimates → bad join order → 100x+ execution time blowup. With RPT, the worst
+  join order is only 1.6x slower than the best. This matters for any execution engine.
+- **GPU VRAM bounding**: Reduced hash tables fit in VRAM without OOM, Grace
+  partitioning, or UVM. This is a significant bonus but not the primary motivation.
+
+The RPT paper's DuckDB evaluation (CPU-only) showed **1.5x geometric mean speedup**
+across TPC-H, JOB, and TPC-DS — with no GPU involved. Combined with Velox's data
+cache (which makes the rescan cost negligible, see below), RPT is worth implementing
+for Presto regardless of GPU plans.
 
 Use Presto's section model to implement RPT transfer phases. The transfer schedule
 maps naturally onto sections:
@@ -757,12 +779,16 @@ For the reference hardware (8x A100, 128 CPU cores, 200 GB/s aggregate PCIe):
   per-fragment. No query ever fails due to GPU limitations. As cuDF support expands,
   more fragments automatically route to GPU with zero coordinator changes.
 
-### Phase 2: RPT Transfer Sections
+### Phase 2: RPT Transfer Sections (Benefits CPU and GPU)
 - Extend Dynamic Filtering with bloom filter support (`filterType: "bloomFilter"`)
 - Implement transfer schedule generation (LargestRoot algorithm) in planner
 - Model RPT phases as sections with `BloomFilterBuildStage`
 - Use existing filter distribution infrastructure for BF propagation
-- **Result**: Hash tables shrink 10-100x; most joins fit in VRAM
+- Split-to-worker affinity across sections for Velox `AsyncDataCache` hits
+- **Result**: Hash tables shrink 10-100x. On CPU: eliminates hash join spilling,
+  improves cache locality, provides join order robustness (worst case 1.6x of best).
+  On GPU: most joins fit in VRAM. Benefits both execution paths — this phase is
+  valuable independent of GPU adoption.
 
 ### Phase 3: NVLink-Aware Overpartitioning + Salted Aggregation
 - Add NVLink topology detection to worker capability reporting
