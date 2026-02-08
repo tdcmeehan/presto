@@ -1136,6 +1136,51 @@ minimized before either touches it.
    (mix of H100, A100, older generations) with different VRAM sizes and compute capabilities?
    Should the cost heuristic adapt per-worker based on GPU generation?
 
+9. **RPT for LEFT JOINs — probe-side I/O reduction via plan decomposition**: RPT cannot
+   filter the preserved (probe) side of a LEFT JOIN — every fact row must appear in the
+   output. For GPU, this is less critical than it sounds: the probe side streams through
+   in batches and never needs to fit in VRAM, while the build side (hash table) does. RPT's
+   backward pass already reduces the build side for LEFT JOINs, which is the primary GPU
+   win (VRAM feasibility).
+
+   However, for CPU-bound queries and I/O-bound workloads, probe-side reduction would
+   provide significant additional value (fewer hash lookups, less downstream data). A
+   potential approach is **plan-level decomposition** inspired by relational algebra:
+
+   ```
+   fact LEFT JOIN dim
+   ≡ (fact INNER JOIN dim) UNION ALL (fact ANTI JOIN dim → NULL-pad)
+   ```
+
+   The INNER JOIN portion gets full bidirectional RPT — including I/O pruning on fact
+   (row group and file skipping via TupleDomain). The ANTI JOIN portion handles the
+   NULL-preserved rows. With `AsyncDataCache`, the two scans share cached pages, so
+   total storage I/O is approximately the same as a single scan:
+
+   ```
+   INNER scan: reads 20% of fact row groups from storage → cached
+   ANTI scan:  20% cached (hit), reads remaining 80% from storage
+   Total storage I/O: 100% — same as single scan
+
+   But: INNER portion processes 80% less data through the hash join
+        ANTI portion just emits rows with NULLs (no hash probe needed)
+   ```
+
+   **HBO-informed decision**: HBO's `JoinNodeStatistics` tracks the historical unmatched
+   rate (probe rows with no build match). This determines whether decomposition is
+   worthwhile:
+   - High unmatched rate (>20%): large ANTI portion emitted cheaply, INNER portion
+     significantly reduced — decomposition is valuable
+   - Very low unmatched rate (<1%): nearly all rows go through INNER anyway — the ANTI
+     portion is negligible, but so is the benefit of decomposition
+   - Zero unmatched rate across multiple runs: the LEFT JOIN is behaviorally INNER — the
+     outer-to-inner conversion in `PredicatePushDown` may have missed it (no static
+     predicate to trigger conversion). HBO could flag this for RPT purposes.
+
+   This is a future optimization — the build-side reduction from the backward pass (which
+   works today for LEFT JOINs) handles the critical GPU VRAM constraint. The decomposition
+   adds CPU/I/O efficiency on top.
+
 ---
 
 ## 8. References
