@@ -450,6 +450,64 @@ of the data, but read only once) hit storage.
 - If query is scan-dominant with trivial joins: skip RPT (overhead > benefit)
 - If join selectivity is low (most keys match): skip RPT (BF won't filter much)
 
+**RPT vs. perfect optimization**: With perfect statistics and an optimal join order, RPT's
+extra scans are pure overhead — the optimizer already minimizes intermediate result sizes.
+However, even optimal join ordering doesn't provide *full reduction*: intermediate results
+after early joins still contain rows that won't survive later joins. RPT eliminates those
+rows before any join executes, approximating Yannakakis's guarantee that no intermediate
+result exceeds the final output size. In practice, the question is moot — cardinality
+estimation errors compound multiplicatively across joins (3x error per join → 81x for 4
+joins), so "perfect stats" is rarely achieved.
+
+**HBO-informed RPT (History-Based Optimizer integration)**: Presto's HBO collects actual
+runtime statistics per plan node — row counts, data sizes, and critically,
+`JoinNodeStatistics` (actual build/probe key counts and NULL key counts per join). These
+are stored keyed by a canonical plan hash (SHA-256 of normalized plan JSON) and matched
+to future queries within a configurable input-size tolerance (default 10%). This enables
+**precise, per-join RPT decisions**:
+
+```
+First run (no HBO data):
+  Apply RPT conservatively — safety net for unknown selectivities.
+  HBO collects: actual join build sizes, join selectivities, row counts.
+
+Subsequent runs (HBO available):
+  For each join, HBO provides actual stats from previous execution:
+    actual_build_size = 2GB   → skip BF for this join (fits in L3/VRAM)
+    actual_build_size = 50GB  → apply BF (would blow L3 cache or VRAM)
+    actual_selectivity = 95%  → BF very valuable, definitely apply
+    actual_selectivity = 5%   → BF barely helps, skip to save scan cost
+
+  Result: selective RPT — BF passes only for joins where they matter.
+  Overhead drops from "BF for every join" to "BF for the 1-2 joins that need it."
+```
+
+HBO transforms RPT from an always-on safety net into a **surgically targeted
+optimization**:
+
+- **Skip/apply decision uses actuals, not estimates**: `join_build_ACTUAL_size`
+  (from HBO) replaces `join_build_estimated_size` — a reliable threshold check
+  instead of a guess.
+- **Per-join selectivity gating**: HBO's `JoinNodeStatistics` reveals which joins
+  have high selectivity (BF valuable) vs. low selectivity (BF wasteful). Only the
+  high-selectivity joins get BF transfer passes.
+- **First-run amortization**: The first execution of a new query pattern pays the
+  full RPT overhead (conservative, all joins). Every subsequent execution benefits
+  from HBO data and applies RPT selectively. For recurring analytical workloads
+  (dashboards, reports), the amortization is near-immediate.
+- **Data drift detection**: If HBO's input-size matching (10% tolerance) fails —
+  meaning the underlying data has changed significantly — the planner reverts to
+  conservative RPT. This automatically re-triggers the safety net when conditions
+  change.
+
+Key HBO infrastructure reused:
+- `HistoryBasedPlanStatisticsCalculator`: provides actual stats during planning
+- `JoinNodeStatistics`: actual build/probe key counts per join
+- `CanonicalPlanGenerator`: plan fingerprinting for cross-query matching
+- `HistoryBasedPlanStatisticsTracker.updateStatistics()`: collects runtime stats
+  post-execution (add RPT-specific metrics: BF reduction ratio, BF build time)
+- `RedisPlanStatisticsProvider`: persistent storage for HBO data across restarts
+
 **Integration with Dynamic Filtering RFC**: RFC-0022 already provides:
 - Filter collection infrastructure (`DynamicFilterFetcher`, long-polling)
 - Filter merging (`CoordinatorDynamicFilter`, `TupleDomain.columnWiseUnion()`)
@@ -785,10 +843,12 @@ For the reference hardware (8x A100, 128 CPU cores, 200 GB/s aggregate PCIe):
 - Model RPT phases as sections with `BloomFilterBuildStage`
 - Use existing filter distribution infrastructure for BF propagation
 - Split-to-worker affinity across sections for Velox `AsyncDataCache` hits
+- HBO integration: use `JoinNodeStatistics` actuals to gate RPT per-join, track BF
+  reduction ratios for future planning, skip RPT when HBO confirms joins are small
 - **Result**: Hash tables shrink 10-100x. On CPU: eliminates hash join spilling,
   improves cache locality, provides join order robustness (worst case 1.6x of best).
   On GPU: most joins fit in VRAM. Benefits both execution paths — this phase is
-  valuable independent of GPU adoption.
+  valuable independent of GPU adoption. HBO amortizes overhead after first run.
 
 ### Phase 3: NVLink-Aware Overpartitioning + Salted Aggregation
 - Add NVLink topology detection to worker capability reporting
@@ -964,6 +1024,10 @@ minimized before either touches it.
 - `AsyncDataCache` config: `presto-native-execution/presto_cpp/main/common/Configs.h` (lines 406-468)
 - `SsdCache` setup: `presto-native-execution/presto_cpp/main/PrestoServer.cpp` (`setupSsdCache()`)
 - Alluxio cache: `presto-cache/src/main/java/com/facebook/presto/cache/alluxio/AlluxioCacheConfig.java`
+- `HistoryBasedPlanStatisticsCalculator`: `presto-main-base/.../cost/HistoryBasedPlanStatisticsCalculator.java`
+- `JoinNodeStatistics`: `presto-spi/.../statistics/JoinNodeStatistics.java`
+- `CanonicalPlanGenerator`: `presto-main-base/.../planner/CanonicalPlanGenerator.java`
+- `HistoryBasedPlanStatisticsTracker`: `presto-main-base/.../cost/HistoryBasedPlanStatisticsTracker.java`
 
 ### GPU Data Path
 - [GPUDirect Storage](https://developer.nvidia.com/blog/gpudirect-storage/)
