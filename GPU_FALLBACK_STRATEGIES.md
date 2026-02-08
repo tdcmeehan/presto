@@ -421,6 +421,51 @@ start producing results), but it is not wasted I/O — it is an investment that
 typically reduces the main query's I/O substantially. For longer queries (>10s),
 the latency overhead drops below 3%, while the I/O savings grow with table size.
 
+**Multi-tier storage cost model**: The 0.3s overhead above assumes local NVMe. Most
+Presto deployments read from remote storage (S3, GCS, HDFS). RPT overhead is higher
+on remote storage — but RPT's **value is also higher**, because the I/O savings are
+amplified by the slower bandwidth.
+
+RPT's key-column-only reads generate one S3 byte-range GET per row group per file
+(~2-4MB each for int64 keys). Velox's `CachedBufferedInput` coalesces reads within
+512KB (`maxCoalesceDistance`), but row groups are ~128MB apart — so each key column
+chunk is a separate request. For 5000 row groups across 10 workers = 500 requests
+per worker at 32 concurrent:
+
+```
+RPT forward pass overhead (400GB fact, 10 workers, 500 RG reads/worker):
+
+                     Local NVMe   HDFS          S3 (CPU inst)   S3 (GPU inst)
+Per-worker BW:       17 GB/s      3 GB/s        1.2 GB/s        12-50 GB/s
+Request latency:     0.05 ms      3 ms          30 ms           30 ms
+Forward pass:        ~0.12s       ~0.8s         ~2.2s           ~0.5s
+Total RPT overhead:  ~0.3s        ~1.5s         ~4s             ~1s
+```
+
+But RPT's savings scale with storage slowness. With 90% BF selectivity, the main
+query reads 60GB instead of 400GB. The savings dwarf the overhead on slow storage:
+
+```
+End-to-end query time (400GB fact, 90% BF selectivity):
+
+                     Local NVMe   HDFS          S3 (CPU inst)   S3 (GPU inst)
+Without RPT:         2.4s         13s           33s             8s
+RPT overhead:        0.3s         1.5s          4s              1s
+Main query w/ RPT:   0.4s         2s            5s              1.2s
+Total with RPT:      0.7s         3.5s          9s              2.2s
+Net speedup:         3.4x         3.7x          3.7x            3.6x
+```
+
+RPT provides roughly the **same speedup ratio** regardless of storage tier — the
+overhead and savings both scale linearly with storage latency. The "skip RPT for
+short queries" threshold is storage-aware: ~2s on local NVMe, ~10s on HDFS, ~30s
+on S3. But most analytical queries on 400GB tables already exceed these thresholds.
+
+Note: GPU instances (p4d.24xlarge, p5.48xlarge) have 400-3200 Gbps network bandwidth
+to S3 — far higher than typical CPU instances (10-25 Gbps). This makes S3 reads on
+GPU clusters comparable to HDFS on CPU clusters, partially offsetting the S3 latency
+overhead. The S3 request latency (30ms) becomes the bottleneck, not bandwidth.
+
 **Why RPT isn't broadly adopted — and how Presto can avoid the pitfall**: The RPT
 paper's DuckDB implementation avoids the rescan penalty entirely by **buffering scanned
 data in memory**. The `CreateBF` operator acts as both sink and source: during the Sink
@@ -500,6 +545,9 @@ of the data, but read only once) hit storage.
 - If `join_build_estimated_size < VRAM_budget`: skip RPT (hash table fits anyway)
 - If query is scan-dominant with trivial joins: skip RPT (overhead > benefit)
 - If join selectivity is low (most keys match): skip RPT (BF won't filter much)
+- If query estimated time < RPT overhead threshold: skip RPT. The threshold is
+  storage-aware: ~2s for local NVMe, ~10s for HDFS, ~30s for S3 (CPU instances).
+  HBO can refine this using actual query durations from previous runs.
 
 **RPT vs. perfect optimization**: With perfect statistics and an optimal join order, RPT's
 extra scans are pure overhead — the optimizer already minimizes intermediate result sizes.
