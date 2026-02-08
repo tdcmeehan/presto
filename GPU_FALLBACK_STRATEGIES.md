@@ -534,11 +534,15 @@ If W1 fails between sections:
   Stats tracked via NodeSelectionStats.preferredNonAliveNodeSkippedCount.
 ```
 
-**Idle-time prefetch of non-key columns**: During RPT Section 2 (backward pass on
-dims), fact-table workers are idle — they're not scanning fact data. After Section 1,
-these workers know exactly which fact row groups survived BF filtering. This idle
-time can be used to prefetch the surviving row groups' non-key columns into the
-`AsyncDataCache`, so that Section 3 (main query) gets cache hits instead of cold reads:
+**Amortizing RPT overhead via idle-time prefetch**: RPT's fundamental cost is the
+extra scan passes (Sections 0-2) before the main query. During the backward pass
+(Section 2), fact-table workers are idle — dim workers are scanning, but fact workers
+have nothing to do. This idle time is pure overhead on the wall clock. Prefetch
+converts that idle time into useful I/O: fact workers prefetch surviving row groups'
+non-key columns into `AsyncDataCache`, so Section 3 finds warm pages instead of cold
+reads. The RPT overhead doesn't disappear, but it becomes partially self-amortizing —
+the time that RPT "costs" is spent doing work that the main query would otherwise
+have to do itself.
 
 ```
 Section 1 (forward — fact):
@@ -557,68 +561,53 @@ Section 2 (backward — dims):
 Section 3 (main query):
   Fact workers: non-key columns already warm in AsyncDataCache
     → cache hits at ~200 GB/s memory bandwidth
-    → no cold storage reads (they happened during Section 2)
+    → cold storage reads reduced or eliminated
 ```
 
-Velox already has the prefetch infrastructure:
-- `CachedBufferedInput::prefetch(Region)`: public API for proactive cache loading
-- Background executor thread pool for non-blocking I/O
-- `shouldPreload()` checks cache capacity to avoid eviction pressure
-- `CoalescedLoad` batches multiple small reads into efficient I/O requests
-
-New work needed: a mechanism to map (rowGroupId, columnSet) → Region for hint-based
-prefetch. Today `scheduleRowGroups()` does sequential prefetch (current + N ahead);
-this extends it to arbitrary row group sets based on RPT survival information.
-
-**On S3, this prefetch is especially valuable**: The S3 request latency (30ms per GET)
-that dominates RPT overhead on remote storage is completely hidden — the GETs are
-in-flight during Section 2 while dim workers do their scans. By Section 3, the
-surviving row groups' data is already in cache. This effectively eliminates the
-"cold read" penalty in the main query for all storage tiers.
-
-**Revised cost model with caching and prefetch** (same reference hardware):
+**Cost model — RPT overhead amortization** (same reference hardware):
 
 ```
 Without caching (every scan hits storage):
-  Forward dims:    0.10s (key-only, cold)
-  Forward fact:    0.12s (key-only, cold)
-  Backward dims:   0.10s (key-only, cold — no affinity)
+  RPT overhead:    0.32s (forward + backward, cold)
   Main query scan: 0.60s (full columns, cold)
   Total I/O:       0.92s
 
 With SOFT_AFFINITY + AsyncDataCache (no prefetch):
-  Forward dims:    0.10s (key-only, cold — warms cache)
-  Forward fact:    0.12s (key-only, cold — warms cache)
-  Backward dims:   0.01s (key-only, cache hit — ~200 GB/s memory BW)
+  RPT overhead:    0.23s (backward is cache hit, ~0.01s)
   Main query scan: 0.50s (key columns cached, non-key columns cold)
   Total I/O:       0.73s
+  RPT net cost:    0.23s overhead, saves nothing on main query non-key reads
 
 With SOFT_AFFINITY + AsyncDataCache + idle-time prefetch:
-  Forward dims:    0.10s (key-only, cold — warms cache)
-  Forward fact:    0.12s (key-only, cold — warms cache, record surviving RGs)
-  Backward dims:   0.01s (key-only, cache hit)
-    + concurrent:  fact workers prefetch surviving RGs' non-key columns
-                   (overlaps with backward dim scan — no added wall time)
+  RPT overhead:    0.23s (same wall time, but fact workers prefetching)
   Main query scan: 0.05s (ALL columns warm in cache — memory speed)
   Total I/O:       0.28s
-
-RPT overhead with prefetch: ~0.23s (forward + backward, prefetch is free)
-Main query: nearly free (cache hits)
+  RPT net cost:    0.23s overhead, but main query drops by 0.45s
+                   → RPT overhead is more than paid back
 ```
 
-The prefetch turns the main query from a storage-bound operation into a
-memory-bound one. The 0.60s main query scan drops to ~0.05s because both key
-columns (from Section 1 cache) and non-key columns (from Section 2 prefetch) are
-warm. The prefetch itself adds zero wall time — it runs concurrently with the
-backward dim scan in Section 2.
+The key insight: the 0.23s of RPT overhead is still on the wall clock, but it's no
+longer idle time. The backward pass duration that used to be pure cost now does double
+duty — dim workers build backward BFs while fact workers warm the cache. RPT's cost
+effectively pays for itself by preloading Section 3's data.
 
-For the prefetch to complete within Section 2's time window, the surviving data
-volume must be readable within the backward scan duration. With 90% BF selectivity:
-surviving data = 10% × 400GB = 40GB. On NVMe at 170 GB/s: 0.24s — fits easily
-within Section 2's ~0.1s+ window. On S3, the backward dim scan takes longer (~1.5s),
-and the surviving data prefetch at 10 GB/s aggregate takes ~4s — the prefetch may
-not fully complete before Section 3 starts, but partial prefetch still reduces
-cold reads. The prefetch continues into Section 3 as background I/O if needed.
+**Limitations — prefetch window vs data volume**: For the prefetch to fully complete,
+the surviving data must be readable within the backward scan duration. With 90%
+selectivity: surviving data = 10% × 400GB = 40GB.
+
+- **NVMe** (170 GB/s): 40GB reads in 0.24s — fits easily within the backward pass
+  window. RPT overhead is fully amortized.
+- **S3** (10 GB/s aggregate): 40GB takes ~4s, but the backward dim scan only takes
+  ~1.5s. Prefetch doesn't finish before Section 3 starts. Partial amortization —
+  some pages are warm, others are still cold or in-flight. The prefetch continues as
+  background I/O into Section 3.
+- **HDFS** (20-40 GB/s): middle ground, likely partial amortization depending on
+  cluster bandwidth.
+
+On S3, the partial amortization is still valuable because S3 request latency (30ms
+per GET) is the costliest part of RPT overhead on remote storage — even getting half
+the GETs in-flight during idle time meaningfully reduces the main query's cold-read
+penalty.
 
 Key column data is small (~20GB for a 400GB fact table). This fits comfortably in
 the `AsyncDataCache` on any modern server with 128GB+ RAM allocated to the cache.
@@ -1351,17 +1340,17 @@ minimized before either touches it.
    works today for LEFT JOINs) handles the critical GPU VRAM constraint. The decomposition
    adds CPU/I/O efficiency on top.
 
-10. **Idle-time prefetch orchestration**: Section 4.2 describes the opportunity to prefetch
-    non-key columns during RPT Section 2 (backward pass) while fact workers are idle. The
-    recommended orchestration is **worker-autonomous background prefetch** (no coordinator
-    involvement):
+10. **Idle-time prefetch — amortizing RPT overhead**: RPT's extra scan passes (Sections
+    0-2) create idle time on fact workers during the backward pass. Prefetch converts that
+    idle time into useful I/O, so the cost of RPT partially pays for itself. See Section
+    4.2 for the cost model showing this amortization.
 
-    **Mechanism**: The planner embeds a `prefetchColumns` descriptor (Section 3's projected
-    column set minus Section 1's key columns) in the Section 1 BF-build task fragment. When
-    a worker completes its Section 1 task and has identified surviving row groups, it
-    autonomously fires background prefetch for those RGs' non-key columns via
-    `CachedBufferedInput::prefetch()`. No coordinator signal, no new RPT section — the
-    worker simply schedules I/O on a background executor thread pool.
+    The recommended orchestration is **worker-autonomous background prefetch**: the planner
+    embeds a `prefetchColumns` descriptor (Section 3's projected column set minus Section
+    1's key columns) in the Section 1 BF-build task fragment. When a worker completes its
+    Section 1 task and has identified surviving row groups, it autonomously fires background
+    prefetch for those RGs' non-key columns via `CachedBufferedInput::prefetch()`. No
+    coordinator signal, no new RPT section — fire-and-forget on a background executor.
 
     ```
     Section 1 (BF-build task completes on worker):
@@ -1374,35 +1363,34 @@ minimized before either touches it.
     Section 2 (backward pass — concurrent with prefetch):
       Dim workers: scanning dim tables (active)
       Fact workers: background prefetch I/O continues asynchronously
-        → AsyncDataCache fills progressively
-        → shouldPreload() prevents cache over-pressure
+        → RPT's idle time is doing useful work instead of nothing
 
-    Section 3 (main query — benefits from prefetch):
+    Section 3 (main query — benefits from amortized prefetch):
       Fact scans find three categories of pages:
-        1. Prefetch-completed pages → cache hit (~200 GB/s memory BW)
-        2. In-flight pages → partial latency (wait for remaining bytes)
-        3. Not-yet-started pages → cold read (normal storage path)
+        1. Prefetch-completed pages → cache hit (RPT overhead fully amortized)
+        2. In-flight pages → partial latency (partially amortized)
+        3. Not-yet-started pages → cold read (not amortized — normal path)
     ```
 
     **Why worker-autonomous (not coordinator-orchestrated)**: A coordinator-managed prefetch
     stage in Section 2 would block section completion — the coordinator can't advance to
     Section 3 until all prefetch tasks report complete, defeating the purpose. Worker-
-    autonomous prefetch is fire-and-forget: it doesn't affect section lifecycle, the
-    scheduler never sees it, and Section 3 starts as soon as backward BFs are ready
-    regardless of prefetch progress.
+    autonomous prefetch is fire-and-forget: Section 3 starts as soon as backward BFs are
+    ready regardless of prefetch progress.
 
-    **Over-fetch tradeoff**: Worker-autonomous prefetch uses the Section 1 surviving RG set,
-    which may be a superset of the final Section 3 set (the backward pass in Section 2
-    could further refine dimension tables, removing some dim rows that Section 1 considered
-    matching). For star schemas this difference is minimal — the backward pass refines
-    dimension tables, not fact, so the same fact RGs survive. For snowflake schemas with
-    correlated dimensions, some wasted prefetch I/O is possible but bounded: the prefetch
-    set is already 90%+ reduced from the full table, so over-fetch is at most a few percent
-    of total data.
+    **Over-fetch tradeoff**: Uses Section 1's surviving RG set, which may be a superset of
+    Section 3's final set (backward pass could further refine dims). For star schemas the
+    difference is minimal — backward pass refines dimension tables, not fact. For snowflake
+    schemas, some wasted prefetch I/O is possible but bounded (prefetch set is already 90%+
+    reduced from the full table).
 
     **Requires**: Mapping from (rowGroupId, columnName) → file byte region for targeted
     prefetch. Today `scheduleRowGroups()` does sequential prefetch (current + N ahead);
     this extends it to arbitrary RG sets based on RPT survival information.
+
+    **Priority**: Phase 2 — only worth building after RPT is working end-to-end and
+    real workload profiling shows that main query scan I/O is the actual bottleneck.
+    SOFT_AFFINITY + AsyncDataCache (no prefetch) may be sufficient in practice.
 
 ---
 
