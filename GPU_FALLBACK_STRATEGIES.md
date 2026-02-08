@@ -545,9 +545,12 @@ of the data, but read only once) hit storage.
 - If `join_build_estimated_size < VRAM_budget`: skip RPT (hash table fits anyway)
 - If query is scan-dominant with trivial joins: skip RPT (overhead > benefit)
 - If join selectivity is low (most keys match): skip RPT (BF won't filter much)
-- If query estimated time < RPT overhead threshold: skip RPT. The threshold is
-  storage-aware: ~2s for local NVMe, ~10s for HDFS, ~30s for S3 (CPU instances).
-  HBO can refine this using actual query durations from previous runs.
+- If query estimated time < RPT overhead threshold: skip RPT. Static thresholds
+  are storage-aware: ~2s for local NVMe, ~10s for HDFS, ~30s for S3. But HBO
+  provides a better mechanism: after the first run, HBO records actual RPT overhead
+  vs actual savings. Subsequent runs use measured cost-benefit rather than static
+  thresholds. This adapts implicitly to storage tier, table size, and cluster
+  configuration without explicit storage detection.
 
 **RPT vs. perfect optimization**: With perfect statistics and an optimal join order, RPT's
 extra scans are pure overhead — the optimizer already minimizes intermediate result sizes.
@@ -598,6 +601,17 @@ optimization**:
   meaning the underlying data has changed significantly — the planner reverts to
   conservative RPT. This automatically re-triggers the safety net when conditions
   change.
+- **Implicit storage-tier adaptation**: HBO measures actual wall-clock RPT overhead
+  and actual query savings — these implicitly capture storage characteristics without
+  the planner needing to know whether it's reading from NVMe, HDFS, or S3. A query
+  on a small S3-backed table where RPT overhead (dominated by S3 request latency) was
+  a net loss gets recorded as such; the next run skips RPT. The same query shape on
+  NVMe where RPT was a net win keeps RPT. This replaces the static storage-aware skip
+  threshold with an empirical one — no configuration needed, adapts to actual I/O
+  behavior. Importantly, the request-count overhead that drives S3 RPT cost is stable
+  across data growth (row group count changes slowly), so HBO's 10% size tolerance
+  rarely invalidates the RPT skip/apply decision even when it fails for cardinality
+  estimates.
 
 Key HBO infrastructure reused:
 - `HistoryBasedPlanStatisticsCalculator`: provides actual stats during planning
