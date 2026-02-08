@@ -136,7 +136,22 @@ Presto "sections" (`StreamingPlanSection`) group stages for ordered execution:
 - **Section boundaries are defined by `REMOTE_MATERIALIZED` exchanges**
 - The scheduler already orchestrates section ordering without modification needed
 
-### 3.4 Dynamic Filtering RFC (In Progress)
+### 3.4 Affinity Scheduling (Soft Affinity)
+
+Presto has built-in affinity scheduling via `NodeSelectionStrategy` on splits:
+- **`SOFT_AFFINITY`**: Split prefers specific nodes but runs elsewhere if they're
+  dead or overloaded. `SimpleNodeSelector` tries preferred nodes first, then appends
+  random fallback nodes. If a preferred node is `DEAD`, it's skipped and
+  `NodeSelectionStats.preferredNonAliveNodeSkippedCount` is incremented.
+- **`HARD_AFFINITY`**: Split must run on specific nodes — fails if unavailable.
+- **`NO_PREFERENCE`**: Round-robin / least-busy assignment.
+
+Key for RPT: connectors return `SOFT_AFFINITY` with the same preferred nodes for
+each split across sections. Same workers handle the same splits (cache locality)
+with automatic fallback if a worker fails between sections. No new scheduler
+infrastructure needed.
+
+### 3.5 Dynamic Filtering RFC (In Progress)
 
 [RFC-0022](https://github.com/prestodb/rfcs/pull/54) proposes distributed dynamic
 partition pruning:
@@ -149,7 +164,7 @@ partition pruning:
   filter extension)
 - Uses sections to gate build completion before probe split scheduling
 
-### 3.5 Intermediate Aggregations (Off by Default)
+### 3.6 Intermediate Aggregations (Off by Default)
 
 `AddIntermediateAggregations` rule (`enable_intermediate_aggregations` session property,
 default `false`) inserts extra INTERMEDIATE aggregation stages:
@@ -170,7 +185,7 @@ This adds cascading partial aggregation — reducing data volume at each stage. 
 only applies to un-grouped aggregations without ORDER BY. For GPU, this is critical:
 each aggregation stage operates on a smaller working set.
 
-### 3.6 Adaptive Exchange Framework (Prior Design)
+### 3.7 Adaptive Exchange Framework (Prior Design)
 
 The [Adaptive Exchange Framework](ADAPTIVE_EXCHANGE_FRAMEWORK.md) introduces:
 - Exchanges buffer initial rows (~100K) and collect runtime statistics
@@ -499,21 +514,69 @@ data cache infrastructure** with split-to-worker affinity:
 - Configuration: `async-data-cache-enabled=true` (default), `async-cache-ssd-gb`,
   `async-cache-ssd-path`, plus TTL and eviction policies.
 
-**Split-to-worker affinity across RPT sections**: The coordinator must assign the same
-table splits to the same workers across RPT sections. This is straightforward — the
-coordinator already tracks which splits went to which workers in Section 0, so
-Section 2 (backward) and Section 3 (main query) reuse the same mapping. This ensures
-cache hits:
+**Split-to-worker affinity across RPT sections**: Presto already has affinity
+scheduling via `NodeSelectionStrategy.SOFT_AFFINITY` in `SimpleNodeSelector`. When
+a connector returns splits with `SOFT_AFFINITY` and preferred nodes, the scheduler
+tries those nodes first and automatically falls back to random nodes if preferred
+nodes are dead or overloaded. For RPT, the connector returns the same preferred
+nodes for each split across all sections. No new scheduler infrastructure needed —
+the existing mechanism handles both affinity and fault tolerance:
 
 ```
 Worker W1 processes splits S1..S50 across all RPT sections:
   Section 0 (forward):  read key column from S1..S50 → AsyncDataCache warm
+  Section 1 (forward):  scan fact S1..S50 with BF_dim → record surviving RGs
   Section 2 (backward): read key column from S1..S50 → cache hit (memory speed)
-  Section 3 (main):     read full columns from S1..S50 → key columns cached,
-                         non-key columns from storage (but these are read only once)
+  Section 3 (main):     read full columns from S1..S50 → key columns cached
+
+If W1 fails between sections:
+  SOFT_AFFINITY falls back to W2 → cold cache miss, but query continues.
+  Stats tracked via NodeSelectionStats.preferredNonAliveNodeSkippedCount.
 ```
 
-**Revised cost model with caching** (same reference hardware):
+**Idle-time prefetch of non-key columns**: During RPT Section 2 (backward pass on
+dims), fact-table workers are idle — they're not scanning fact data. After Section 1,
+these workers know exactly which fact row groups survived BF filtering. This idle
+time can be used to prefetch the surviving row groups' non-key columns into the
+`AsyncDataCache`, so that Section 3 (main query) gets cache hits instead of cold reads:
+
+```
+Section 1 (forward — fact):
+  Workers scan key columns, apply BF_dim → BF_fact
+  Workers record: "RGs {12, 37, 42, 89, ...} survived" (10% of total)
+
+Section 2 (backward — dims):
+  Dim workers: scanning dim tables (active)
+  Fact workers: IDLE — trigger background prefetch:
+    For each surviving RG:
+      CachedBufferedInput::prefetch(Region{rg.offset, rg.length})
+      → schedules non-key column reads on background executor
+      → AsyncDataCache fills at storage bandwidth
+      → shouldPreload() prevents over-filling cache (50% cap)
+
+Section 3 (main query):
+  Fact workers: non-key columns already warm in AsyncDataCache
+    → cache hits at ~200 GB/s memory bandwidth
+    → no cold storage reads (they happened during Section 2)
+```
+
+Velox already has the prefetch infrastructure:
+- `CachedBufferedInput::prefetch(Region)`: public API for proactive cache loading
+- Background executor thread pool for non-blocking I/O
+- `shouldPreload()` checks cache capacity to avoid eviction pressure
+- `CoalescedLoad` batches multiple small reads into efficient I/O requests
+
+New work needed: a mechanism to map (rowGroupId, columnSet) → Region for hint-based
+prefetch. Today `scheduleRowGroups()` does sequential prefetch (current + N ahead);
+this extends it to arbitrary row group sets based on RPT survival information.
+
+**On S3, this prefetch is especially valuable**: The S3 request latency (30ms per GET)
+that dominates RPT overhead on remote storage is completely hidden — the GETs are
+in-flight during Section 2 while dim workers do their scans. By Section 3, the
+surviving row groups' data is already in cache. This effectively eliminates the
+"cold read" penalty in the main query for all storage tiers.
+
+**Revised cost model with caching and prefetch** (same reference hardware):
 
 ```
 Without caching (every scan hits storage):
@@ -523,17 +586,39 @@ Without caching (every scan hits storage):
   Main query scan: 0.60s (full columns, cold)
   Total I/O:       0.92s
 
-With Velox AsyncDataCache + split affinity:
+With SOFT_AFFINITY + AsyncDataCache (no prefetch):
   Forward dims:    0.10s (key-only, cold — warms cache)
   Forward fact:    0.12s (key-only, cold — warms cache)
   Backward dims:   0.01s (key-only, cache hit — ~200 GB/s memory BW)
   Main query scan: 0.50s (key columns cached, non-key columns cold)
   Total I/O:       0.73s
 
-RPT overhead with caching: ~0.23s (forward) + ~0.01s (backward) = ~0.24s
-RPT overhead without:      ~0.22s (forward) + ~0.10s (backward) = ~0.32s
-Backward pass is essentially free with caching.
+With SOFT_AFFINITY + AsyncDataCache + idle-time prefetch:
+  Forward dims:    0.10s (key-only, cold — warms cache)
+  Forward fact:    0.12s (key-only, cold — warms cache, record surviving RGs)
+  Backward dims:   0.01s (key-only, cache hit)
+    + concurrent:  fact workers prefetch surviving RGs' non-key columns
+                   (overlaps with backward dim scan — no added wall time)
+  Main query scan: 0.05s (ALL columns warm in cache — memory speed)
+  Total I/O:       0.28s
+
+RPT overhead with prefetch: ~0.23s (forward + backward, prefetch is free)
+Main query: nearly free (cache hits)
 ```
+
+The prefetch turns the main query from a storage-bound operation into a
+memory-bound one. The 0.60s main query scan drops to ~0.05s because both key
+columns (from Section 1 cache) and non-key columns (from Section 2 prefetch) are
+warm. The prefetch itself adds zero wall time — it runs concurrently with the
+backward dim scan in Section 2.
+
+For the prefetch to complete within Section 2's time window, the surviving data
+volume must be readable within the backward scan duration. With 90% BF selectivity:
+surviving data = 10% × 400GB = 40GB. On NVMe at 170 GB/s: 0.24s — fits easily
+within Section 2's ~0.1s+ window. On S3, the backward dim scan takes longer (~1.5s),
+and the surviving data prefetch at 10 GB/s aggregate takes ~4s — the prefetch may
+not fully complete before Section 3 starts, but partial prefetch still reduces
+cold reads. The prefetch continues into Section 3 as background I/O if needed.
 
 Key column data is small (~20GB for a 400GB fact table). This fits comfortably in
 the `AsyncDataCache` on any modern server with 128GB+ RAM allocated to the cache.
@@ -1286,6 +1371,9 @@ minimized before either touches it.
 - `ReaderOptions` (loadQuantum, maxCoalesceDistance): `velox/common/io/Options.h`
 - `FileHandleCache`: `velox/connectors/hive/FileHandle.h`
 - `LazySplitSource`: `presto-main-base/.../planner/LazySplitSource.java`
+- `SimpleNodeSelector`: `presto-main-base/.../scheduler/nodeSelection/SimpleNodeSelector.java`
+- `NodeSelectionStrategy`: `presto-spi/.../schedule/NodeSelectionStrategy.java` (SOFT_AFFINITY, HARD_AFFINITY, NO_PREFERENCE)
+- `NodeSelectionStats`: `presto-main-base/.../scheduler/nodeSelection/NodeSelectionStats.java`
 - `LogicalCteOptimizer`: `presto-main-base/.../optimizations/LogicalCteOptimizer.java`
 - `PhysicalCteOptimizer`: `presto-main-base/.../optimizations/PhysicalCteOptimizer.java`
 - `CteProjectionAndPredicatePushDown`: `presto-main-base/.../optimizations/CteProjectionAndPredicatePushDown.java`
