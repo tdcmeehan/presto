@@ -1351,6 +1351,59 @@ minimized before either touches it.
    works today for LEFT JOINs) handles the critical GPU VRAM constraint. The decomposition
    adds CPU/I/O efficiency on top.
 
+10. **Idle-time prefetch orchestration**: Section 4.2 describes the opportunity to prefetch
+    non-key columns during RPT Section 2 (backward pass) while fact workers are idle. The
+    recommended orchestration is **worker-autonomous background prefetch** (no coordinator
+    involvement):
+
+    **Mechanism**: The planner embeds a `prefetchColumns` descriptor (Section 3's projected
+    column set minus Section 1's key columns) in the Section 1 BF-build task fragment. When
+    a worker completes its Section 1 task and has identified surviving row groups, it
+    autonomously fires background prefetch for those RGs' non-key columns via
+    `CachedBufferedInput::prefetch()`. No coordinator signal, no new RPT section — the
+    worker simply schedules I/O on a background executor thread pool.
+
+    ```
+    Section 1 (BF-build task completes on worker):
+      Worker knows: surviving RGs = {12, 37, 42, 89, ...}
+      Worker knows: prefetchColumns = {col_a, col_b, col_c}  (from fragment metadata)
+      Worker fires: for each (RG, col) pair:
+        CachedBufferedInput::prefetch(Region{rg_col_offset, rg_col_length})
+      Worker returns: BF to coordinator (normal path — prefetch is fire-and-forget)
+
+    Section 2 (backward pass — concurrent with prefetch):
+      Dim workers: scanning dim tables (active)
+      Fact workers: background prefetch I/O continues asynchronously
+        → AsyncDataCache fills progressively
+        → shouldPreload() prevents cache over-pressure
+
+    Section 3 (main query — benefits from prefetch):
+      Fact scans find three categories of pages:
+        1. Prefetch-completed pages → cache hit (~200 GB/s memory BW)
+        2. In-flight pages → partial latency (wait for remaining bytes)
+        3. Not-yet-started pages → cold read (normal storage path)
+    ```
+
+    **Why worker-autonomous (not coordinator-orchestrated)**: A coordinator-managed prefetch
+    stage in Section 2 would block section completion — the coordinator can't advance to
+    Section 3 until all prefetch tasks report complete, defeating the purpose. Worker-
+    autonomous prefetch is fire-and-forget: it doesn't affect section lifecycle, the
+    scheduler never sees it, and Section 3 starts as soon as backward BFs are ready
+    regardless of prefetch progress.
+
+    **Over-fetch tradeoff**: Worker-autonomous prefetch uses the Section 1 surviving RG set,
+    which may be a superset of the final Section 3 set (the backward pass in Section 2
+    could further refine dimension tables, removing some dim rows that Section 1 considered
+    matching). For star schemas this difference is minimal — the backward pass refines
+    dimension tables, not fact, so the same fact RGs survive. For snowflake schemas with
+    correlated dimensions, some wasted prefetch I/O is possible but bounded: the prefetch
+    set is already 90%+ reduced from the full table, so over-fetch is at most a few percent
+    of total data.
+
+    **Requires**: Mapping from (rowGroupId, columnName) → file byte region for targeted
+    prefetch. Today `scheduleRowGroups()` does sequential prefetch (current + N ahead);
+    this extends it to arbitrary RG sets based on RPT survival information.
+
 ---
 
 ## 8. References
