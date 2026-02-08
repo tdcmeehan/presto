@@ -410,26 +410,42 @@ small I/O amplification could dominate.
    - `shouldPrefetchStripes()` = true for `CachedBufferedInput`
    - Hides I/O latency behind compute for sequential access patterns
 
-**What remains a concern — the small I/O amplification for key-column reads:**
+**What remains a concern — per-row-group request count for key-column reads:**
 
 For RPT key-column-only scans across many row groups in a file:
 - Key column pages within a single row group are contiguous → coalesced (good)
 - Key column pages across row groups are spaced ~128MB apart (typical RG size)
   → exceeds the 512KB coalesce distance → each RG's key column = separate I/O
+- This is correct behavior — coalescing across RGs would read the entire file
+  (reading through ~122MB of non-key columns between RGs), defeating the
+  column pruning that makes RPT lightweight
 
-For **local NVMe**: This is fine. Random 0.5MB reads at NVMe speeds (~6 GB/s
-per device) mean each RG key column read takes ~0.1ms. A file with 50 RGs =
-5ms. Metadata overhead is negligible.
+**Important: increasing `maxCoalesceDistance` is NOT the answer.** At 256MB,
+Velox would read through the gaps between key column pages, reading ~100% of
+the file to get 5% of the data. This destroys the core insight that key-column-
+only reads are lightweight.
+
+For **local NVMe**: Not a concern. Random 6MB reads at NVMe speeds (~6 GB/s
+per device) → ~1ms per RG. A file with 50 RGs = 50ms. Metadata negligible.
 
 For **remote storage (S3)**: Each RG's key column page is a separate S3 GET
-with Range header. S3 GET latency is ~20-50ms per request. A file with 50 RGs
-= 50 × 30ms = 1.5s per file. 1000 files × 1.5s = catastrophic **if serial**.
-However:
-- Velox parallelizes across files (multiple splits processed concurrently)
-- Within a file, `CoalescedLoad` parallelizes reads via the IO executor
-- S3 supports high request concurrency (~1000+ parallel GETs)
-- With 128 concurrent requests: 1000 files × 50 RGs = 50K GETs / 128 = ~12s
-  at 30ms each — still significant but parallelizable
+of ~6MB (5% of 128MB RG). The data volume is correct (only 5% read), but
+request count is high:
+```
+50 RGs per file × 1 GET each = 50 GETs per file
+Each GET: ~6MB at ~80-100 MB/s throughput = ~60-75ms
+All 50 in parallel (S3 handles concurrent GETs well): ~75ms wall clock
+Per-request overhead (TLS, HTTP): ~20-30ms, amortized by connection pooling
+```
+This is a bread-and-butter S3 access pattern. The concern is request count,
+not data volume — and S3 is designed for high request concurrency.
+
+Across all files on a worker:
+```
+100 files assigned to worker × 50 RGs each = 5000 GETs
+At 128 concurrent connections: 5000 / 128 = ~40 rounds × 75ms = ~3s
+Data transferred: 100 × 300MB = 30GB (the actual 5% of 600GB)
+```
 
 **The footer cache is the key win for RPT.** On the backward pass:
 - File footers: cached in `AsyncDataCache` from forward pass → free
@@ -442,21 +458,14 @@ However:
 |---|---|---|---|
 | Local NVMe | 0.12s (storage-bound) | 0.01s (cache hit) | Low |
 | HDFS (nearby) | 0.5-2s (network latency) | 0.01s (cache hit) | Medium |
-| S3 (remote) | 5-15s (GET latency × parallelism) | 0.01s (cache hit) | High for forward pass |
+| S3 (remote) | 3-5s (parallel GETs) | 0.01s (cache hit) | Moderate |
 
-For S3 deployments, the forward pass is expensive but is a **one-time cost per
-query** (the backward pass and main query benefit from cached footers/metadata).
-The question is whether this one-time cost is acceptable for RPT's benefits.
+For S3 deployments, the forward pass is slower than NVMe but not catastrophic
+— 50 parallel 6MB GETs per file is well within S3's design. The backward pass
+and main query benefit from cached footers and key column pages regardless.
 
-**Possible mitigation for S3**: increase `maxCoalesceDistance` beyond 512KB for
-RPT key-column scans. If set to, say, 256MB (one full row group), Velox would
-coalesce all key column pages in a file into fewer, larger reads. This trades
-extra bytes read (reading through the gaps between key column pages) for fewer
-S3 requests. For a key column that's 5% of the row, this means reading 20x more
-bytes but making 50x fewer requests — a good trade on S3 where latency dominates.
-
-**Resolution**: The cost model is realistic for local NVMe (the doc's reference
-hardware). For S3, the forward pass cost is higher but the backward pass is
-still cache-speed. Add the storage-type dimension to the cost model. Consider
-exposing a tunable `maxCoalesceDistance` for RPT scans to optimize for high-
-latency storage.
+**Resolution**: The cost model is realistic for local NVMe. For S3, the forward
+pass is ~25-40x slower due to per-request latency, but the data volume is
+unchanged (column pruning works correctly). The concern is moderate, not
+blocking. Do NOT increase `maxCoalesceDistance` — it would destroy the column
+pruning benefit that makes RPT lightweight.
