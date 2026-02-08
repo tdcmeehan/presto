@@ -334,6 +334,14 @@ ordering. Transfer sections are lightweight scan-only stages — no hash tables,
 shuffle (bloom filters are aggregated at the coordinator). For star schemas (depth 1),
 only 3 transfer sections are needed.
 
+**Section transition overhead is near-zero.** All `StageExecutionAndScheduler` objects
+are created upfront in the `SqlQueryScheduler` constructor for ALL sections. Split
+sources are wrapped in `LazySplitSource` — a lazy proxy that defers connector calls
+until first `getNextBatch()`. Section readiness is a pure state check. The only
+latency at transition is connector split enumeration (~10-100ms), which can be hidden
+by **eagerly triggering** the next section's `LazySplitSource` during the current
+section's execution. With eager pre-enumeration, transition overhead is ~1-5ms.
+
 **RPT transfer sections run on CPU, not GPU**. The BF-build pass is pure CPU work:
 read Parquet metadata, decompress, decode the **join key column only** (column pruning),
 hash keys into a bloom filter. This is critical for two reasons:
@@ -363,7 +371,7 @@ Star schema (1 fact + 3 dims), forward + backward:
   Forward dims (small, concurrent):   ~0.1s
   Forward fact (key-only scan):       ~0.12s
   Backward dims (BF-filtered, small): ~0.05s
-  Total RPT overhead:                 ~0.3s
+  Total RPT latency:                  ~0.3s
 
 Main query scan (full columns, with DF row-group pruning):
   Effective data after pruning: ~100GB
@@ -372,13 +380,29 @@ Main query scan (full columns, with DF row-group pruning):
   GPU join + agg: ~0.5s (8x A100 at full throughput)
   Total main query: ~1.1s
 
-Total with RPT:    ~1.4s (0.3s overhead + 1.1s main)
+Total with RPT:    ~1.4s (0.3s RPT + 1.1s main)
 Total without RPT: ~1.1s main + potential GPU OOM on hash build
-RPT overhead:      ~25% on this short query, but guarantees VRAM safety
 ```
 
-For longer queries (>10s), RPT overhead drops below 3%. The cost is front-loaded
-scan latency; the payoff is bounded VRAM usage and 10-100x smaller hash tables.
+**Important: RPT's forward pass is NOT additional I/O.** The main query would
+read those same key column pages as part of reading the full row groups. RPT
+reads them earlier in a separate pass, and `AsyncDataCache` ensures they are
+not re-read during the main query. Total I/O volume is identical:
+
+```
+Without RPT:  main query reads 400GB (includes key column)
+With RPT:     forward reads 20GB (key column) + main reads 380GB (non-key, cached key)
+              = 400GB total — identical
+
+With 90% BF selectivity:  20GB + 10% × 400GB = 60GB  (6.7x I/O savings)
+With 50% BF selectivity:  20GB + 50% × 400GB = 220GB (1.8x I/O savings)
+Worst case (0% pruning):  20GB + 400GB = 420GB        (~5% overhead from extra requests)
+```
+
+The 0.3s RPT latency is real wall-clock time (the query takes 0.3s longer to
+start producing results), but it is not wasted I/O — it is an investment that
+typically reduces the main query's I/O substantially. For longer queries (>10s),
+the latency overhead drops below 3%, while the I/O savings grow with table size.
 
 **Why RPT isn't broadly adopted — and how Presto can avoid the pitfall**: The RPT
 paper's DuckDB implementation avoids the rescan penalty entirely by **buffering scanned
@@ -393,13 +417,23 @@ buffering or effective caching pay the full storage cost 2-3x (forward scan, bac
 scan, main query scan). Presto can avoid this penalty by leveraging **Velox's existing
 data cache infrastructure** with split-to-worker affinity:
 
-**Velox's tiered caching (already deployed)**:
-- **`AsyncDataCache`** (RAM, **enabled by default**): Caches decoded Parquet
-  pages/column chunks in memory. When the RPT forward pass reads key column pages from
-  a file, they land in the `AsyncDataCache`. Subsequent reads of the same pages (backward
-  pass, main query) hit the cache at memory bandwidth instead of storage bandwidth.
+**Velox's I/O and caching infrastructure (already deployed)**:
+- **I/O Coalescing (`CachedBufferedInput`)**: Velox merges nearby reads within
+  `maxCoalesceDistance` (512KB default) into single I/O requests. Within each Parquet
+  row group, key column pages are contiguous and get coalesced. Across row groups,
+  pages are ~128MB apart — correctly kept as separate reads (coalescing across RGs
+  would read through non-key columns, defeating column pruning).
+  `loadQuantum` = 8MB, `maxCoalesceBytes` = 128MB.
+- **`FileHandleCache`** (LRU, keyed by filename): Caches open file handles. Forward
+  pass opens files; backward pass and main query reuse cached handles — no re-open
+  overhead (avoids S3 HEAD / `open()` syscall). Metrics tracked for monitoring.
+- **`AsyncDataCache`** (RAM, **enabled by default**): Caches Parquet pages/column
+  chunks keyed by `{fileNum, offset}`. Forward pass reads land in cache. Backward
+  pass and main query hit cache at memory bandwidth. Parquet footers are also cached.
 - **`SsdCache`** (local NVMe, 16 shards for parallel I/O): Overflow tier for data
   that doesn't fit in RAM cache. Still ~10-20x faster than remote storage (S3/HDFS).
+- **Row group prefetching**: `prefetchRowGroups` = 1 (default). While processing RG
+  N, Velox pre-fetches RG N+1 via `scheduleRowGroups()`, hiding I/O latency.
 - Configuration: `async-data-cache-enabled=true` (default), `async-cache-ssd-gb`,
   `async-cache-ssd-path`, plus TTL and eviction policies.
 
@@ -1023,6 +1057,10 @@ minimized before either touches it.
 - `AddIntermediateAggregations`: `presto-main-base/.../iterative/rule/AddIntermediateAggregations.java`
 - `AsyncDataCache` config: `presto-native-execution/presto_cpp/main/common/Configs.h` (lines 406-468)
 - `SsdCache` setup: `presto-native-execution/presto_cpp/main/PrestoServer.cpp` (`setupSsdCache()`)
+- `CachedBufferedInput` (I/O coalescing): `velox/dwio/common/CachedBufferedInput.cpp`
+- `ReaderOptions` (loadQuantum, maxCoalesceDistance): `velox/common/io/Options.h`
+- `FileHandleCache`: `velox/connectors/hive/FileHandle.h`
+- `LazySplitSource`: `presto-main-base/.../planner/LazySplitSource.java`
 - Alluxio cache: `presto-cache/src/main/java/com/facebook/presto/cache/alluxio/AlluxioCacheConfig.java`
 - `HistoryBasedPlanStatisticsCalculator`: `presto-main-base/.../cost/HistoryBasedPlanStatisticsCalculator.java`
 - `JoinNodeStatistics`: `presto-spi/.../statistics/JoinNodeStatistics.java`
