@@ -24,6 +24,74 @@ Without it, the reduction ratio is less predictable and potentially much smaller
 **Resolution needed**: State the acyclicity requirement explicitly. Discuss what
 happens for cyclic queries and whether partial reduction is still valuable.
 
+**Mitigation: materialized CTEs as cycle breakers.**
+
+Presto's materialized CTE infrastructure (`LogicalCteOptimizer` → `PhysicalCteOptimizer`)
+converts CTE definitions into temporary table writes (`CteProducerNode` → `TableWriteNode`)
+and CTE references into temporary table scans (`CteConsumerNode` → `TableScanNode`). Each
+materialized CTE becomes a separate execution section via `SequenceNode`. This creates a
+natural mechanism for breaking cyclic join graphs:
+
+**How it works**: A cyclic join graph has edges that form cycles (e.g., A⋈B⋈C⋈A — the
+triangle pattern `A.x=B.x, B.y=C.y, C.z=A.z`). By materializing one of the joins as a
+CTE, we "snip" an edge: the join result becomes a new base table (temp table), and the
+remaining join graph within each section can be acyclic.
+
+```
+Cyclic query:
+  A ⋈ B ⋈ C ⋈ A   (triangle — no valid topological ordering for RPT)
+
+With materialized CTE:
+  Section 1 (CTE producer):  A ⋈ B → temp table T_AB
+    Join graph: A—B (acyclic, 2 tables)
+    RPT applies: BF_A from A → filter B, BF_B → filter A
+
+  Section 2 (consumer):  T_AB ⋈ C
+    Join graph: T_AB—C (acyclic, 2 "tables")
+    RPT applies: BF_TAB from temp table → filter C, BF_C → filter T_AB
+
+Each section's join graph is acyclic → RPT works within each section.
+```
+
+**Automatic cycle detection**: RPT's `LargestRoot` algorithm already computes a spanning
+tree of the join graph. Any join edge NOT in the spanning tree is a "back edge" that
+creates a cycle. These back edges identify exactly which joins to materialize as CTEs.
+For typical analytical queries (≤20 joins), the number of back edges is small (usually
+1-2 for moderately cyclic queries).
+
+**Existing infrastructure reused**:
+- `LogicalCteOptimizer.CteConsumerTransformer`: wraps subplans in `CteProducerNode` +
+  `CteConsumerNode` pairs
+- `PhysicalCteOptimizer.CteProducerRewriter`: converts producer → `TableWriteNode`
+  (temporary table)
+- `PhysicalCteOptimizer.CteConsumerRewriter`: converts consumer → `TableScanNode`
+  (temporary table)
+- `SequenceNode`: creates section boundaries — CTE producers must complete before
+  consumers start
+- `CTEMaterializationTracker`: coordinates completion via `SettableFuture` per CTE
+- `CteProjectionAndPredicatePushDown`: pushes predicates from consumers into producers
+  (complementary to RPT's BF filtering)
+
+**New work needed**:
+1. Cycle detection in the RPT planner (identify back edges in join graph)
+2. Synthetic CTE generation for back-edge joins (wrap the join subtree in a
+   `CteReferenceNode` that triggers the materialization pipeline)
+3. Cost model: materialization cost (temp table write + read) vs. RPT benefit from
+   breaking the cycle. For small back-edge joins, materialization may not be worth it.
+
+**Partial reduction without CTEs**: Even without cycle-breaking, RPT's `LargestRoot`
+algorithm can still generate a transfer schedule for cyclic queries — it just can't
+guarantee full reduction. The bloom filters still provide useful filtering, just not
+the theoretical optimality guarantee. For mildly cyclic queries (one back edge), the
+reduction loss is typically small.
+
+**Resolution**: Cyclic join graphs are addressable via materialized CTEs. The approach
+decomposes a cyclic query into acyclic sections, each of which RPT can fully reduce.
+This leverages Presto's existing CTE materialization infrastructure with minimal new
+code (cycle detection + synthetic CTE generation). For queries where the cycle-breaking
+materialization cost exceeds the RPT benefit, fall back to partial reduction (apply RPT
+to the spanning tree, accept non-optimal filtering on back edges).
+
 ---
 
 ## Issue 2: The "10-100x" Hash Table Reduction Claim Is Unsupported
@@ -79,6 +147,97 @@ join inputs (derived tables, aggregated dimensions, CTEs).
 patterns where RPT applies (star/snowflake with base table joins) vs. where it
 doesn't (subquery join inputs). Consider whether RPT sections could be placed
 after subquery materialization.
+
+**Mitigation: materialized CTEs turn subqueries into scannable base tables.**
+
+The same CTE materialization infrastructure that addresses Issue #1 (cycle breaking)
+directly solves Issue #3. When a complex subquery (aggregation, nested join, window
+function) is materialized as a CTE:
+
+1. **CTE producer** (Section N): executes the subquery, writes result to a temporary
+   table via `TableWriteNode`
+2. **CTE consumer** (Section N+1): reads from the temporary table via `TableScanNode`
+
+The `TableScanNode` on the temporary table is a **base table scan** — exactly what RPT
+needs. RPT can push bloom filters into it, and Parquet column pruning works on the
+temporary table's columns.
+
+```
+Original (RPT can't help):
+  fact ⋈ (SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         Opaque aggregation subquery — RPT can't push BF into this
+
+With materialized CTE:
+  Section 1 (CTE producer):
+    SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id
+    → writes to temp table T_agg (columns: customer_id, sum_amount)
+
+  Section 2 (consumer + main query):
+    fact ⋈ T_agg ON fact.customer_id = T_agg.customer_id
+    ^^^^^^   ^^^^^
+    Both are base table scans — RPT works on both!
+
+    RPT forward pass:
+      Scan T_agg key column (customer_id) → BF_agg
+      Scan fact key column + apply BF_agg → BF_fact
+    RPT backward pass:
+      Apply BF_fact to T_agg scan → tighter BF_agg
+    Main query:
+      Both hash tables are reduced — joins on filtered data
+```
+
+**Why this works well**: Complex subqueries (especially aggregations) typically produce
+**much smaller output than their input**. An aggregation `GROUP BY customer_id` on a
+billion-row orders table might produce 10M rows. The CTE materialization cost is writing
+10M rows to a temp table — fast. The RPT benefit is filtering those 10M rows against
+the fact table's bloom filter before building the hash table.
+
+**Automatic subquery-to-CTE promotion for RPT**: The RPT planner can identify join
+inputs that are not base table scans and automatically wrap them in synthetic CTEs:
+
+```
+RPT planning phase:
+  For each join in the query:
+    For each join input:
+      If input is NOT a TableScanNode (it's a subquery, aggregation, etc.):
+        If RPT is enabled for this join (via heuristic or HBO):
+          Wrap input in synthetic CteReferenceNode
+          → LogicalCteOptimizer pipeline handles the rest
+```
+
+**Existing infrastructure reused** (same as Issue #1):
+- `LogicalCteOptimizer` → `PhysicalCteOptimizer` → `SequenceNode` pipeline
+- `CteProjectionAndPredicatePushDown`: can push RPT-derived predicates from the
+  consumer back into the CTE producer (e.g., if BF_fact eliminates 90% of
+  customer_ids, push that filter into the aggregation — fewer groups to compute)
+- `CTEMaterializationTracker`: coordinates section ordering
+
+**Interaction with CteProjectionAndPredicatePushDown**: This existing optimizer pushes
+predicates from CTE consumers into CTE producers. If RPT produces a `TupleDomain`
+(min/max range) from the fact table scan, this range could potentially be pushed into
+the CTE producer's aggregation — reducing the aggregation work itself. The BF can't be
+pushed into the producer (it operates on pre-aggregation rows), but the TD range can
+prune partitions/row groups of the orders table within the CTE producer. This is a
+bonus: not only does RPT filter the CTE consumer's scan, but it can also reduce the
+CTE producer's work.
+
+**Cost model for subquery-to-CTE promotion**:
+- Materialization cost: write subquery result to temp table (~disk I/O for result size)
+- RPT benefit: BF-filtered scan of temp table (column pruning on key column)
+- Break-even: when subquery output is large enough that BF filtering saves more than
+  the materialization cost
+- For small subquery outputs (< 100MB): materialization overhead likely not worth it —
+  just build the hash table directly
+- For large subquery outputs (> 1GB): materialization + RPT filtering is clearly
+  beneficial
+
+**Resolution**: Materialized CTEs directly solve the subquery limitation. Complex join
+inputs become temporary tables that RPT can scan with column pruning and BF filtering.
+The existing CTE pipeline handles materialization, section boundaries, and predicate
+pushdown. New work is limited to: (1) detecting non-scannable join inputs during RPT
+planning, (2) wrapping them in synthetic CTEs, (3) cost-based gating to avoid
+materializing small subqueries unnecessarily.
 
 ---
 

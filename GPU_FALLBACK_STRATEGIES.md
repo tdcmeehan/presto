@@ -554,6 +554,40 @@ The RPT transfer sections extend this infrastructure by:
 - Using the existing filter distribution mechanism to propagate BFs between sections
 - Generating the transfer schedule via the LargestRoot algorithm in the planner
 
+**Extending RPT to cyclic queries and complex subqueries via materialized CTEs**:
+RPT's Yannakakis-based algorithm requires an acyclic join graph. Additionally, RPT can
+only push bloom filters into base table scans — not into complex subquery join inputs
+(aggregations, nested joins, window functions). Presto's materialized CTE infrastructure
+addresses both limitations:
+
+- **Cycle breaking (acyclic requirement)**: RPT's `LargestRoot` algorithm computes a
+  spanning tree of the join graph. Any join edge not in the spanning tree is a "back edge"
+  that creates a cycle. By materializing the join at each back edge as a CTE, the cyclic
+  graph decomposes into acyclic sections. Each section's join graph is acyclic, so RPT
+  applies independently within each section.
+
+  ```
+  Cyclic: A ⋈ B ⋈ C ⋈ A (triangle)
+  → Materialize A ⋈ B as CTE → temp table T_AB
+  → Section 1: A ⋈ B (acyclic) — RPT reduces both
+  → Section 2: T_AB ⋈ C (acyclic) — RPT reduces both
+  ```
+
+- **Complex subquery join inputs**: When a join input is not a base table scan (e.g.,
+  `fact ⋈ (SELECT id, SUM(x) FROM orders GROUP BY id)`), materializing the subquery
+  as a CTE converts it to a `TableScanNode` on a temporary table. RPT can then push BFs
+  into this scan — column pruning on the temp table's key column, BF filtering on the
+  scan output. The existing `CteProjectionAndPredicatePushDown` optimizer can further
+  push RPT-derived `TupleDomain` ranges back into the CTE producer, potentially reducing
+  the aggregation work itself.
+
+The mechanism leverages the existing CTE pipeline:
+`LogicalCteOptimizer` → `PhysicalCteOptimizer` (converts to `TableWriteNode` /
+`TableScanNode`) → `SequenceNode` (section boundaries) → `CTEMaterializationTracker`
+(coordinates completion). New work: (1) cycle detection during RPT planning, (2)
+automatic subquery-to-CTE promotion for non-scannable join inputs, (3) cost-based
+gating to avoid materializing small subqueries where the overhead exceeds the RPT benefit.
+
 **GPU-specific benefits**: Bloom filter construction and probing are embarrassingly
 parallel — among the fastest operations on GPU. Bloom filters (~150MB) always fit in
 VRAM. The row-level BF probing happens on GPU after decode, at billions of probes/sec.
@@ -1061,6 +1095,11 @@ minimized before either touches it.
 - `ReaderOptions` (loadQuantum, maxCoalesceDistance): `velox/common/io/Options.h`
 - `FileHandleCache`: `velox/connectors/hive/FileHandle.h`
 - `LazySplitSource`: `presto-main-base/.../planner/LazySplitSource.java`
+- `LogicalCteOptimizer`: `presto-main-base/.../optimizations/LogicalCteOptimizer.java`
+- `PhysicalCteOptimizer`: `presto-main-base/.../optimizations/PhysicalCteOptimizer.java`
+- `CteProjectionAndPredicatePushDown`: `presto-main-base/.../optimizations/CteProjectionAndPredicatePushDown.java`
+- `CTEMaterializationTracker`: `presto-main-base/.../scheduler/CTEMaterializationTracker.java`
+- `SequenceNode`: `presto-main-base/.../plan/SequenceNode.java`
 - Alluxio cache: `presto-cache/src/main/java/com/facebook/presto/cache/alluxio/AlluxioCacheConfig.java`
 - `HistoryBasedPlanStatisticsCalculator`: `presto-main-base/.../cost/HistoryBasedPlanStatisticsCalculator.java`
 - `JoinNodeStatistics`: `presto-spi/.../statistics/JoinNodeStatistics.java`
