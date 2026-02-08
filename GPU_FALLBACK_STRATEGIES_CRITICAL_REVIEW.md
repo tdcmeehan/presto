@@ -1,13 +1,14 @@
 # GPU Execution Strategies — Critical Review
 
 ## Status: Open issues against GPU_FALLBACK_STRATEGIES.md v0.3
-## Date: 2026-02-08
+## Date: 2026-02-08 (updated)
 
 ---
 
 ## Issue 1: RPT Only Works for Acyclic Query Graphs
 
 **Severity**: Fundamental scope limitation
+**Status**: Mitigated
 
 The Yannakakis algorithm — and RPT's approximation of it — only guarantees full
 reduction for **acyclic queries**. The doc never states this constraint.
@@ -21,85 +22,34 @@ through the bloom filters.
 **Impact**: The doc's claims about hash table reduction depend on full reduction.
 Without it, the reduction ratio is less predictable and potentially much smaller.
 
-**Resolution needed**: State the acyclicity requirement explicitly. Discuss what
-happens for cyclic queries and whether partial reduction is still valuable.
+**Resolution**: Mitigated via materialized CTEs as cycle breakers (Section 4.2).
+RPT's `LargestRoot` identifies back edges → materialize as CTEs → each section's
+join graph is acyclic. For queries where materialization cost exceeds benefit, fall
+back to partial reduction. The mechanism leverages existing CTE infrastructure
+(`LogicalCteOptimizer` → `PhysicalCteOptimizer` → `SequenceNode`). New work is
+limited to cycle detection and synthetic CTE generation.
 
-**Mitigation: materialized CTEs as cycle breakers.**
-
-Presto's materialized CTE infrastructure (`LogicalCteOptimizer` → `PhysicalCteOptimizer`)
-converts CTE definitions into temporary table writes (`CteProducerNode` → `TableWriteNode`)
-and CTE references into temporary table scans (`CteConsumerNode` → `TableScanNode`). Each
-materialized CTE becomes a separate execution section via `SequenceNode`. This creates a
-natural mechanism for breaking cyclic join graphs:
-
-**How it works**: A cyclic join graph has edges that form cycles (e.g., A⋈B⋈C⋈A — the
-triangle pattern `A.x=B.x, B.y=C.y, C.z=A.z`). By materializing one of the joins as a
-CTE, we "snip" an edge: the join result becomes a new base table (temp table), and the
-remaining join graph within each section can be acyclic.
-
-```
-Cyclic query:
-  A ⋈ B ⋈ C ⋈ A   (triangle — no valid topological ordering for RPT)
-
-With materialized CTE:
-  Section 1 (CTE producer):  A ⋈ B → temp table T_AB
-    Join graph: A—B (acyclic, 2 tables)
-    RPT applies: BF_A from A → filter B, BF_B → filter A
-
-  Section 2 (consumer):  T_AB ⋈ C
-    Join graph: T_AB—C (acyclic, 2 "tables")
-    RPT applies: BF_TAB from temp table → filter C, BF_C → filter T_AB
-
-Each section's join graph is acyclic → RPT works within each section.
-```
-
-**Automatic cycle detection**: RPT's `LargestRoot` algorithm already computes a spanning
-tree of the join graph. Any join edge NOT in the spanning tree is a "back edge" that
-creates a cycle. These back edges identify exactly which joins to materialize as CTEs.
-For typical analytical queries (≤20 joins), the number of back edges is small (usually
-1-2 for moderately cyclic queries).
-
-**Existing infrastructure reused**:
-- `LogicalCteOptimizer.CteConsumerTransformer`: wraps subplans in `CteProducerNode` +
-  `CteConsumerNode` pairs
-- `PhysicalCteOptimizer.CteProducerRewriter`: converts producer → `TableWriteNode`
-  (temporary table)
-- `PhysicalCteOptimizer.CteConsumerRewriter`: converts consumer → `TableScanNode`
-  (temporary table)
-- `SequenceNode`: creates section boundaries — CTE producers must complete before
-  consumers start
-- `CTEMaterializationTracker`: coordinates completion via `SettableFuture` per CTE
-- `CteProjectionAndPredicatePushDown`: pushes predicates from consumers into producers
-  (complementary to RPT's BF filtering)
-
-**New work needed**:
-1. Cycle detection in the RPT planner (identify back edges in join graph)
-2. Synthetic CTE generation for back-edge joins (wrap the join subtree in a
-   `CteReferenceNode` that triggers the materialization pipeline)
-3. Cost model: materialization cost (temp table write + read) vs. RPT benefit from
-   breaking the cycle. For small back-edge joins, materialization may not be worth it.
-
-**Partial reduction without CTEs**: Even without cycle-breaking, RPT's `LargestRoot`
-algorithm can still generate a transfer schedule for cyclic queries — it just can't
-guarantee full reduction. The bloom filters still provide useful filtering, just not
-the theoretical optimality guarantee. For mildly cyclic queries (one back edge), the
-reduction loss is typically small.
-
-**Resolution**: Cyclic join graphs are addressable via materialized CTEs. The approach
-decomposes a cyclic query into acyclic sections, each of which RPT can fully reduce.
-This leverages Presto's existing CTE materialization infrastructure with minimal new
-code (cycle detection + synthetic CTE generation). For queries where the cycle-breaking
-materialization cost exceeds the RPT benefit, fall back to partial reduction (apply RPT
-to the spanning tree, accept non-optimal filtering on back edges).
+**Remaining gap**: The doc now describes the mechanism but doesn't acknowledge the
+acyclicity requirement in the introductory RPT description (Section 2.2, lines 46-67).
+A reader encountering RPT for the first time won't know about this limitation until
+deep in Section 4.2. The constraint should be stated upfront.
 
 ---
 
 ## Issue 2: The "10-100x" Hash Table Reduction Claim Is Unsupported
 
 **Severity**: Misleading quantification
+**Status**: OPEN — worse than before
 
-The doc repeats "10-100x" six times but never derives or justifies it. The actual
-reduction is highly workload-dependent:
+The doc now repeats "10-100x" in **more places** than the original version:
+- Line 66: "hash tables shrink 10-100x"
+- Line 277: "10-100x smaller hash tables"
+- Line 297: "reduces build sides by 10-100x"
+- Line 345: "Hash tables 10-100x smaller → fit in VRAM"
+- Line 1094: "Hash tables shrink 10-100x"
+
+None of these are qualified or derived. The actual reduction is highly
+workload-dependent:
 
 - **TPC-H Q5** (`region = 'ASIA'`): filters to ~20% of nations → ~5x reduction
 - **TPC-H Q3** (broad date filter): maybe 2-3x reduction
@@ -111,139 +61,51 @@ The 100x figure requires very selective dimension predicates. It's the best case
 not the typical case.
 
 **Impact**: Overstating the reduction ratio inflates RPT's apparent value and
-understates the scenarios where RPT overhead isn't justified.
+understates the scenarios where RPT overhead isn't justified. This is especially
+problematic now that "10-100x" is used to justify "fits in VRAM" (line 345) —
+if the actual reduction is 3-5x for a typical workload, 800GB × 0.2 = 160GB,
+which does NOT fit in VRAM.
 
 **Resolution needed**: Replace "10-100x" with workload-qualified ranges. Provide
 concrete TPC-H/TPC-DS examples with actual selectivities and reduction ratios.
+Consider presenting a table:
+
+```
+| Query Pattern               | Typical Selectivity | Expected Reduction |
+| Star, selective dim filter  | 1-5%                | 20-100x            |
+| Star, moderate dim filter   | 10-30%              | 3-10x              |
+| Star, broad/no dim filter   | 50-100%             | 1-2x               |
+| Snowflake, multi-hop filter | varies               | 5-50x (compounds)  |
+```
 
 ---
 
 ## Issue 3: RPT Doesn't Work for Complex Subqueries
 
 **Severity**: Significant scope limitation
+**Status**: Mitigated
 
 RPT operates on **base table scans only**. When join inputs are subqueries —
 aggregations, nested joins, CTEs, window functions — RPT cannot push bloom filters
-into them. The subquery output is an opaque leaf.
+into them.
 
-Example that RPT can't help:
-```sql
-SELECT *
-FROM fact f
-JOIN (SELECT customer_id, SUM(amount) AS total
-     FROM orders GROUP BY customer_id
-     HAVING SUM(amount) > 1000) high_value
-ON f.customer_id = high_value.customer_id
-```
+**Resolution**: Mitigated via materialized CTEs (Section 4.2). Complex subquery
+join inputs are materialized as temporary tables via the existing CTE pipeline.
+The temporary table becomes a `TableScanNode` that RPT can scan. New work: (1)
+detecting non-scannable join inputs during RPT planning, (2) wrapping them in
+synthetic CTEs, (3) cost-based gating.
 
-RPT can build a BF from `fact.customer_id`, but it can't push that into the
-aggregation subquery — the subquery must run to completion first.
-
-**Impact**: The doc's star schema examples all use simple base table scans, making
-RPT look more broadly applicable than it is. Many analytical queries have subquery
-join inputs (derived tables, aggregated dimensions, CTEs).
-
-**Resolution needed**: Document the limitation explicitly. Identify the query
-patterns where RPT applies (star/snowflake with base table joins) vs. where it
-doesn't (subquery join inputs). Consider whether RPT sections could be placed
-after subquery materialization.
-
-**Mitigation: materialized CTEs turn subqueries into scannable base tables.**
-
-The same CTE materialization infrastructure that addresses Issue #1 (cycle breaking)
-directly solves Issue #3. When a complex subquery (aggregation, nested join, window
-function) is materialized as a CTE:
-
-1. **CTE producer** (Section N): executes the subquery, writes result to a temporary
-   table via `TableWriteNode`
-2. **CTE consumer** (Section N+1): reads from the temporary table via `TableScanNode`
-
-The `TableScanNode` on the temporary table is a **base table scan** — exactly what RPT
-needs. RPT can push bloom filters into it, and Parquet column pruning works on the
-temporary table's columns.
-
-```
-Original (RPT can't help):
-  fact ⋈ (SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id)
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-         Opaque aggregation subquery — RPT can't push BF into this
-
-With materialized CTE:
-  Section 1 (CTE producer):
-    SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id
-    → writes to temp table T_agg (columns: customer_id, sum_amount)
-
-  Section 2 (consumer + main query):
-    fact ⋈ T_agg ON fact.customer_id = T_agg.customer_id
-    ^^^^^^   ^^^^^
-    Both are base table scans — RPT works on both!
-
-    RPT forward pass:
-      Scan T_agg key column (customer_id) → BF_agg
-      Scan fact key column + apply BF_agg → BF_fact
-    RPT backward pass:
-      Apply BF_fact to T_agg scan → tighter BF_agg
-    Main query:
-      Both hash tables are reduced — joins on filtered data
-```
-
-**Why this works well**: Complex subqueries (especially aggregations) typically produce
-**much smaller output than their input**. An aggregation `GROUP BY customer_id` on a
-billion-row orders table might produce 10M rows. The CTE materialization cost is writing
-10M rows to a temp table — fast. The RPT benefit is filtering those 10M rows against
-the fact table's bloom filter before building the hash table.
-
-**Automatic subquery-to-CTE promotion for RPT**: The RPT planner can identify join
-inputs that are not base table scans and automatically wrap them in synthetic CTEs:
-
-```
-RPT planning phase:
-  For each join in the query:
-    For each join input:
-      If input is NOT a TableScanNode (it's a subquery, aggregation, etc.):
-        If RPT is enabled for this join (via heuristic or HBO):
-          Wrap input in synthetic CteReferenceNode
-          → LogicalCteOptimizer pipeline handles the rest
-```
-
-**Existing infrastructure reused** (same as Issue #1):
-- `LogicalCteOptimizer` → `PhysicalCteOptimizer` → `SequenceNode` pipeline
-- `CteProjectionAndPredicatePushDown`: can push RPT-derived predicates from the
-  consumer back into the CTE producer (e.g., if BF_fact eliminates 90% of
-  customer_ids, push that filter into the aggregation — fewer groups to compute)
-- `CTEMaterializationTracker`: coordinates section ordering
-
-**Interaction with CteProjectionAndPredicatePushDown**: This existing optimizer pushes
-predicates from CTE consumers into CTE producers. If RPT produces a `TupleDomain`
-(min/max range) from the fact table scan, this range could potentially be pushed into
-the CTE producer's aggregation — reducing the aggregation work itself. The BF can't be
-pushed into the producer (it operates on pre-aggregation rows), but the TD range can
-prune partitions/row groups of the orders table within the CTE producer. This is a
-bonus: not only does RPT filter the CTE consumer's scan, but it can also reduce the
-CTE producer's work.
-
-**Cost model for subquery-to-CTE promotion**:
-- Materialization cost: write subquery result to temp table (~disk I/O for result size)
-- RPT benefit: BF-filtered scan of temp table (column pruning on key column)
-- Break-even: when subquery output is large enough that BF filtering saves more than
-  the materialization cost
-- For small subquery outputs (< 100MB): materialization overhead likely not worth it —
-  just build the hash table directly
-- For large subquery outputs (> 1GB): materialization + RPT filtering is clearly
-  beneficial
-
-**Resolution**: Materialized CTEs directly solve the subquery limitation. Complex join
-inputs become temporary tables that RPT can scan with column pruning and BF filtering.
-The existing CTE pipeline handles materialization, section boundaries, and predicate
-pushdown. New work is limited to: (1) detecting non-scannable join inputs during RPT
-planning, (2) wrapping them in synthetic CTEs, (3) cost-based gating to avoid
-materializing small subqueries unnecessarily.
+**Remaining gap**: The cost-based gating threshold is hand-waved. The doc says
+"< 100MB: not worth it" and "> 1GB: clearly beneficial" but doesn't derive these
+thresholds. The CTE materialization cost (temp table write I/O) should appear in
+the quantitative cost model alongside the RPT scan costs.
 
 ---
 
 ## Issue 4: AsyncDataCache Contention Under Concurrent Workload
 
 **Severity**: Optimistic assumption in cost model
+**Status**: OPEN
 
 The caching analysis assumes a single query using the `AsyncDataCache` in
 isolation. In a production Presto cluster with dozens of concurrent queries, the
@@ -269,93 +131,25 @@ a reliable middle ground.
 ## Issue 5: Section Scheduling Overhead Is Zero in the Cost Model
 
 **Severity**: ~~Missing cost component~~ **Mitigated — lower than initially estimated**
+**Status**: Mitigated
 
-The cost model accounts for scan I/O time but doesn't include coordinator overhead
-between sections. Initial concern was 50-200ms per section transition.
+Code analysis revealed that all stages are pre-created upfront, split sources are
+`LazySplitSource` (deferred construction), and section readiness is a pure state
+check. The real latency is connector split enumeration (~10-100ms), which is
+addressable through eager pre-enumeration during the previous section's execution.
 
-**Code analysis reveals the overhead is much lower than feared:**
+**Revised overhead**: ~1-5ms per section transition with pre-enumeration. For 3
+RPT sections: ~3-15ms total (negligible vs. scan time).
 
-1. **All stages are pre-created upfront.** `SqlQueryScheduler` constructor calls
-   `createStageExecutions()` recursively for ALL sections, creating ALL
-   `StageExecutionAndScheduler` objects at query start time. Section transition
-   is just a map lookup via `getStageExecutions()`, not stage creation.
-
-2. **Split sources are `LazySplitSource`.** `SplitSourceFactory.visitTableScan()`
-   wraps every source in `LazySplitSource` — a lazy proxy that only calls the
-   connector's `getSplits()` on first `getNextBatch()`. Construction is free.
-
-3. **Section readiness check is pure state inspection.** `isReadyForExecution()`
-   just checks `stageExecution.getState() != PLANNED` and child section states.
-   No I/O, no allocation.
-
-**Actual section transition path:**
-```
-Section N root stage → FINISHED
-  → stateChangeListener calls startScheduling()       (~0ms, callback)
-  → executor.submit(schedule)                          (~1ms, queue)
-  → getSectionsReadyForExecution()                     (~0ms, state checks)
-  → getStageExecutions()                               (~0ms, map lookup)
-  → schedule loop: stageScheduler.schedule()
-    → splitSource.getNextBatch()
-      → LazySplitSource.getDelegate() triggers connector (~10-100ms)
-      → This is the real latency: partition/file listing
-```
-
-**Remaining concern: connector split enumeration latency.** The first
-`getNextBatch()` for each new section hits the connector (Hive metastore,
-Iceberg manifest reads). For large tables this can be 10-100ms. But this is
-**addressable** through eager pre-enumeration:
-
-**Mitigation: eager split pre-enumeration for RPT sections.**
-Since we know at planning time which tables are scanned in Section N+1, the
-`LazySplitSource` can be triggered eagerly during Section N's execution:
-
-```
-Section 0 executing (scanning dims):
-  In parallel: kick off Section 1's LazySplitSource.getDelegate()
-               → Hive/Iceberg enumerates fact table splits in background
-               → Splits buffered, ready for immediate use
-
-Section 0 completes → BFs/TDs arrive at coordinator:
-  → Coordinator prunes pre-enumerated splits using TDs (fast, in-memory)
-  → Section 1 schedule: getNextBatch() returns immediately
-```
-
-Further optimization: **pre-create tasks on workers** using split-to-worker
-affinity from the previous section. `HttpRemoteTaskWithEventLoop.addSplits()`
-supports adding splits to existing tasks. Pattern:
-
-```
-During Section 0:
-  Pre-create tasks on workers with empty split sets (plan fragment only)
-  Workers initialize pipeline, allocate memory
-When Section 0 completes:
-  Coordinator prunes splits → addSplits() to pre-created tasks
-  Workers begin scan immediately (no task startup overhead)
-```
-
-This requires extending `SourcePartitionedScheduler` to support pre-creation
-(currently it couples task creation with split assignment), or using
-`FixedSourcePartitionedScheduler`'s pre-assignment pattern.
-
-**Revised overhead estimate with pre-enumeration:**
-```
-Without pre-enumeration:  ~10-100ms per section transition (connector latency)
-With pre-enumeration:     ~1-5ms per section transition (state check + pruning)
-For 3 RPT sections:       ~3-15ms total (negligible vs. scan time)
-```
-
-**Resolution**: The original 50-200ms estimate was wrong — coordinator overhead
-is near-zero because stages are pre-created. Connector split enumeration is the
-real cost, and it's addressable through eager pre-enumeration during the previous
-section. This should be noted as an optimization in the main design doc rather
-than treated as a blocking issue.
+**Remaining gap**: The eager pre-enumeration optimization is described in the
+critical review but not in the main doc. It should be incorporated into Section 4.2.
 
 ---
 
 ## Issue 6: GPU-CPU Exchange Data Path Is Hand-Waved
 
 **Severity**: Missing implementation detail
+**Status**: OPEN
 
 Section 4.1 claims "different fragments in the same query can get different
 GPU/CPU decisions" connected by exchanges. But the doc never addresses how data
@@ -382,42 +176,44 @@ overhead into the per-fragment decision.
 ## Issue 7: RPT + Dynamic Filtering RFC Lifecycle Mismatch
 
 **Severity**: Integration complexity underestimated
+**Status**: Partially addressed
 
-The doc says RPT reuses RFC-0022's Dynamic Filtering infrastructure. But they have
-fundamentally different lifecycles:
+The main doc now lists specific extension points (lines 562-572):
+- New `BloomFilterBuildStage` type
+- Using existing filter distribution for BF propagation
+- Transfer schedule generation via LargestRoot
+
+But the fundamental lifecycle mismatch is still unaddressed:
 
 - **RFC-0022 dynamic filters**: Generated *during* query execution. Hash join
-  build side completes → filter extracted → pushed to probe side. The filter
-  emerges as a side effect of normal execution.
+  build side completes → filter extracted → pushed to probe side.
 - **RPT bloom filters**: Generated *before* query execution in dedicated transfer
-  sections. The filters are the primary output of these sections, not a side
-  effect.
+  sections. Filters are complete before the main query starts.
 
 Specific mismatches:
-- RFC-0022's `DynamicFilterFetcher` long-polls for filters that arrive during
-  execution. RPT's BFs are complete before the main query starts — no long-polling
-  needed.
+- RFC-0022's `DynamicFilterFetcher` long-polls for filters during execution. RPT's
+  BFs are complete before the main query — no long-polling needed.
 - RFC-0022's transitive propagation works through join equality chains in the
   running query. RPT's propagation follows a transfer schedule computed by
-  LargestRoot, independent of the main query's join order.
-- RFC-0022's section gating waits for build-side completion. RPT's section gating
-  waits for BF-build completion — similar but orchestrated differently.
+  LargestRoot, independent of join order.
+- Can RPT BFs and RFC-0022 dynamic filters coexist on the same join? If RPT
+  provides a BF from the transfer phase AND the join build side generates a DF
+  during execution, how do they compose?
 
 The filter serialization format and coordinator-side application logic are likely
 reusable. The orchestration, timing, and distribution mechanisms need new work.
 
-**Impact**: "Extend Dynamic Filtering with bloom filter support" understates the
-implementation effort. The plumbing is reusable; the orchestration is new.
-
 **Resolution needed**: Separate clearly which RFC-0022 components are reused
 (serialization, coordinator application, TupleDomain merging) vs. which are new
-(transfer section orchestration, BF-build stage type, transfer schedule generation).
+(transfer section orchestration, BF-build stage type, BF collection before
+main query starts, BF+DF composition on the same join).
 
 ---
 
 ## Issue 8: NVLink Assumption May Not Hold for Commodity GPUs
 
 **Severity**: Economic thesis undermined
+**Status**: OPEN
 
 Section 6 assumes ex-training GPUs retain NVLink connectivity. Training clusters
 use NVLink because they're purpose-built DGX/HGX chassis. When GPUs enter the
@@ -446,28 +242,23 @@ fallback.
 ## Issue 9: Fault Tolerance for RPT Sections Is Unaddressed
 
 **Severity**: Reliability gap
+**Status**: OPEN
 
-If a worker fails midway through an RPT section (e.g., Section 1, forward fact
-scan), the partial bloom filter built on that worker is lost. The coordinator
-must handle this failure, but the options are unclear:
+If a worker fails midway through an RPT section, the partial bloom filter on that
+worker is lost. The coordinator must handle this, but options are unclear:
 
-- **Retry the entire section**: Safe but expensive — all workers' work in that
-  section is discarded. Other workers' BFs were fine.
-- **Retry just the failed worker's splits**: The BF is an aggregation across all
-  splits. You need to merge the surviving workers' partial BFs with the retried
-  worker's partial BF. This requires BFs to be merge-friendly (they are — BFs
-  support bitwise OR merge), but the coordinator needs new logic for partial
-  section retry.
-- **Skip the failed BF**: Proceed without that table's BF. The main query runs
-  with less filtering — safe but suboptimal.
+- **Retry the entire section**: Safe but expensive.
+- **Retry just the failed worker's splits**: BFs support bitwise OR merge, so
+  the surviving workers' partial BFs can be combined with the retried worker's.
+  Needs new coordinator logic for partial section retry.
+- **Skip the failed BF**: Proceed without that table's BF — safe but suboptimal.
 
 Traditional query execution can reassign individual splits on failure. RPT
 introduces section-level coupling — the BF is only useful when all splits have
 contributed.
 
 **Impact**: RPT adds a new failure mode that increases blast radius from
-per-split to per-section. For long-running RPT passes on large tables, this
-could be a reliability concern.
+per-split to per-section.
 
 **Resolution needed**: Design the failure handling strategy. BF merge-on-retry
 is likely the right approach, but needs explicit design.
@@ -477,26 +268,22 @@ is likely the right approach, but needs explicit design.
 ## Issue 10: HBO Can't Help When You Need It Most
 
 **Severity**: Amortization story weaker than presented
+**Status**: OPEN
 
 HBO matches queries when input table sizes are within 10% of historical runs.
-But fact tables in production often grow daily — new partitions arrive, tables
-grow by gigabytes or terabytes. If the table grows 15% between runs, HBO's match
-fails and RPT reverts to conservative mode.
+Fact tables in production often grow daily. If the table grows 15% between runs,
+HBO's match fails and RPT reverts to conservative mode.
 
 This creates an inversion:
 - **Stable data** (HBO matches): RPT decisions are well-informed. But stable data
-  also means simple table stats are reliable — the optimizer's cardinality
-  estimates are more likely correct, reducing RPT's value.
-- **Rapidly changing data** (HBO fails to match): RPT reverts to conservative
-  overhead. This is exactly when safety-net RPT is most needed (because optimizer
-  stats are stale), but also when HBO can't help target it.
+  also means simple table stats are reliable — reducing RPT's value.
+- **Rapidly changing data** (HBO fails): RPT reverts to conservative overhead.
+  This is exactly when the safety net is most needed.
 
-**Impact**: The HBO amortization is most effective where it's least needed, and
-least effective where it's most needed.
+**Impact**: The HBO amortization is most effective where it's least needed.
 
 **Resolution needed**: Consider relaxing the HBO matching threshold for RPT
-decisions (e.g., 30% tolerance for RPT vs. 10% for cardinality estimates — RPT
-decisions are more robust to size changes than cardinality overrides). Or use
+decisions (e.g., 30% tolerance for RPT vs. 10% for cardinality estimates). Or use
 relative metrics (join selectivity ratio) rather than absolute sizes for matching.
 
 ---
@@ -504,93 +291,236 @@ relative metrics (join selectivity ratio) rather than absolute sizes for matchin
 ## Issue 11: Salted Joins Replicate the Build Side
 
 **Severity**: Memory pressure interaction
+**Status**: OPEN
 
 Section 4.3 says "Replicate build side N ways, salt probe side partition key."
 If N=8 GPUs and the build side is 10GB after RPT reduction, replication creates
-80GB total build-side data distributed across 8 GPUs — each GPU holds its full
-10GB copy.
+80GB total build-side data — each GPU holds its full 10GB copy.
 
-This means salted joins don't reduce per-GPU memory for the build side. They
-only reduce per-GPU probe-side data. If the build side is what's causing OOM,
-salted joins don't help — they need the build side to already fit on each GPU.
+Salted joins don't reduce per-GPU memory for the build side. They only reduce
+per-GPU probe-side data. If the build side is what's causing OOM, salted joins
+don't help.
 
 For builds that don't fit: you'd need partitioned joins (hash-partition both
-sides by join key, then salt within each partition), which is more complex than
-presented.
-
-**Impact**: The doc implies salted joins solve per-GPU memory pressure. They
-only solve probe-side pressure. Build-side pressure requires different
-techniques (Grace hash join, RPT reduction).
+sides by join key, then salt within each partition), which is more complex.
 
 **Resolution needed**: Clarify that salted joins help probe-side parallelism
 and skew, not build-side memory pressure. Distinguish between salted joins
-(build replication) and partitioned joins (build partitioning) more carefully.
+(build replication) and partitioned joins (build partitioning).
 
 ---
 
 ## Issue 12: Cost Model Ignores Parquet Metadata Overhead
 
 **Severity**: ~~Optimistic cost model~~ **Resolved — not additional I/O**
+**Status**: Resolved
 
-The original concern was that RPT's key-column-only reads would produce many
-small I/O requests (one per row group per file) with high metadata overhead,
-especially on remote storage like S3.
+RPT's forward pass reads data that would be read anyway — total I/O volume is
+identical. The only overhead is ~5% more S3 requests in the worst case. With any
+meaningful BF selectivity, RPT reduces total I/O. The Parquet metadata concern
+is handled by `AsyncDataCache` and `FileHandleCache` across RPT sections.
 
-**This concern is invalid: the key column I/O is not additional work.**
+---
 
-The main query phase would read those exact same key column pages as part of
-reading the full row groups. RPT just reads them *earlier* in a separate pass.
-Total I/O volume is identical:
+## Issue 13: Cost Model Assumes Local NVMe — Completely Invalid for S3/HDFS
 
-```
-Without RPT:
-  Main query: 50 RGs × 128MB = 6.4GB per file (includes key column)
+**Severity**: Fundamental cost model gap
+**Status**: NEW
 
-With RPT + AsyncDataCache:
-  Forward pass: 50 RGs × 6MB (key column) = 300MB from storage
-  Main query:   50 RGs × 122MB (non-key columns) = 6.1GB from storage
-                (key column pages cached from forward pass)
-  Total: 300MB + 6.1GB = 6.4GB — identical to without RPT
-```
+The entire quantitative cost model (lines 378-402) is based on a specific hardware
+configuration: "2x EPYC 7763, 170 GB/s NVMe, 8x A100 80GB." This is an on-premise
+setup with local SSDs.
 
-RPT front-loads 300MB of I/O that would have happened anyway. The BENEFIT is
-that those 300MB build a bloom filter that prunes the main query:
+**Most Presto deployments read from remote storage** (S3, GCS, HDFS, ADLS). The
+performance characteristics are radically different:
 
 ```
-With 90% BF selectivity:  300MB + 10% × 6.4GB = 940MB total (6.8x savings)
-With 50% BF selectivity:  300MB + 50% × 6.4GB = 3.5GB total (1.8x savings)
-With  0% BF selectivity:  300MB + 6.4GB        = 6.7GB total (~5% overhead)
+                    Local NVMe    S3 (per-worker)    HDFS (per-worker)
+Sequential read:    170 GB/s      ~0.5-2 GB/s        ~1-5 GB/s
+Request latency:    ~50 μs        ~10-50 ms           ~1-5 ms
+Request cost:       free          $0.40/M GETs        free
 ```
 
-Even in the worst case (BF prunes nothing), the overhead is just ~5% — the
-cost of reading the key column in a separate pass rather than as part of the
-full row group reads. This overhead comes from extra S3 requests (50 separate
-6MB GETs for the key column vs. being coalesced into 50 larger full-RG reads),
-not from additional data volume.
+The cost model says RPT forward pass reads 20GB of key columns in 0.12s. On S3
+at 1 GB/s per worker with 10 workers, that's 20GB / (10 × 1 GB/s) = 2s — 17x
+longer. More critically, RPT's key-column-only reads generate many small I/O
+requests (one per row group per file), and S3 latency per request is 10-50ms.
+For 5000 row groups across 100 files: 5000 GETs × 30ms = 150s sequentially.
+Even with parallelism and coalescing, S3 request overhead dominates.
 
-**Velox infrastructure that makes this work:**
+**Impact**: The "0.3s total RPT overhead" is specific to local NVMe. On S3, RPT
+overhead could be 5-30s — still potentially worthwhile for long queries, but the
+cost-benefit calculus changes dramatically. The "skip RPT for short queries" threshold
+shifts from <5s to potentially <60s.
 
-1. **`AsyncDataCache`** (enabled by default): Caches key column pages from the
-   forward pass. Main query hits cache for those pages — no re-read.
-   Keyed by `{fileNum, offset}`. Source: `velox/common/caching/AsyncDataCache.h`
+**Resolution needed**: Present cost models for at least three storage tiers: local
+NVMe, HDFS, and S3. The RPT skip threshold should be storage-aware. The cost
+heuristic should use actual storage bandwidth (measurable at runtime) rather than
+assuming local NVMe.
 
-2. **`FileHandleCache`**: LRU cache of open file handles. Forward pass opens
-   files, backward pass and main query reuse cached handles.
-   Source: `velox/connectors/hive/FileHandle.h`
+---
 
-3. **I/O Coalescing** (`CachedBufferedInput`): Within each row group, key
-   column pages are contiguous and coalesced into one read.
-   `maxCoalesceDistance` = 512KB, `loadQuantum` = 8MB.
-   Do NOT increase `maxCoalesceDistance` to coalesce across RGs — that would
-   read through ~122MB of non-key columns between RGs, defeating column pruning.
-   Source: `velox/dwio/common/CachedBufferedInput.cpp`
+## Issue 14: Parquet BF Section Is 115 Lines to Conclude "Not Worth It"
 
-4. **Row group prefetching**: `prefetchRowGroups` = 1 by default. Hides I/O
-   latency behind compute for sequential access within a file.
+**Severity**: Structural bloat
+**Status**: NEW
 
-**Resolution**: Issue is resolved. RPT's forward pass reads data that would be
-read anyway — it's not extra I/O, it's an investment. The only overhead is ~5%
-more S3 requests in the worst case (no pruning). With any meaningful BF
-selectivity, RPT reduces total I/O. The Parquet metadata concern (footers,
-page indexes) is handled by `AsyncDataCache` and `FileHandleCache` across
-RPT sections.
+Section 4.2.8 (lines 729-844) spends ~115 lines analyzing Parquet bloom filters
+and their interaction with RPT, including FPR saturation math, cost comparisons,
+and predicate interaction tables. The conclusion: "Parquet BFs are not a significant
+optimization for RPT" and "not on the critical path for the GPU execution strategy."
+
+This is a research dead end documented at the same level of detail as the core
+strategies. It buries the actual conclusion and makes the document harder to read.
+A reader navigating Section 4.2 encounters this long diversion between the important
+progressive split pruning section and Section 4.3.
+
+**Impact**: The doc's signal-to-noise ratio is degraded. Key design decisions
+(NVLink overpartitioning, Grace hash join) get the same page space as this dead end.
+
+**Resolution needed**: Condense Section 4.2.8 to ~15-20 lines: state the question,
+give the two reasons it doesn't work (FPR saturation on merge, marginal savings vs
+columnar projection for row-group pruning), and the conclusion. Move the detailed
+analysis to the research companion doc (`GPU_ALGEBRAIC_MEMORY_TECHNIQUES.md`) or
+an appendix.
+
+---
+
+## Issue 15: Duplicate Section Numbering
+
+**Severity**: Document structure bug
+**Status**: NEW
+
+The document has two sections numbered "6":
+- Line 1071: `## 6. Implementation Phases`
+- Line 1120: `## 6. Commodity GPU Economics`
+
+The second should be Section 7, making Open Questions Section 8 and References
+Section 9.
+
+---
+
+## Issue 16: Superlinear Join Efficiency Claims Are Uncited
+
+**Severity**: Unsupported technical claim
+**Status**: NEW
+
+Lines 283-311 make specific micro-architectural claims:
+- "a hash table at 75% load has ~4x more cache misses per probe than one at 25% load"
+- "L3 cache (256-384MB on modern servers)"
+- "GPU's L2 cache (40-50MB on H100)"
+- "each remaining probe is faster due to fewer collisions"
+
+These claims are directionally correct — hash table probe cost does increase
+superlinearly with load factor, and cache residency does matter. But the specific
+numbers (4x, 256-384MB, 40-50MB) are stated as facts without citations.
+
+The H100 L2 cache is actually 50MB (correct), but the "4x more cache misses at
+75% vs 25% load" depends heavily on the hash table implementation (open addressing
+vs chaining, probe sequence), key distribution, and table size relative to cache.
+
+**Impact**: The superlinear argument is important — it's the reason RPT's value
+compounds beyond the raw row-count reduction. But unsupported numbers weaken it.
+A skeptical reader may dismiss the entire argument.
+
+**Resolution needed**: Either cite sources for the specific numbers or soften the
+language to "significantly more" without specific multipliers. The L3/L2 cache
+sizes are verifiable from spec sheets — cite them. The collision chain behavior
+should reference hash table performance literature.
+
+---
+
+## Issue 17: CTE Materialization Cost Missing from Quantitative Cost Model
+
+**Severity**: Incomplete cost model
+**Status**: NEW
+
+Section 4.2 proposes two uses of CTE materialization: cycle breaking and
+subquery-to-CTE promotion. Both involve writing intermediate results to temporary
+tables (via `TableWriteNode`) and reading them back (via `TableScanNode`). The
+quantitative cost model (lines 378-402) does not include this cost.
+
+For cycle-breaking CTEs on large join results or subquery-to-CTE promotion on
+large aggregation outputs, the materialization cost could be substantial:
+
+```
+Example: subquery outputs 50M rows × 100 bytes = 5GB
+  Write to temp table (local NVMe): 5GB / 10 GB/s = 0.5s
+  Read back during RPT scan:        5GB × 5% (key column) / 170 GB/s = ~0.001s
+  Total CTE overhead: ~0.5s — comparable to the RPT overhead itself
+```
+
+For S3-backed deployments, writing temp tables is even more expensive.
+
+**Impact**: The cost model may underestimate total RPT overhead when CTEs are
+needed. The "cost-based gating" threshold for when CTE materialization is
+worthwhile needs to be quantified, not hand-waved.
+
+**Resolution needed**: Add CTE materialization cost to the quantitative cost
+model. Define the gating threshold: materialization is worthwhile when
+`RPT_benefit > CTE_write_cost + CTE_read_cost`.
+
+---
+
+## Issue 18: What Happens When Reduced Hash Table Still Exceeds VRAM?
+
+**Severity**: Gap in fallback chain
+**Status**: NEW
+
+Line 345 states: "Hash tables 10-100x smaller → fit in VRAM." But what if the
+original hash table is 4TB (large fact-to-fact join, or low-selectivity star
+schema)? Even 100x reduction gives 40GB — fits in one 80GB GPU. But:
+- 10x reduction gives 400GB — does NOT fit in one GPU
+- 3x reduction gives 1.3TB — does NOT fit in 8 GPUs combined (640GB)
+
+The doc presents RPT and GPU memory-bounded operators (Grace hash join) as
+separate phases (Phase 2 and Phase 4), but doesn't describe how they compose.
+After RPT reduces the hash table from 4TB to 400GB, what happens next?
+
+The intended answer is probably: Grace hash join partitions the 400GB across
+multiple passes. But this interaction isn't stated. The doc's narrative implies
+RPT makes everything fit, and Grace hash join is a separate fallback for when
+RPT isn't available.
+
+**Impact**: The overall strategy's coverage for large joins is unclear. The reader
+needs to understand the composition: RPT reduces the problem, then Grace hash join
+handles any remaining overflow.
+
+**Resolution needed**: Explicitly state the composition chain:
+1. RPT reduces build side (e.g., 4TB → 400GB)
+2. NVLink overpartitioning distributes across GPUs (400GB / 8 = 50GB per GPU)
+3. If per-GPU share still exceeds VRAM: Grace hash join within each GPU
+4. If still failing: UVM / CPU fallback
+
+This makes the layered defense clear rather than presenting each technique
+as an independent solution.
+
+---
+
+## Summary
+
+| Issue | Severity | Status | Topic |
+|-------|----------|--------|-------|
+| 1  | Scope limitation | Mitigated | RPT acyclicity requirement |
+| 2  | Misleading | **OPEN** | "10-100x" unsupported, now in more places |
+| 3  | Scope limitation | Mitigated | RPT + complex subqueries |
+| 4  | Optimistic model | **OPEN** | AsyncDataCache concurrent contention |
+| 5  | Missing cost | Mitigated | Section scheduling overhead |
+| 6  | Missing detail | **OPEN** | GPU-CPU exchange data path |
+| 7  | Underestimated | Partial | RPT + Dynamic Filtering lifecycle |
+| 8  | Economic thesis | **OPEN** | NVLink may not exist on commodity GPUs |
+| 9  | Reliability | **OPEN** | RPT section fault tolerance |
+| 10 | Amortization | **OPEN** | HBO inversion problem |
+| 11 | Memory pressure | **OPEN** | Salted joins replicate build side |
+| 12 | Cost model | Resolved | Parquet metadata I/O |
+| 13 | Cost model | **NEW** | S3/HDFS storage invalidates cost numbers |
+| 14 | Structure | **NEW** | 115-line dead-end Parquet BF section |
+| 15 | Structure | **NEW** | Duplicate section numbering |
+| 16 | Unsupported claim | **NEW** | Superlinear efficiency uncited |
+| 17 | Cost model | **NEW** | CTE materialization cost missing |
+| 18 | Fallback chain | **NEW** | Reduced hash table still > VRAM |
+
+**Open issues**: 12 (7 original + 5 new)
+**Mitigated**: 4 (Issues 1, 3, 5, 7-partial)
+**Resolved**: 1 (Issue 12)
+**Highest priority**: Issues 2 (misleading claims), 13 (S3 cost model), 18 (fallback composition)
