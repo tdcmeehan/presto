@@ -371,29 +371,92 @@ and skew, not build-side memory pressure. Distinguish between salted joins
 
 ## Issue 12: Cost Model Ignores Parquet Metadata Overhead
 
-**Severity**: Optimistic cost model
+**Severity**: ~~Optimistic cost model~~ **Partially mitigated by Velox I/O infrastructure**
 
 The 0.12s scan time for key columns assumes you read exactly the key column
-bytes at full storage throughput. In reality:
+bytes at full storage throughput. The concern was that metadata overhead and
+small I/O amplification could dominate.
 
-1. **File footer read**: Each Parquet file requires reading the footer to find
-   column chunk offsets. For remote storage (S3), this is a GET request with
-   ~50-100ms latency per file.
-2. **Row group metadata**: Page indexes and column chunk metadata must be parsed
-   before reading actual data pages.
-3. **Small I/O amplification**: Key-column-only reads may produce many small I/O
-   requests (one per row group per file) rather than large sequential reads.
-   Storage throughput for small random reads is far below sequential throughput.
+**Velox provides three layers of mitigation (already deployed):**
 
-For local NVMe, metadata overhead is small (~1ms per file). For S3/HDFS with
-high-latency reads, it can dominate: 1000 files × 50ms = 50s of metadata
-latency, even though the key column data itself is only 20GB.
+1. **I/O Coalescing (`CachedBufferedInput` + `CoalescedLoad`):**
+   - `maxCoalesceDistance` = 512KB (default) — nearby reads within 512KB merged
+     into a single I/O request
+   - `maxCoalesceBytes` = 128MB — max coalesced read size
+   - `loadQuantum` = 8MB — large chunks broken into 8MB cache entries
+   - `groupRequests()` sorts by offset and merges adjacent requests via
+     `coalesceIo<>`. Within a row group, a key column's pages are contiguous
+     and get coalesced into one read.
+   - Source: `velox/dwio/common/CachedBufferedInput.cpp`, `velox/common/io/Options.h`
 
-**Impact**: The cost model is realistic for local NVMe storage but potentially
-off by orders of magnitude for cloud/remote storage (where many Presto
-deployments actually run).
+2. **`FileHandleCache` (LRU cache of open file handles):**
+   - `SimpleLRUCache<FileHandleKey, FileHandle>` keyed by filename
+   - Avoids re-opening files (no extra `open()` syscall or S3 HEAD request)
+   - Each `FileHandle` gets a `StringIdLease` UUID for downstream cache keying
+   - Metrics: num elements, hits, lookups, pinned size
+   - On RPT backward pass: files already in `FileHandleCache` from forward pass
+   - Source: `velox/connectors/hive/FileHandle.h`
 
-**Resolution needed**: Present separate cost models for local NVMe vs. remote
-storage. For remote storage, evaluate whether Velox's file prefetching and
-metadata caching mitigate the latency. Consider whether RPT is only practical
-for local-storage deployments.
+3. **`AsyncDataCache` caches footer + data at page/chunk level:**
+   - Keyed by `{fileNum, offset}` — caches individual I/O regions
+   - Parquet footer bytes read through `CachedBufferedInput` → cached
+   - Second read of the same footer (backward pass, main query) → cache hit
+   - Row group metadata pages are also cached
+   - Source: `velox/common/caching/AsyncDataCache.h`
+
+4. **Row group prefetching:**
+   - `prefetchRowGroups` = 1 (default) — while processing RG N, Velox
+     pre-fetches RG N+1 via `scheduleRowGroups()`
+   - `shouldPrefetchStripes()` = true for `CachedBufferedInput`
+   - Hides I/O latency behind compute for sequential access patterns
+
+**What remains a concern — the small I/O amplification for key-column reads:**
+
+For RPT key-column-only scans across many row groups in a file:
+- Key column pages within a single row group are contiguous → coalesced (good)
+- Key column pages across row groups are spaced ~128MB apart (typical RG size)
+  → exceeds the 512KB coalesce distance → each RG's key column = separate I/O
+
+For **local NVMe**: This is fine. Random 0.5MB reads at NVMe speeds (~6 GB/s
+per device) mean each RG key column read takes ~0.1ms. A file with 50 RGs =
+5ms. Metadata overhead is negligible.
+
+For **remote storage (S3)**: Each RG's key column page is a separate S3 GET
+with Range header. S3 GET latency is ~20-50ms per request. A file with 50 RGs
+= 50 × 30ms = 1.5s per file. 1000 files × 1.5s = catastrophic **if serial**.
+However:
+- Velox parallelizes across files (multiple splits processed concurrently)
+- Within a file, `CoalescedLoad` parallelizes reads via the IO executor
+- S3 supports high request concurrency (~1000+ parallel GETs)
+- With 128 concurrent requests: 1000 files × 50 RGs = 50K GETs / 128 = ~12s
+  at 30ms each — still significant but parallelizable
+
+**The footer cache is the key win for RPT.** On the backward pass:
+- File footers: cached in `AsyncDataCache` from forward pass → free
+- File handles: cached in `FileHandleCache` → no re-open
+- Key column pages from forward pass: cached → backward pass is memory-speed
+
+**Revised assessment:**
+
+| Storage Type | Forward Pass (cold) | Backward Pass (warm cache) | Concern Level |
+|---|---|---|---|
+| Local NVMe | 0.12s (storage-bound) | 0.01s (cache hit) | Low |
+| HDFS (nearby) | 0.5-2s (network latency) | 0.01s (cache hit) | Medium |
+| S3 (remote) | 5-15s (GET latency × parallelism) | 0.01s (cache hit) | High for forward pass |
+
+For S3 deployments, the forward pass is expensive but is a **one-time cost per
+query** (the backward pass and main query benefit from cached footers/metadata).
+The question is whether this one-time cost is acceptable for RPT's benefits.
+
+**Possible mitigation for S3**: increase `maxCoalesceDistance` beyond 512KB for
+RPT key-column scans. If set to, say, 256MB (one full row group), Velox would
+coalesce all key column pages in a file into fewer, larger reads. This trades
+extra bytes read (reading through the gaps between key column pages) for fewer
+S3 requests. For a key column that's 5% of the row, this means reading 20x more
+bytes but making 50x fewer requests — a good trade on S3 where latency dominates.
+
+**Resolution**: The cost model is realistic for local NVMe (the doc's reference
+hardware). For S3, the forward pass cost is higher but the backward pass is
+still cache-speed. Add the storage-type dimension to the cost model. Consider
+exposing a tunable `maxCoalesceDistance` for RPT scans to optimize for high-
+latency storage.
