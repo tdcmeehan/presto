@@ -13,6 +13,77 @@ the Pareto principle: the 20% of tables and join edges that appear in 80% of que
 get sampled almost immediately, providing zero-config optimization for the most
 impactful parts of the workload.
 
+## Storage Model (aligned with Axiom)
+
+Following Axiom's architecture, all adaptive statistics are stored in the **existing
+HBO provider** (Redis). There is no separate storage system. The HBO provider stores
+four types of statistics in distinct key spaces within the same backend:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  HBO Provider (Redis)                        │
+│                                                             │
+│  ┌─────────────┐  ┌──────────┐  ┌───────────┐  ┌────────┐ │
+│  │ leaves      │  │ joins    │  │ aggs      │  │ plans  │ │
+│  │             │  │          │  │           │  │        │ │
+│  │ filter      │  │ join     │  │ agg       │  │ plan   │ │
+│  │ selectivity │  │ fanout   │  │ reduction │  │ node   │ │
+│  │             │  │          │  │           │  │ history│ │
+│  │ key: table  │  │ key: tbl │  │ key: tbl  │  │        │ │
+│  │  + filter   │  │  pair +  │  │  + group  │  │ (exist │ │
+│  │             │  │  joinKeys│  │  Keys     │  │  -ing  │ │
+│  │ val: float  │  │          │  │           │  │  HBO)  │ │
+│  │             │  │ val: lr, │  │ val: float│  │        │ │
+│  │             │  │  rl      │  │           │  │        │ │
+│  └─────────────┘  └──────────┘  └───────────┘  └────────┘ │
+│                                                             │
+│  ◄── new adaptive caches ──────────────────►  ◄─existing─► │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Why One Provider, Not Two
+
+Axiom stores all three of its cache types (`leaves`, `joins`, `plans`) through
+a single storage layer serialized as one JSON structure. We follow the same pattern:
+
+- **Single SPI**: Extend `HistoryBasedPlanStatisticsProvider` with new methods for
+  adaptive statistics, rather than creating a separate `AdaptiveStatisticsProvider`
+- **Single Redis backend**: All key spaces share the same Redis instance/cluster
+- **Unified lifecycle**: Cache warming, staleness detection, and invalidation are
+  coordinated through one manager rather than two independent systems
+- **Existing HBO preserved**: The `plans` key space (existing subtree-level HBO)
+  continues to work unchanged. Adaptive statistics are additive.
+
+### Four Key Spaces
+
+| Key Space | Key | Value | Source | Filter in Key? |
+|-----------|-----|-------|--------|---------------|
+| `leaves` | `(table, filter)` | `selectivity: float` | Sampling | Yes |
+| `joins` | `(tablePair, joinKeys)` | `(lr_fanout, rl_fanout)` | Sampling | **No** |
+| `aggs` | `(table, groupByKeys)` | `reductionFactor: float` | Sampling | **No** |
+| `plans` | `(canonicalSubtree)` | `(cardinality, memory, cpu)` | Post-execution | N/A (full subtree) |
+
+The first three are the adaptive optimizer. The fourth is existing HBO.
+
+### Key Canonicalization (aligned with Axiom)
+
+Axiom uses **canonical string keys**, not hashes. Join keys use a format that orders
+table names and join columns lexicographically:
+
+```
+Join key example:  "customers id   orders cust_id "
+                    ^^^^^^^^^ ^^   ^^^^^^ ^^^^^^^
+                    table1   col1  table2  col2     (sorted lexicographically)
+
+Leaf key example:  "hive.default.orders[total>1000]"
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    full table handle toString() including filters
+```
+
+We should follow the same approach: **canonical strings as keys, not SHA256 hashes**.
+This makes the cache inspectable/debuggable (you can read the Redis keys and
+understand what they represent) and avoids hash collision concerns.
+
 ## Architecture
 
 ```
@@ -44,50 +115,19 @@ impactful parts of the workload.
                        │              │              │
                        ▼              ▼              ▼
                 ┌──────────────────────────────────────────┐
-                │ Adaptive Statistics Provider (Redis/HBO) │
-                │ persist for cross-query reuse            │
+                │ HBO Provider (Redis)                     │
+                │ leaves[] + joins[] + aggs[] + plans[]    │
                 └──────────────────────────────────────────┘
 ```
 
-## Cache Key Design
-
-**Three caches with different key granularities, composed at query time:**
-
-### 1. Join Fanout Cache
-```
-Key:   (canonicalTable, canonicalJoinKeys)
-Value: (leftToRightFanout: double, rightToLeftFanout: double)
-```
-- Sampled from **unfiltered** base table — no filter in the key
-- One entry per (table, join key set) pair, reused across all queries
-- Example: `(orders, [custkey])` → `(lr: 1.3, rl: 0.8)`
-
-### 2. Filter Selectivity Cache
-```
-Key:   (canonicalTable, canonicalFilterPredicate)
-Value: (selectivity: double)
-```
-- Filter constants ARE part of the key (different filter values → different entry)
-- One entry per (table, filter combo)
-- Example: `(orders, "ds = '2024-01-01'")` → `0.03`
-
-### 3. Aggregation Reduction Cache
-```
-Key:   (canonicalTable, canonicalGroupByKeys)
-Value: (reductionFactor: double)    // distinctGroups / totalRows
-```
-- Sampled from **unfiltered** base table — no filter in the key
-- Captures the compound-key NDV that CBO cannot derive from per-column stats
-- Example: `(users, [state, city])` → `0.001` (1K groups in 1M rows)
-
-### Composition at Query Time
+## Composition at Query Time
 
 **Join estimation:**
 ```
 SELECT * FROM orders WHERE ds='2024-01-01' JOIN customers ON custkey
 
-ordersSelectivity   = filterCache.get(orders, "ds='2024-01-01'")     → 0.03
-joinFanout          = fanoutCache.get((orders, customers), custkey)   → (1.3, 0.8)
+ordersSelectivity   = leaves.get(orders, "ds='2024-01-01'")            → 0.03
+joinFanout          = joins.get((orders, customers), custkey)           → (1.3, 0.8)
 effectiveFanout     = 1.3 * 1.0   (customers has no filter)
 outputRows          = ordersRows * 0.03 * 1.3
 ```
@@ -96,85 +136,95 @@ outputRows          = ordersRows * 0.03 * 1.3
 ```
 SELECT state, city, COUNT(*) FROM users WHERE region='West' GROUP BY state, city
 
-usersSelectivity    = filterCache.get(users, "region='West'")        → 0.25
-reductionFactor     = reductionCache.get(users, [state, city])       → 0.001
+usersSelectivity    = leaves.get(users, "region='West'")               → 0.25
+reductionFactor     = aggs.get(users, [state, city])                   → 0.001
 filteredRows        = usersRows * 0.25
 aggOutput           = filteredRows * 0.001
 
-CBO would estimate:  filteredRows * NDV(state) * NDV(city) / filteredRows
-                    = min(50 * 10000, filteredRows) = way too high
+CBO would estimate:  min(NDV(state) * NDV(city), filteredRows)
+                    = min(50 * 10000, 250K) = 250K   (vs actual ~250)
+```
+
+**Existing HBO still works for exact subtree matches:**
+```
+If the plan subtree hash matches plans[] cache → use exact historical stats
+Else → compose from leaves[] + joins[] + aggs[]
+Else → fall back to CBO
 ```
 
 ## Phases
 
-### Phase 1: SPI Types
+### Phase 1: SPI Types and Provider Extension
 
-**New types in `presto-spi`:**
+**Extend existing `HistoryBasedPlanStatisticsProvider`** with new methods:
 
-1. `AdaptiveStatisticsKey` — base type for cache keys
-   - `String hash` (SHA256 of canonical form)
+```java
+// New methods added to HistoryBasedPlanStatisticsProvider (or a sub-interface)
 
-2. `JoinFanoutEstimate` — bidirectional fanout measurement
+// Filter selectivity: (table+filter canonical string) → selectivity
+Map<String, Double> getFilterSelectivities(List<String> keys, long timeoutMs);
+void putFilterSelectivities(Map<String, Double> selectivities);
+
+// Join fanout: (canonical join edge string) → (lr_fanout, rl_fanout)
+Map<String, JoinFanoutEstimate> getJoinFanouts(List<String> keys, long timeoutMs);
+void putJoinFanouts(Map<String, JoinFanoutEstimate> fanouts);
+
+// Aggregation reduction: (canonical agg key string) → reductionFactor
+Map<String, Double> getAggregationReductions(List<String> keys, long timeoutMs);
+void putAggregationReductions(Map<String, Double> reductions);
+```
+
+**New value types in `presto-spi`:**
+
+1. `JoinFanoutEstimate`
    - `double leftToRightFanout`
    - `double rightToLeftFanout`
-   - `long sampledRows` (sample size, for confidence)
-   - `long estimatedTableRows` (table size at sampling time, for staleness)
+   - `long sampledRows` (for confidence)
+   - `long estimatedTableRows` (for staleness detection)
 
-3. `FilterSelectivityEstimate` — selectivity measurement
-   - `double selectivity`
-   - `long sampledRows`
-   - `long estimatedTableRows`
+**Note:** Filter selectivity and aggregation reduction are simple doubles (with
+metadata), following Axiom's approach. Join fanout needs a pair, hence a dedicated type.
 
-4. `AggregationReductionEstimate` — group-by reduction measurement
-   - `double reductionFactor` (distinctGroups / inputRows)
-   - `long sampledRows`
-   - `long estimatedTableRows`
-   - `long observedDistinctGroups` (from sample, for confidence assessment)
-
-5. `AdaptiveStatisticsProvider` — SPI interface for storage
-   - `Map<Key, JoinFanoutEstimate> getJoinFanouts(List<Key>, timeout)`
-   - `void putJoinFanouts(Map<Key, JoinFanoutEstimate>)`
-   - `Map<Key, FilterSelectivityEstimate> getFilterSelectivities(List<Key>, timeout)`
-   - `void putFilterSelectivities(Map<Key, FilterSelectivityEstimate>)`
-   - `Map<Key, AggregationReductionEstimate> getAggregationReductions(List<Key>, timeout)`
-   - `void putAggregationReductions(Map<Key, AggregationReductionEstimate>)`
+**Files to modify:**
+- `presto-spi/.../statistics/HistoryBasedPlanStatisticsProvider.java` (add default methods)
 
 **Files to create:**
-- `presto-spi/.../statistics/AdaptiveStatisticsKey.java`
 - `presto-spi/.../statistics/JoinFanoutEstimate.java`
-- `presto-spi/.../statistics/FilterSelectivityEstimate.java`
-- `presto-spi/.../statistics/AggregationReductionEstimate.java`
-- `presto-spi/.../statistics/AdaptiveStatisticsProvider.java`
 
 ---
 
 ### Phase 2: Canonicalization
 
-**Three canonicalization utilities, sharing common infrastructure:**
+**Three canonicalization utilities producing readable string keys (not hashes),
+following Axiom's approach:**
 
 #### A. Join Fanout Key Canonicalizer
-Given a `JoinNode`, produce a key for each side's (table, joinKeys):
+Given a `JoinNode`, produce a canonical string:
 1. Walk from JoinNode to the leaf `TableScanNode` on each side
-2. Canonicalize table identity (connector + table handle, **stripping** pushed-down predicates)
-3. Canonicalize join key columns (map to table-relative column names, sort)
-4. Order the two table sides deterministically (e.g., alphabetical by table name)
-5. Hash → `AdaptiveStatisticsKey`
+2. Canonicalize table identity (connector + table, **stripping** pushed-down predicates)
+3. Canonicalize join key columns (map to table-relative column names)
+4. Sort table sides lexicographically, sort columns within each side
+5. Produce string: `"customers id   orders cust_id "` (Axiom format)
 
-**Important:** The table identity is the *unfiltered* table. Pushed-down predicates
-are stripped so the same base table always produces the same fanout key.
+**Important:** No filters in the key. The same base table always produces the same
+fanout key regardless of what WHERE clauses appear in the query.
 
 #### B. Filter Selectivity Key Canonicalizer
 Given a `FilterNode` or pushed-down predicate:
-1. Canonicalize table identity (same unfiltered base table)
-2. Canonicalize filter predicate (preserve constants, normalize variable names)
-3. Hash → `AdaptiveStatisticsKey`
+1. Canonicalize table identity including connector and schema
+2. Canonicalize filter predicate (preserve constants, normalize variable names, sort conjuncts)
+3. Produce string: `"hive.default.orders[ds='2024-01-01' AND total>1000]"`
+
+Filters ARE part of the key — different filter values produce different keys.
 
 #### C. Aggregation Reduction Key Canonicalizer
 Given an `AggregationNode`:
 1. Walk to the leaf `TableScanNode` feeding the aggregation
 2. Canonicalize table identity (unfiltered)
 3. Canonicalize grouping key columns (map to table-relative column names, sort)
-4. Hash → `AdaptiveStatisticsKey`
+4. Produce string: `"hive.default.users state city"`
+
+No filters in the key — same rationale as join fanout.
 
 **Reuse from existing infrastructure:**
 - `CanonicalPlanGenerator` expression canonicalization utilities
@@ -208,7 +258,7 @@ For a (table, joinKeys) pair:
    - `hits = sum of min(leftCount[h], rightCount[h]) for matching hashes`
    - `leftToRightFanout = hits / leftSample.size()`
    - `rightToLeftFanout = hits / rightSample.size()`
-5. Store in cache via `AdaptiveStatisticsProvider`
+5. Store in HBO provider via `putJoinFanouts()`
 
 #### B. Filter Selectivity Sampling
 
@@ -217,7 +267,7 @@ For a (table, filter) pair:
 2. Apply the filter predicate
 3. `selectivity = passingRows / scannedRows`
 4. Floor at configurable minimum to prevent underestimation
-5. Store in cache
+5. Store in HBO provider via `putFilterSelectivities()`
 
 #### C. Aggregation Reduction Sampling
 
@@ -230,8 +280,8 @@ For a (table, groupByKeys) pair:
    - Count distinct hash values in sample
 3. Compute reduction factor:
    - `reductionFactor = distinctHashValues / sampledRows`
-   - This captures the compound-key NDV that per-column NDV multiplication misses
-4. Store in cache
+   - Captures compound-key NDV that per-column NDV multiplication misses
+4. Store in HBO provider via `putAggregationReductions()`
 
 **Note on accuracy:** For high-cardinality grouping keys (many groups relative to
 input), the sample-based distinct count may underestimate. Use HyperLogLog on the
@@ -268,32 +318,32 @@ sample for better accuracy with large group counts. For low-cardinality keys
 
 ### Phase 4: Cache Infrastructure
 
-Add caches in `HistoryBasedStatisticsCacheManager` (or a new `AdaptiveStatisticsCacheManager`)
-for all three statistic types.
+Extend `HistoryBasedStatisticsCacheManager` with in-memory caches for the three
+adaptive statistic types, backed by the HBO provider.
 
-**Cache manager responsibilities:**
-- `LoadingCache<AdaptiveStatisticsKey, JoinFanoutEstimate> joinFanoutCache`
-- `LoadingCache<AdaptiveStatisticsKey, FilterSelectivityEstimate> filterSelectivityCache`
-- `LoadingCache<AdaptiveStatisticsKey, AggregationReductionEstimate> aggregationReductionCache`
+**Extend `HistoryBasedStatisticsCacheManager`:**
+- Add `LoadingCache<String, Double> filterSelectivityCache`
+- Add `LoadingCache<String, JoinFanoutEstimate> joinFanoutCache`
+- Add `LoadingCache<String, Double> aggregationReductionCache`
 - Cache miss triggers sampling (async or sync depending on config)
 - Cleanup on table metadata changes (partition additions, etc.)
 
 **Pre-loading during planning:**
-- In a new `AdaptiveStatisticsCalculator.registerPlan()` (or extend existing HBO calculator):
+- Extend `HistoryBasedPlanStatisticsCalculator.registerPlan()`:
   - Walk plan tree, identify all `JoinNode`s, `FilterNode`s, `AggregationNode`s
-  - Compute canonical keys for each
-  - Bulk-load from `AdaptiveStatisticsProvider`
+  - Compute canonical string keys for each
+  - Bulk-load from HBO provider (joins[], leaves[], aggs[])
   - For cache misses: enqueue async sampling or sample with timeout
 
 **Staleness detection:**
-- Each cached entry stores `estimatedTableRows` at sampling time
+- Each cached entry optionally stores `estimatedTableRows` at sampling time
 - Compare against current table stats from `ConnectorMetadata.getTableStatistics()`
 - If table has grown/shrunk by more than threshold, invalidate and re-sample
 
-**Files to create/modify:**
-- `presto-main-base/.../cost/adaptive/AdaptiveStatisticsCacheManager.java` (new)
-- `presto-main-base/.../cost/adaptive/AdaptiveStatisticsCalculator.java` (new)
-- Or extend existing `HistoryBasedStatisticsCacheManager` and `HistoryBasedPlanStatisticsCalculator`
+**Files to modify:**
+- `presto-main-base/.../cost/HistoryBasedStatisticsCacheManager.java`
+- `presto-main-base/.../cost/HistoryBasedPlanStatisticsCalculator.java`
+- `presto-main-base/.../cost/HistoryBasedPlanStatisticsManager.java`
 
 ---
 
@@ -307,10 +357,10 @@ when available, falling back to existing CBO logic.
 **New flow in `computeInnerJoinStats()`:**
 ```
 1. For each side of the join, look up filter selectivity:
-   - If FilterNode or pushed-down predicate exists: get from cache
+   - If FilterNode or pushed-down predicate exists: get from leaves[] cache
    - Else: selectivity = 1.0
 
-2. Look up join fanout for the (leftTable, rightTable, joinKeys) edge
+2. Look up join fanout from joins[] cache
 
 3. If fanout available:
    outputRows = leftInputRows * leftSelectivity * fanout.leftToRight
@@ -324,13 +374,13 @@ when available, falling back to existing CBO logic.
 **New flow in `groupBy()` estimation:**
 ```
 Current CBO:
-  outputRows = NDV(col1) * NDV(col2) * ... * NDV(colN)   // independence assumption
+  outputRows = NDV(col1) * NDV(col2) * ... * NDV(colN)
   outputRows = min(outputRows, inputRows)
 
 New flow:
-1. Look up aggregation reduction for (table, groupByKeys)
+1. Look up aggregation reduction from aggs[] cache
 
-2. Look up filter selectivity if filters exist upstream
+2. Look up filter selectivity from leaves[] cache if filters exist upstream
 
 3. If reduction factor available:
    filteredInputRows = inputRows * filterSelectivity
@@ -340,15 +390,14 @@ New flow:
 4. Else: fall back to existing NDV-product estimation
 ```
 
-#### C. PushPartialAggregationThroughExchange
+#### C. Interaction with Existing HBO (plans[])
 
-The existing `partialAggregationNotUseful()` check compares output/input sizes.
-With accurate reduction factors from the adaptive cache, this decision becomes
-much better — especially for multi-key aggregations, where Presto currently
-always pushes partial aggregation blindly because it can't estimate the reduction.
+The priority order for stats is:
+1. **Existing HBO (plans[])** — if the exact subtree hash matches, use it (highest confidence)
+2. **Adaptive composition** — compose from joins[]/leaves[]/aggs[] caches
+3. **CBO** — fall back to model-based estimation
 
-No code changes needed here — the improvement flows automatically through
-`AggregationStatsRule` returning better estimates to the stats provider.
+This preserves existing HBO behavior while layering adaptive estimation on top.
 
 **Files to modify:**
 - `presto-main-base/.../cost/JoinStatsRule.java`
@@ -359,16 +408,17 @@ No code changes needed here — the improvement flows automatically through
 ### Phase 6: Testing and In-Memory Provider
 
 **In-memory provider:**
-- `InMemoryAdaptiveStatisticsProvider` implementing `AdaptiveStatisticsProvider`
-- Backed by `ConcurrentHashMap`
+- Extend existing `InMemoryHistoryBasedPlanStatisticsProvider` to implement the
+  new adaptive statistics methods (backed by `ConcurrentHashMap` per key space)
 
 **Unit tests:**
 - Canonicalization:
-  - Same join edge across different queries → same key
-  - Same GROUP BY across different queries → same key
-  - Different filters → different selectivity keys
+  - Same join edge across different queries → same key string
+  - Same GROUP BY across different queries → same key string
+  - Different filters → different selectivity key strings
   - Same table with different join/group keys → different keys
   - Filter changes don't affect fanout/reduction keys
+  - Key strings are human-readable and debuggable
 - Sampling:
   - Join fanout: mock connector with known data, verify fanout
   - Filter selectivity: mock connector, verify selectivity
@@ -377,7 +427,8 @@ No code changes needed here — the improvement flows automatically through
 - Stats rule integration:
   - JoinStatsRule: fanout * selectivity produces correct estimate
   - AggregationStatsRule: reduction * selectivity produces correct estimate
-  - AggregationStatsRule: fallback to NDV-product when no adaptive stats
+  - Fallback to existing HBO when subtree hash matches
+  - Fallback to CBO when no adaptive stats available
 - Independence assumption:
   - Test where assumption holds (estimate matches actual)
   - Test where assumption fails (estimate diverges from actual)
@@ -389,15 +440,18 @@ No code changes needed here — the improvement flows automatically through
 - Staleness: data change → invalidation → re-sample
 - Timeout: slow sampling → falls back to CBO gracefully
 - Cross-query reuse: two different queries hitting same tables → shared cache entries
+- HBO + adaptive: verify existing HBO still takes priority for exact subtree matches
 
 **Files to create:**
-- `presto-main-base/.../cost/adaptive/InMemoryAdaptiveStatisticsProvider.java`
 - `presto-main-base/.../cost/adaptive/TestJoinFanoutSampler.java`
 - `presto-main-base/.../cost/adaptive/TestFilterSelectivitySampler.java`
 - `presto-main-base/.../cost/adaptive/TestAggregationReductionSampler.java`
 - `presto-main-base/.../cost/adaptive/TestJoinStatsRuleWithAdaptiveStats.java`
 - `presto-main-base/.../cost/adaptive/TestAggregationStatsRuleWithAdaptiveStats.java`
 - `presto-main-base/.../sql/planner/adaptive/TestKeyCanonicalizers.java`
+
+**Files to modify:**
+- `presto-main-base/.../cost/InMemoryHistoryBasedPlanStatisticsProvider.java`
 
 ---
 
@@ -421,13 +475,13 @@ No code changes needed here — the improvement flows automatically through
 ## Dependency Graph
 
 ```
-Phase 1 (SPI types)
+Phase 1 (SPI types + provider extension)
     │
     ├──► Phase 2 (Canonicalization — all three key types)
     │        │
     │        ├──► Phase 3 (Sampling — join, filter, aggregation)
     │        │        │
-    │        │        ├──► Phase 4 (Cache infrastructure)
+    │        │        ├──► Phase 4 (Cache infrastructure in existing HBO manager)
     │        │        │        │
     │        │        │        └──► Phase 5 (JoinStatsRule + AggregationStatsRule)
     │        │        │                 │
