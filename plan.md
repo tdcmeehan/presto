@@ -371,7 +371,14 @@ when available, falling back to existing CBO logic.
 
 #### B. AggregationStatsRule Integration
 
-**New flow in `groupBy()` estimation:**
+**Two distinct consumers of aggregation cardinality, with different integration points:**
+
+##### Consumer 1: Downstream Join Ordering (via AggregationStatsRule)
+
+When an aggregation feeds into a join, `ReorderJoins` needs accurate output
+cardinality to cost the join. The adaptive reduction factor plugs directly into
+`AggregationStatsRule`:
+
 ```
 Current CBO:
   outputRows = NDV(col1) * NDV(col2) * ... * NDV(colN)
@@ -390,6 +397,52 @@ New flow:
 4. Else: fall back to existing NDV-product estimation
 ```
 
+This flows transparently into join costing — `ReorderJoins` calls `StatsCalculator`
+which calls `AggregationStatsRule`, and the better estimate improves join ordering.
+
+##### Consumer 2: Partial Aggregation Decision (via PushPartialAggregationThroughExchange)
+
+`PushPartialAggregationThroughExchange` does NOT use `AggregationStatsRule`. It has
+its own `partialAggregationNotUseful()` check that operates in two modes:
+
+- **Without history**: Compares output bytes vs input bytes. Only evaluates single-key
+  aggregations; multi-key aggregations **always push partial agg blindly**.
+- **With history** (`use_partial_aggregation_history=true`): Uses
+  `PartialAggregationStatsEstimate` populated by HBO from actual prior execution stats.
+  Compares row count reduction.
+
+The adaptive reduction factor doesn't automatically reach this code path. We need to
+**synthesize a `PartialAggregationStatsEstimate`** from the adaptive cache when HBO
+execution history isn't available:
+
+```
+If adaptive reduction factor is available for (table, groupByKeys):
+  Synthesize PartialAggregationStatsEstimate:
+    inputRowCount  = estimated input rows to partial agg
+    outputRowCount = inputRowCount * reductionFactor
+    inputBytes     = inputRowCount * avgRowSize
+    outputBytes    = outputRowCount * avgRowSize
+  Attach to the AggregationNode's PlanNodeStatsEstimate
+```
+
+This makes the adaptive data look like HBO history to the existing decision code,
+enabling `partialAggregationNotUseful()` to make informed decisions — especially
+for **multi-key aggregations**, where it currently always pushes blindly.
+
+**Caveat: Global vs. Partial Reduction Factor**
+
+Our sample gives the **global** reduction factor (across all data). The **partial**
+reduction factor (per-worker, on one partition of data) may differ:
+- If data is partitioned by a grouping key → partial agg achieves near-full reduction
+- If partitioned by unrelated key → partial agg achieves less reduction
+
+The global reduction factor is a reasonable **upper bound** on partial agg
+effectiveness. If the global factor is close to 1.0 (little reduction), partial agg
+is definitely not useful. If the global factor is very low (high reduction), partial
+agg is likely useful regardless of partitioning. The edge cases are when the global
+factor is moderate — but this is still far better than the current behavior of
+pushing blindly for multi-key or relying on HBO execution history for single-key.
+
 #### C. Interaction with Existing HBO (plans[])
 
 The priority order for stats is:
@@ -399,9 +452,15 @@ The priority order for stats is:
 
 This preserves existing HBO behavior while layering adaptive estimation on top.
 
+For the partial aggregation decision specifically:
+1. **HBO execution history** — actual `PartialAggregationStatistics` from prior runs (highest confidence)
+2. **Adaptive synthesized estimate** — derived from sampled reduction factor
+3. **Existing heuristic** — bytes comparison for single-key, always-push for multi-key
+
 **Files to modify:**
 - `presto-main-base/.../cost/JoinStatsRule.java`
 - `presto-main-base/.../cost/AggregationStatsRule.java`
+- `presto-main-base/.../cost/HistoryBasedPlanStatisticsCalculator.java` (synthesize PartialAggregationStatsEstimate)
 
 ---
 
