@@ -2,274 +2,320 @@
 
 ## Goal
 
-Bring Axiom-style per-join-edge fanout estimation to Presto by:
-1. Decomposing HBO's cache from per-subtree to per-join-edge granularity
-2. Recording actual join fanout after execution (warm path)
-3. Adding sampling-based fanout estimation for cold start (cold path)
+Bring Axiom-style join fanout estimation to Presto by:
+1. Sampling unfiltered base tables to measure join key frequency distributions
+2. Independently sampling filter selectivity for filtered scans
+3. Composing the two at optimization time: `effectiveFanout = sampledFanout * filterSelectivity`
+4. Caching both in HBO infrastructure (Redis) for cross-query reuse
 
-This gives the optimizer empirical join selectivity data instead of relying on
-`1/max(leftNdv, rightNdv)` with uniformity assumptions.
+This replaces the CBO's `1/max(leftNdv, rightNdv)` uniformity assumption with
+empirical measurements from the actual data.
 
 ## Architecture Overview
 
 ```
                   ┌─────────────────────┐
                   │    JoinStatsRule     │
-                  │  (uses fanout if     │
-                  │   available, else    │
-                  │   falls back to CBO) │
-                  └─────┬───────────────┘
-                        │ lookup
-                        ▼
-              ┌─────────────────────┐
-              │ JoinEdgeFanout      │
-              │ CacheManager        │
-              │ (per-query cache)   │
-              └────┬──────────┬─────┘
-                   │          │
-          cache miss     cache hit
-                   │          │
-                   ▼          ▼
-     ┌──────────────────┐   return
-     │ HBO Provider      │   cached
-     │ (Redis/storage)   │   fanout
-     └──────────────────┘
-          ▲          ▲
-          │          │
-    ┌─────┘          └──────┐
-    │ record after          │ sample on
-    │ execution             │ cold start
-    │ (Phase 3)             │ (Phase 5)
-    └───────────────┘       └───────────┘
+                  │                     │
+                  │  effective_fanout =  │
+                  │  join_fanout *       │
+                  │  left_selectivity *  │
+                  │  right_selectivity   │
+                  └───┬─────────────┬───┘
+                      │             │
+            ┌─────────▼───┐   ┌────▼──────────┐
+            │ JoinFanout  │   │ FilterSelect. │
+            │ Cache       │   │ Cache         │
+            │             │   │               │
+            │ key: (table,│   │ key: (table,  │
+            │  joinKeys)  │   │  filter)      │
+            └──────┬──────┘   └──────┬────────┘
+                   │                 │
+              cache miss        cache miss
+                   │                 │
+                   ▼                 ▼
+            ┌────────────┐   ┌────────────────┐
+            │ Sample     │   │ Sample         │
+            │ unfiltered │   │ with filter    │
+            │ base table │   │ applied        │
+            │ join keys  │   │ count pass/    │
+            │ ~10K rows  │   │ total ratio    │
+            └────────────┘   └────────────────┘
+                   │                 │
+                   ▼                 ▼
+            ┌────────────────────────────────┐
+            │ HBO Provider (Redis/storage)   │
+            │ persist for cross-query reuse  │
+            └────────────────────────────────┘
 ```
 
 ## Cache Key Design
 
-The join edge key is a tuple of:
-```
-(leftTableCanonical + leftFilter, rightTableCanonical + rightFilter, joinKeysCanonical)
-```
+**Two separate caches with different key granularities:**
 
-Canonicalized so that:
-- Variable names are normalized
-- Left/right are ordered deterministically (e.g., by table name)
-- Filter predicates preserve constants (same as current HBO FilterNode behavior)
-- Join keys are sorted
+### Join Fanout Cache
+```
+Key:   (canonicalTable, canonicalJoinKeys)
+Value: (leftToRightFanout: double, rightToLeftFanout: double)
+```
+- No filter in the key — sampled from unfiltered base table
+- One entry per (table, join key set) pair, reused across all queries
+- Example: `(orders, [custkey])` → `(fanout: 1.3, 0.8)`
 
-This means the same physical join edge matches across different queries regardless
-of surrounding plan structure.
+### Filter Selectivity Cache
+```
+Key:   (canonicalTable, canonicalFilterPredicate)
+Value: (selectivity: double)
+```
+- Filter constants ARE part of the key (different filters → different selectivity)
+- One entry per (table, filter combo), reused across all queries hitting that table+filter
+- Example: `(orders, "ds = '2024-01-01'")` → `0.03`
+
+### Composition at Query Time
+```
+For: SELECT * FROM orders WHERE ds='2024-01-01' JOIN customers ON custkey
+
+ordersSelectivity  = filterSelectivityCache.get(orders, "ds='2024-01-01'")  → 0.03
+customerSelectivity = 1.0  (no filter)
+joinFanout         = joinFanoutCache.get((orders, customers), custkey)      → (1.3, 0.8)
+
+effectiveLeftToRight = 1.3 * customerSelectivity  = 1.3
+effectiveRightToLeft = 0.8 * ordersSelectivity     = 0.024
+outputRows          = ordersRows * ordersSelectivity * effectiveLeftToRight
+                    = ordersRows * 0.03 * 1.3
+```
 
 ## Phases
 
-### Phase 1: SPI Types for Join Edge Fanout
+### Phase 1: SPI Types
 
 **New types in `presto-spi`:**
 
-1. `JoinEdgeKey` — serializable key identifying a join edge
-   - `String hash` (SHA256 of canonical join edge)
-   - Used as cache/storage key
+1. `JoinFanoutKey` — identifies a (table, joinKeys) pair
+   - `String hash` (SHA256 of canonical form)
 
-2. `JoinEdgeFanoutStatistics` — fanout data for a single join edge
-   - `double leftToRightFanout` (avg rows on right per left key)
-   - `double rightToLeftFanout` (avg rows on left per right key)
-   - `double outputSelectivity` (outputRows / crossProductRows)
-   - `long observedLeftRows`, `long observedRightRows` (input sizes at time of observation)
-   - `double confidence`
+2. `JoinFanoutEstimate` — bidirectional fanout measurement
+   - `double leftToRightFanout`
+   - `double rightToLeftFanout`
+   - `long sampledRows` (sample size, for confidence)
+   - `long estimatedTableRows` (table size at time of sampling, for staleness detection)
 
-3. `HistoricalJoinEdgeFanoutStatistics` — multiple observations over time
-   - `List<JoinEdgeFanoutEntry>` (last N runs, like HistoricalPlanStatistics)
+3. `FilterSelectivityKey` — identifies a (table, filter) pair
+   - `String hash` (SHA256 of canonical form)
 
-4. `JoinEdgeFanoutStatisticsProvider` — SPI interface (parallel to `HistoryBasedPlanStatisticsProvider`)
-   - `Map<JoinEdgeKey, HistoricalJoinEdgeFanoutStatistics> getFanoutStats(List<JoinEdgeKey>, timeout)`
-   - `void putFanoutStats(Map<JoinEdgeKey, HistoricalJoinEdgeFanoutStatistics>)`
+4. `FilterSelectivityEstimate` — selectivity measurement
+   - `double selectivity`
+   - `long sampledRows`
+   - `long estimatedTableRows`
+
+5. `JoinEdgeStatisticsProvider` — SPI interface for storage
+   - `Map<JoinFanoutKey, JoinFanoutEstimate> getJoinFanouts(List<JoinFanoutKey>, timeout)`
+   - `void putJoinFanouts(Map<JoinFanoutKey, JoinFanoutEstimate>)`
+   - `Map<FilterSelectivityKey, FilterSelectivityEstimate> getFilterSelectivities(List<FilterSelectivityKey>, timeout)`
+   - `void putFilterSelectivities(Map<FilterSelectivityKey, FilterSelectivityEstimate>)`
 
 **Files to create:**
-- `presto-spi/src/main/java/com/facebook/presto/spi/statistics/JoinEdgeKey.java`
-- `presto-spi/src/main/java/com/facebook/presto/spi/statistics/JoinEdgeFanoutStatistics.java`
-- `presto-spi/src/main/java/com/facebook/presto/spi/statistics/HistoricalJoinEdgeFanoutStatistics.java`
-- `presto-spi/src/main/java/com/facebook/presto/spi/statistics/JoinEdgeFanoutEntry.java`
-- `presto-spi/src/main/java/com/facebook/presto/spi/statistics/JoinEdgeFanoutStatisticsProvider.java`
-
-**Files to modify:**
-- None yet — these are purely additive SPI types.
+- `presto-spi/.../statistics/JoinFanoutKey.java`
+- `presto-spi/.../statistics/JoinFanoutEstimate.java`
+- `presto-spi/.../statistics/FilterSelectivityKey.java`
+- `presto-spi/.../statistics/FilterSelectivityEstimate.java`
+- `presto-spi/.../statistics/JoinEdgeStatisticsProvider.java`
 
 ---
 
-### Phase 2: Join Edge Canonicalization
+### Phase 2: Canonicalization
 
-Build a canonicalization scheme for join edges that produces a stable hash
-independent of the surrounding plan structure.
+**Two canonicalization utilities:**
 
-**New class: `JoinEdgeCanonicalizer`** in `presto-main-base/.../sql/planner/`
+#### A. Join Fanout Key Canonicalizer
+Given a `JoinNode`, produce a canonical key for each side's (table, joinKeys):
+1. Walk from JoinNode to the leaf `TableScanNode` on each side
+2. Canonicalize table identity (connector + table handle, ignoring filters/predicates)
+3. Canonicalize join key columns (map to table-relative names, sort)
+4. Order the two sides deterministically
+5. Hash → `JoinFanoutKey`
 
-Given a `JoinNode`, produces a canonical key by:
-1. For each side of the join, walk down to the leaf `TableScanNode`(s)
-2. Canonicalize the table identity (connector + table handle)
-3. Canonicalize filter predicates between the table scan and the join
-   (preserving constants, normalizing variable names)
-4. Canonicalize the join criteria (sort equi-clauses deterministically)
-5. Order left/right deterministically (e.g., alphabetical by table name)
-6. Hash the canonical representation → `JoinEdgeKey`
+**Important:** The table identity here is the *unfiltered* table. Any pushed-down
+predicates in the table handle are stripped for the fanout key.
+
+#### B. Filter Selectivity Key Canonicalizer
+Given a `FilterNode` (or predicate pushed into `TableScanNode`):
+1. Canonicalize table identity (same as above)
+2. Canonicalize filter predicate (preserve constants, normalize variable names)
+3. Hash → `FilterSelectivityKey`
 
 **Reuse from existing infrastructure:**
-- `CanonicalPlanGenerator` already handles variable renaming, expression canonicalization,
-  and deterministic ordering. We can reuse its expression canonicalization utilities.
-- `CachingPlanCanonicalInfoProvider` already extracts input table statistics for leaf nodes.
-
-**Key difference from subtree hashing:** We only hash the join edge's immediate
-properties (tables, filters, join keys), NOT the full subtree. This means:
-- `A JOIN B JOIN C` and `A JOIN B JOIN D` share the `(A, B)` edge fanout
-- Different queries hitting the same tables with the same filters share fanout
+- `CanonicalPlanGenerator` expression canonicalization utilities
+- `CanonicalTableScanNode.getCanonicalTableHandle()` for table identity
 
 **Files to create:**
-- `presto-main-base/src/main/java/com/facebook/presto/sql/planner/JoinEdgeCanonicalizer.java`
-
-**Files to modify:**
-- None yet — this is a standalone utility.
+- `presto-main-base/.../sql/planner/JoinFanoutKeyCanonicalizer.java`
+- `presto-main-base/.../sql/planner/FilterSelectivityKeyCanonicalizer.java`
 
 ---
 
-### Phase 3: Recording Actual Fanout After Execution
+### Phase 3: Sampling Execution
 
-Extend the existing HBO tracking infrastructure to record per-join-edge fanout
-statistics after query execution completes.
+This is the core new capability. On cache miss, execute a lightweight sample query
+to measure join key frequency or filter selectivity.
 
-**Modify `HistoryBasedPlanStatisticsTracker`:**
-- In `getQueryStats()` (which already walks the plan tree and collects execution stats),
-  add logic to extract per-join-edge fanout:
-  - For each `JoinNode` in the executed plan:
-    - Compute `JoinEdgeKey` using `JoinEdgeCanonicalizer`
-    - Extract actual output rows from `PlanNodeStatsAndCostSummary`
-    - Extract actual input rows for both sides
-    - Compute `leftToRightFanout = outputRows / leftInputRows`
-    - Compute `rightToLeftFanout = outputRows / rightInputRows`
-    - Compute `outputSelectivity = outputRows / (leftInputRows * rightInputRows)`
-  - Call `JoinEdgeFanoutStatisticsProvider.putFanoutStats()` with collected data
+#### A. Join Fanout Sampling
 
-**Modify `HistoryBasedPlanStatisticsManager`:**
-- Wire in `JoinEdgeFanoutStatisticsProvider` (injected via Guice)
-- Create tracker with access to the provider
+For a (table, joinKeys) pair:
+1. Determine sample fraction:
+   - Small tables (<10K rows): sample all
+   - Large tables: fraction = 10000 / estimatedRowCount
+2. Construct sample scan:
+   - Read from table with SYSTEM sampling (split-level via `SampledSplitSource`)
+   - Project only the join key columns
+   - Hash join keys: `hash_combine(hash(key1), hash(key2))`
+   - Apply deterministic filter: `(hash % modulus) < limit` for ~10K rows
+3. Build frequency map: `Map<hashValue, count>`
+4. For each pair of tables in a join, intersect frequency maps:
+   - `hits = sum of min(leftCount[h], rightCount[h]) for matching hashes`
+   - `leftToRightFanout = hits / leftSample.size()`
+   - `rightToLeftFanout = hits / rightSample.size()`
+5. Store in HBO cache
 
-**New session properties:**
-- `hbo_use_join_edge_fanout` (boolean, default false) — feature flag
-- `hbo_join_edge_fanout_matching_threshold` (double, default 0.2) — how similar
-  input table sizes need to be for a fanout match (±20%)
+#### B. Filter Selectivity Sampling
+
+For a (table, filter) pair:
+1. Sample ~1% of table data (SYSTEM sampling)
+2. Apply the filter predicate
+3. `selectivity = passingRows / scannedRows`
+4. Floor at some minimum (Axiom uses 0.9, we may want to tune this)
+5. Store in HBO cache
+
+#### Execution Mechanism
+
+**Option A: Connector-level sampling (preferred for Phase 3)**
+- Add `SamplingCapableConnector` SPI interface
+- Connectors that support it (Hive, Iceberg) implement sampling natively
+  (read a subset of files/splits, apply filter, return counts)
+- This avoids dispatching a full Presto query during planning
+- `SampledSplitSource` already exists for split-level sampling
+
+**Option B: Internal query dispatch (Phase 7 enhancement)**
+- For connectors that don't support native sampling
+- Use ANALYZE-like mechanism to dispatch an internal query
+- More complex but universally applicable
+
+**Latency management:**
+- Sampling is async: on cache miss, fall back to CBO for this query,
+  kick off background sampling, next query benefits
+- Or: synchronous with timeout (e.g., 500ms), fall back to CBO if timeout
+- Configurable via session property
+
+**Files to create:**
+- `presto-main-base/.../cost/JoinFanoutSampler.java`
+- `presto-main-base/.../cost/FilterSelectivitySampler.java`
+- `presto-spi/.../connector/SamplingCapableConnector.java` (optional SPI)
 
 **Files to modify:**
-- `presto-main-base/src/main/java/com/facebook/presto/cost/HistoryBasedPlanStatisticsTracker.java`
-- `presto-main-base/src/main/java/com/facebook/presto/cost/HistoryBasedPlanStatisticsManager.java`
-- `presto-main-base/src/main/java/com/facebook/presto/SystemSessionProperties.java`
+- Connector implementations that opt in to native sampling
 
 ---
 
 ### Phase 4: Cache Infrastructure
 
-Add a parallel cache in `HistoryBasedStatisticsCacheManager` for join edge fanout,
-following the same pattern as the existing subtree statistics cache.
+Add caches in `HistoryBasedStatisticsCacheManager` for both fanout and selectivity.
 
 **Modify `HistoryBasedStatisticsCacheManager`:**
-- Add `Map<QueryId, LoadingCache<JoinEdgeKey, HistoricalJoinEdgeFanoutStatistics>> joinEdgeFanoutCache`
-- Add `getJoinEdgeFanoutCache(queryId, provider, timeout)` method
-- Cleanup on query completion (same lifecycle as existing caches)
+- Add `LoadingCache<JoinFanoutKey, JoinFanoutEstimate> joinFanoutCache`
+- Add `LoadingCache<FilterSelectivityKey, FilterSelectivityEstimate> filterSelectivityCache`
+- Cache miss triggers sampling (async or sync depending on config)
+- Cache cleanup on table metadata changes (partition additions, etc.)
 
 **Pre-loading during planning:**
-- Extend `HistoryBasedPlanStatisticsCalculator.registerPlan()`:
-  - Walk the plan tree, find all `JoinNode`s
-  - Compute `JoinEdgeKey` for each
-  - Bulk-load fanout stats from provider (same timeout approach as existing HBO)
+- In `HistoryBasedPlanStatisticsCalculator.registerPlan()`:
+  - Walk plan tree, identify all `JoinNode`s and `FilterNode`s
+  - Compute keys for each
+  - Bulk-load from HBO provider
+  - For cache misses: either sample synchronously (with timeout) or enqueue async
+
+**Staleness detection:**
+- Compare `estimatedTableRows` in cached entry against current table stats
+- If table has grown/shrunk by more than threshold, invalidate and re-sample
 
 **Files to modify:**
-- `presto-main-base/src/main/java/com/facebook/presto/cost/HistoryBasedStatisticsCacheManager.java`
-- `presto-main-base/src/main/java/com/facebook/presto/cost/HistoryBasedPlanStatisticsCalculator.java`
+- `presto-main-base/.../cost/HistoryBasedStatisticsCacheManager.java`
+- `presto-main-base/.../cost/HistoryBasedPlanStatisticsCalculator.java`
+- `presto-main-base/.../cost/HistoryBasedPlanStatisticsManager.java`
 
 ---
 
 ### Phase 5: JoinStatsRule Integration
 
-Modify `JoinStatsRule` to use cached fanout when available.
+Modify `JoinStatsRule` to use sampled fanout + selectivity when available.
 
-**Modify `JoinStatsRule.computeInnerJoinStats()`:**
+**New flow in `computeInnerJoinStats()`:**
 
 ```
-Current flow:
-  1. Compute crossJoinStats (leftRows * rightRows)
-  2. filterByEquiJoinClauses() → apply NDV-based selectivity
-  3. If unknown, use defaultJoinSelectivityCoefficient (0.15)
+1. For each side of the join, look up filter selectivity:
+   - If FilterNode or pushed-down predicate exists above/in the TableScan:
+     selectivity = filterSelectivityCache.get(table, filter)
+   - Else: selectivity = 1.0
 
-New flow:
-  1. Compute crossJoinStats (leftRows * rightRows)
-  2. Check joinEdgeFanoutCache for this JoinNode's edge key
-  3. If fanout available AND input sizes match within threshold:
-     a. Use historical outputSelectivity to compute outputRows
-     b. Set confidence to HIGH (or whatever HBO uses)
-  4. Else: fall back to filterByEquiJoinClauses() (existing CBO logic)
+2. Look up join fanout for the (leftTable, rightTable, joinKeys) edge:
+   fanout = joinFanoutCache.get(joinFanoutKey)
+
+3. If fanout available:
+   outputRows = leftInputRows * leftSelectivity * fanout.leftToRight
+   // or equivalently: rightInputRows * rightSelectivity * fanout.rightToLeft
+   confidence = HIGH
+
+4. Else: fall back to existing NDV-based estimation
 ```
 
-**Matching logic:**
-- Compare current `leftRows` and `rightRows` against the historical
-  `observedLeftRows` and `observedRightRows`
-- If within `hbo_join_edge_fanout_matching_threshold`, use the historical fanout
-- If multiple historical entries exist, select the closest match by input size ratio
-
-**How fanout feeds into cost:**
-- `outputRows = leftRows * leftToRightFanout` (or equivalently `rightRows * rightToLeftFanout`)
-- This replaces the NDV-based `leftRows * rightRows / max(leftNdv, rightNdv)` formula
-- The fanout implicitly captures skew, NULL distribution, and correlation
+**Integration with ReorderJoins:**
+- `ReorderJoins` already calls `JoinStatsRule` via `StatsCalculator`
+- Better fanout estimates automatically improve join order selection
+- No changes needed to `ReorderJoins` itself
 
 **Files to modify:**
-- `presto-main-base/src/main/java/com/facebook/presto/cost/JoinStatsRule.java`
+- `presto-main-base/.../cost/JoinStatsRule.java`
 
 ---
 
-### Phase 6: In-Memory Provider for Testing
+### Phase 6: Testing and In-Memory Provider
 
-Implement a simple in-memory `JoinEdgeFanoutStatisticsProvider` for testing.
+**In-memory provider:**
+- `InMemoryJoinEdgeStatisticsProvider` implementing `JoinEdgeStatisticsProvider`
+- Backed by `ConcurrentHashMap`
+
+**Unit tests:**
+- Canonicalization: same join edge across different queries → same key
+- Canonicalization: different filters → different selectivity keys
+- Canonicalization: same table with different join keys → different fanout keys
+- Fanout sampling: mock connector returning known data, verify computed fanout
+- Selectivity sampling: mock connector, verify selectivity
+- JoinStatsRule: verify fanout * selectivity produces correct estimate
+- Independence assumption: test case where assumption holds, one where it doesn't
+
+**Integration tests:**
+- End-to-end: query → sample → cache → re-query → cache hit → better plan
+- Staleness: insert data → cache invalidation → re-sample
+- Timeout: slow sampling → falls back to CBO gracefully
 
 **Files to create:**
-- `presto-main-base/src/main/java/com/facebook/presto/cost/InMemoryJoinEdgeFanoutStatisticsProvider.java`
-
-**Tests to create:**
-- Unit tests for `JoinEdgeCanonicalizer` — verify same edge in different queries produces same key
-- Unit tests for `JoinStatsRule` with fanout — verify fanout overrides NDV estimate
-- Integration test — run a query, verify fanout is recorded, run again, verify fanout is used
-- Test that different filter values produce different edge keys
-- Test that input size matching threshold works correctly
+- `presto-main-base/.../cost/InMemoryJoinEdgeStatisticsProvider.java`
+- `presto-main-base/.../cost/TestJoinFanoutSampler.java`
+- `presto-main-base/.../cost/TestFilterSelectivitySampler.java`
+- `presto-main-base/.../cost/TestJoinStatsRuleWithFanout.java`
+- `presto-main-base/.../sql/planner/TestJoinFanoutKeyCanonicalizer.java`
 
 ---
 
-### Phase 7 (Future): Sampling on Cache Miss
+### Phase 7 (Future): Enhancements
 
-This phase adds Axiom-style sampling for cold start. It's the most architecturally
-novel piece and can be deferred — Phases 1-6 already provide the core benefit for
-recurring queries.
-
-**Approach: Internal query dispatch**
-
-On cache miss for a join edge:
-1. Construct a sampling query:
-   ```sql
-   SELECT hash_combine(hash(key1), hash(key2)) AS h, COUNT(*) AS cnt
-   FROM tableA
-   WHERE (hash(key1) % 10000) < sampleFraction
-     AND <original filters>
-   GROUP BY 1
-   ```
-   (And similarly for tableB)
-2. Execute as an internal query (similar to ANALYZE mechanism)
-3. Build frequency maps, compute fanout
-4. Store in HBO cache
-
-**Challenges to address:**
-- Planning latency: Use async execution with timeout, fall back to CBO if too slow
-- Resource isolation: Internal sample queries should not compete with user queries
-  (use a separate resource group or priority)
-- Query complexity: For simple base table joins this is straightforward; for joins
-  against subqueries/CTEs, fall back to execution-based recording (Phase 3)
-
-**Existing infrastructure to reuse:**
-- `SampledSplitSource` for split-level sampling
-- `StatisticsAggregationPlanner` for building aggregation queries
-- The ANALYZE execution path as a reference for internal query dispatch
+1. **Internal query dispatch** — for connectors without native sampling support
+2. **Proactive cache warming** — background job samples popular join edges
+3. **Post-execution recording** — after query completes, record actual fanout to
+   validate/update sampled estimates (combines with existing HBO tracking)
+4. **Correlation detection** — if post-execution fanout consistently differs from
+   sampled fanout * selectivity, flag the independence assumption violation
+5. **Multi-key frequency maps** — cache raw frequency maps (not just scalar fanout)
+   to support more sophisticated estimation in the future
 
 ---
 
@@ -280,40 +326,46 @@ Phase 1 (SPI types)
     │
     ├──► Phase 2 (Canonicalization)
     │        │
-    │        ├──► Phase 3 (Recording after execution)
+    │        ├──► Phase 3 (Sampling execution)
     │        │        │
-    │        │        └──► Phase 4 (Cache infrastructure)
-    │        │                 │
-    │        │                 └──► Phase 5 (JoinStatsRule integration)
-    │        │                          │
-    │        │                          └──► Phase 6 (Testing)
-    │        │                                   │
-    │        │                                   └──► Phase 7 (Sampling - future)
+    │        │        ├──► Phase 4 (Cache infrastructure)
+    │        │        │        │
+    │        │        │        └──► Phase 5 (JoinStatsRule integration)
+    │        │        │                 │
+    │        │        │                 └──► Phase 6 (Testing)
+    │        │        │
+    │        │        └──► Phase 6 (Testing - sampler unit tests)
     │        │
-    │        └──► (Phase 2 also needed by Phase 5 for cache lookup key)
+    │        └──► Phase 5 (for cache lookup keys)
 ```
 
-Phases 1-2 are pure infrastructure with no behavioral change.
-Phase 3 starts recording data (write path only, no read path yet).
-Phase 4-5 close the loop (read path — optimizer uses the data).
-Phase 6 validates everything.
-Phase 7 is an enhancement for cold start.
+Phase 1-2: Pure infrastructure, no behavioral change.
+Phase 3: Core new capability — sampling.
+Phase 4-5: Close the loop — optimizer uses sampled data.
+Phase 6: Validate everything.
 
-## Risk Assessment
+## Known Limitation: Independence Assumption
 
-| Risk | Mitigation |
-|------|-----------|
-| Fanout from prior run doesn't match current data | Input size matching threshold (±20%); fall back to CBO when no match |
-| Cache pollution from outlier queries | Store last N runs, use median; discard entries with very small input sizes |
-| Planning latency from cache lookups | Bulk pre-load during registerPlan() with timeout, same as existing HBO |
-| Join edge key collisions | SHA256 hash of canonical form; extremely unlikely |
-| Filter changes invalidate cached fanout | By design — different filters produce different keys. This is correct behavior. |
-| Complex subquery inputs (not base tables) | Only record fanout for join edges whose inputs resolve to base table scans. Subquery-backed joins fall back to CBO. |
+The composition `effectiveFanout = sampledFanout * filterSelectivity` assumes
+that filtered rows have the same join key distribution as unfiltered rows.
 
-## Session Properties Summary
+This breaks when:
+- `WHERE region = 'US'` selects customers who happen to place 10x more orders
+- `WHERE status = 'cancelled'` selects orders with NULL customer keys
+
+Mitigation (Phase 7): post-execution validation. After the query runs, compare
+actual fanout against the estimate. If they consistently diverge, either:
+- Fall back to CBO for that join edge
+- Cache a correction factor keyed by (table, filter, joinKeys)
+
+## Session Properties
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `hbo_use_join_edge_fanout` | boolean | false | Enable per-join-edge fanout statistics |
-| `hbo_join_edge_fanout_matching_threshold` | double | 0.2 | Input size similarity threshold for matching |
-| `hbo_join_edge_fanout_max_history` | int | 10 | Max historical runs to keep per edge |
+| `hbo_join_fanout_sampling_enabled` | boolean | false | Enable fanout sampling |
+| `hbo_join_fanout_sample_size` | int | 10000 | Target rows per sample |
+| `hbo_join_fanout_sampling_timeout_ms` | int | 500 | Max time for sync sampling |
+| `hbo_join_fanout_async_sampling` | boolean | true | Sample async on miss (vs sync with timeout) |
+| `hbo_filter_selectivity_sampling_enabled` | boolean | false | Enable selectivity sampling |
+| `hbo_filter_selectivity_sample_ratio` | double | 0.01 | Fraction of table to sample for selectivity |
+| `hbo_join_fanout_staleness_threshold` | double | 0.5 | Re-sample if table size changed by >50% |
