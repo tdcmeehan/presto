@@ -18,6 +18,8 @@ import com.facebook.airlift.json.Codec;
 import com.facebook.airlift.json.JsonCodec;
 import com.facebook.airlift.units.Duration;
 import com.facebook.presto.Session;
+import com.facebook.presto.common.predicate.TupleDomain;
+import com.facebook.presto.execution.DynamicFilterResult;
 import com.facebook.presto.execution.TaskId;
 import com.facebook.presto.execution.TaskInfo;
 import com.facebook.presto.execution.TaskManager;
@@ -26,10 +28,14 @@ import com.facebook.presto.execution.TaskStatus;
 import com.facebook.presto.execution.buffer.OutputBufferInfo;
 import com.facebook.presto.execution.buffer.OutputBuffers.OutputBufferId;
 import com.facebook.presto.metadata.SessionPropertyManager;
+import com.facebook.presto.server.remotetask.DynamicFilterResponse;
 import com.facebook.presto.sql.planner.PlanFragment;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.SettableFuture;
 import jakarta.annotation.security.RolesAllowed;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -51,6 +57,7 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -309,6 +316,69 @@ public class TaskResource
         requireNonNull(remoteSourceTaskId, "remoteSourceTaskId is null");
 
         taskManager.removeRemoteSource(taskId, remoteSourceTaskId);
+    }
+
+    @GET
+    @Path("{taskId}/dynamicFilters")
+    @Produces(APPLICATION_JSON)
+    public void getDynamicFilters(
+            @PathParam("taskId") TaskId taskId,
+            @QueryParam("since") @DefaultValue("0") long sinceVersion,
+            @HeaderParam(PRESTO_MAX_WAIT) Duration maxWait,
+            @Suspended AsyncResponse asyncResponse)
+    {
+        requireNonNull(taskId, "taskId is null");
+
+        if (maxWait == null) {
+            Map<String, TupleDomain<String>> filters = taskManager.getDynamicFiltersSince(taskId, sinceVersion);
+            asyncResponse.resume(DynamicFilterResponse.incomplete(filters, sinceVersion));
+            return;
+        }
+
+        Duration waitTime = randomizeWaitTime(maxWait);
+        ListenableFuture<DynamicFilterResult> futureResult = addTimeout(
+                taskManager.getDynamicFiltersWait(taskId, sinceVersion),
+                () -> new DynamicFilterResult(taskManager.getDynamicFiltersSince(taskId, sinceVersion), sinceVersion, taskManager.isDynamicFilterOperatorCompleted(taskId), taskManager.getRegisteredDynamicFilterIds(taskId)),
+                waitTime,
+                timeoutExecutor);
+
+        // SettableFuture + listener to gracefully handle CancellationException (Futures.catching does not)
+        SettableFuture<DynamicFilterResponse> futureResponse = SettableFuture.create();
+        ListenableFuture<DynamicFilterResponse> transformedFuture = Futures.transform(
+                futureResult,
+                result -> result.isOperatorCompleted()
+                        ? DynamicFilterResponse.completed(result.getFilters(), result.getVersion(), result.getCompletedFilterIds())
+                        : DynamicFilterResponse.incomplete(result.getFilters(), result.getVersion()),
+                directExecutor());
+        Futures.addCallback(transformedFuture, new FutureCallback<DynamicFilterResponse>()
+        {
+            @Override
+            public void onSuccess(DynamicFilterResponse result)
+            {
+                futureResponse.set(result);
+            }
+
+            @Override
+            public void onFailure(Throwable t)
+            {
+                futureResponse.set(DynamicFilterResponse.incomplete(ImmutableMap.of(), sinceVersion));
+            }
+        }, directExecutor());
+
+        Duration timeout = new Duration(waitTime.toMillis() + ADDITIONAL_WAIT_TIME.toMillis(), MILLISECONDS);
+        bindAsyncResponse(asyncResponse, futureResponse, responseExecutor)
+                .withTimeout(timeout);
+    }
+
+    @DELETE
+    @Path("{taskId}/dynamicFilters")
+    public Response deleteDynamicFilters(
+            @PathParam("taskId") TaskId taskId,
+            @QueryParam("through") @DefaultValue("0") long throughVersion)
+    {
+        requireNonNull(taskId, "taskId is null");
+        taskManager.removeDynamicFiltersThrough(taskId, throughVersion);
+        return Response.noContent().build();
     }
 
     private static boolean shouldSummarize(UriInfo uriInfo)

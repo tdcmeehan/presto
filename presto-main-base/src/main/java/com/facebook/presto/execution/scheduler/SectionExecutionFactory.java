@@ -34,11 +34,14 @@ import com.facebook.presto.operator.ForScheduler;
 import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.NodePoolType;
+import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.spi.connector.ConnectorPartitionHandle;
+import com.facebook.presto.spi.plan.JoinNode;
 import com.facebook.presto.spi.plan.PartitioningHandle;
 import com.facebook.presto.spi.plan.PlanFragmentId;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
+import com.facebook.presto.spi.plan.SemiJoinNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.split.SplitSource;
 import com.facebook.presto.sql.planner.NodePartitionMap;
@@ -69,6 +72,7 @@ import java.util.function.Supplier;
 import static com.facebook.presto.SystemSessionProperties.getConcurrentLifespansPerNode;
 import static com.facebook.presto.SystemSessionProperties.getMaxTasksPerStage;
 import static com.facebook.presto.SystemSessionProperties.getWriterMinSize;
+import static com.facebook.presto.SystemSessionProperties.isDistributedDynamicFilterEnabled;
 import static com.facebook.presto.SystemSessionProperties.isOptimizedScaleWriterProducerBuffer;
 import static com.facebook.presto.execution.SqlStageExecution.createSqlStageExecution;
 import static com.facebook.presto.execution.scheduler.SourcePartitionedScheduler.newSourcePartitionedSchedulerAsStageScheduler;
@@ -107,6 +111,7 @@ public class SectionExecutionFactory
     private final NodeScheduler nodeScheduler;
     private final int splitBatchSize;
     private final boolean isEnableWorkerIsolation;
+    private final DynamicFilterService dynamicFilterService;
 
     @Inject
     public SectionExecutionFactory(
@@ -118,7 +123,8 @@ public class SectionExecutionFactory
             FailureDetector failureDetector,
             SplitSchedulerStats schedulerStats,
             NodeScheduler nodeScheduler,
-            QueryManagerConfig queryManagerConfig)
+            QueryManagerConfig queryManagerConfig,
+            DynamicFilterService dynamicFilterService)
     {
         this(
                 metadata,
@@ -130,7 +136,8 @@ public class SectionExecutionFactory
                 schedulerStats,
                 nodeScheduler,
                 requireNonNull(queryManagerConfig, "queryManagerConfig is null").getScheduleSplitBatchSize(),
-                queryManagerConfig.isEnableWorkerIsolation());
+                queryManagerConfig.isEnableWorkerIsolation(),
+                dynamicFilterService);
     }
 
     public SectionExecutionFactory(
@@ -143,7 +150,8 @@ public class SectionExecutionFactory
             SplitSchedulerStats schedulerStats,
             NodeScheduler nodeScheduler,
             int splitBatchSize,
-            boolean isEnableWorkerIsolation)
+            boolean isEnableWorkerIsolation,
+            DynamicFilterService dynamicFilterService)
     {
         this.metadata = requireNonNull(metadata, "metadata is null");
         this.nodePartitioningManager = requireNonNull(nodePartitioningManager, "nodePartitioningManager is null");
@@ -155,6 +163,7 @@ public class SectionExecutionFactory
         this.nodeScheduler = requireNonNull(nodeScheduler, "nodeScheduler is null");
         this.splitBatchSize = splitBatchSize;
         this.isEnableWorkerIsolation = isEnableWorkerIsolation;
+        this.dynamicFilterService = requireNonNull(dynamicFilterService, "dynamicFilterService is null");
     }
 
     /**
@@ -172,6 +181,9 @@ public class SectionExecutionFactory
             int attemptId,
             CTEMaterializationTracker cteMaterializationTracker)
     {
+        // JoinNode and probe-side TableScan may be in different fragments
+        registerDynamicFiltersForAllFragments(splitSourceFactory, session, section.getPlan());
+
         // Only fetch a distribution once per section to ensure all stages see the same machine assignments
         Map<PartitioningHandle, NodePartitionMap> partitioningCache = new HashMap<>();
         TableWriteInfo tableWriteInfo = createTableWriteInfo(section.getPlan(), metadata, session);
@@ -304,7 +316,15 @@ public class SectionExecutionFactory
             SplitPlacementPolicy placementPolicy = new DynamicSplitPlacementPolicy(nodeSelector, stageExecution::getAllTasks);
 
             checkArgument(!plan.getFragment().getStageExecutionDescriptor().isStageGroupedExecution());
-            return newSourcePartitionedSchedulerAsStageScheduler(stageExecution, planNodeId, splitSource, placementPolicy, splitBatchSize, cteMaterializationTracker);
+            boolean hasDpp = isDistributedDynamicFilterEnabled(session)
+                    && !dynamicFilterService.getAllFiltersForQuery(session.getQueryId()).isEmpty();
+
+            // Broadcast joins: all tasks receive identical build data, so one partition suffices
+            if (hasDpp) {
+                setExpectedPartitionsForFilters(session, plan.getFragment().getRoot(), 1);
+            }
+
+            return newSourcePartitionedSchedulerAsStageScheduler(stageExecution, planNodeId, splitSource, placementPolicy, splitBatchSize, cteMaterializationTracker, hasDpp);
         }
         else if (partitioningHandle.equals(SCALED_WRITER_DISTRIBUTION)) {
             Supplier<Collection<TaskStatus>> sourceTasksProvider = () -> childStageExecutions.stream()
@@ -350,7 +370,11 @@ public class SectionExecutionFactory
                         cteMaterializationTracker);
             }
             else if (!splitSources.isEmpty()) {
-                // contains local source
+                // contains local source (co-located/bucketed joins)
+                // TODO: setExpectedPartitionsForFilters() is not called here, so DPP filters
+                // would timeout rather than complete. Not an issue today because Iceberg doesn't
+                // support bucketed execution (no TablePartitioning), but must be fixed if DPP
+                // is extended to connectors like Hive that do.
                 List<PlanNodeId> schedulingOrder = plan.getFragment().getTableScanSchedulingOrder();
                 ConnectorId connectorId = partitioningHandle.getConnectorId().orElseThrow(IllegalStateException::new);
                 List<ConnectorPartitionHandle> connectorPartitionHandles;
@@ -427,6 +451,11 @@ public class SectionExecutionFactory
                 List<InternalNode> partitionToNode = nodePartitionMap.getPartitionToNode();
                 // todo this should asynchronously wait a standard timeout period before failing
                 checkCondition(!partitionToNode.isEmpty(), NO_NODES_AVAILABLE, "No worker nodes available");
+
+                if (isDistributedDynamicFilterEnabled(session)) {
+                    setExpectedPartitionsForFilters(session, plan.getFragment().getRoot(), partitionToNode.size());
+                }
+
                 return new FixedCountScheduler(stageExecution, partitionToNode);
             }
         }
@@ -467,6 +496,56 @@ public class SectionExecutionFactory
             // todo this should asynchronously wait a standard timeout period before failing
             checkCondition(!partitionToNode.isEmpty(), NO_NODES_AVAILABLE, "No worker nodes available");
             return Optional.of(nodePartitionMap.getBucketToPartition());
+        }
+    }
+
+    private static void registerDynamicFiltersForAllFragments(
+            SplitSourceFactory splitSourceFactory,
+            Session session,
+            StreamingSubPlan plan)
+    {
+        splitSourceFactory.registerDynamicFilters(plan.getFragment(), session);
+        for (StreamingSubPlan child : plan.getChildren()) {
+            registerDynamicFiltersForAllFragments(splitSourceFactory, session, child);
+        }
+    }
+
+    // Skips joins whose build side is a RemoteSourceNode (handled when that child stage is scheduled)
+    private void setExpectedPartitionsForFilters(Session session, PlanNode root, int taskCount)
+    {
+        QueryId queryId = session.getQueryId();
+        List<JoinNode> joinNodes = PlanNodeSearcher.searchFrom(root)
+                .where(node -> node instanceof JoinNode)
+                .findAll().stream()
+                .map(node -> (JoinNode) node)
+                .collect(toImmutableList());
+
+        for (JoinNode joinNode : joinNodes) {
+            if (joinNode.getRight() instanceof RemoteSourceNode) {
+                continue;
+            }
+
+            for (String filterId : joinNode.getDynamicFilters().keySet()) {
+                dynamicFilterService.getFilter(queryId, filterId)
+                        .ifPresent(filter -> filter.setExpectedPartitions(taskCount));
+            }
+        }
+
+        List<SemiJoinNode> semiJoinNodes = PlanNodeSearcher.searchFrom(root)
+                .where(node -> node instanceof SemiJoinNode)
+                .findAll().stream()
+                .map(node -> (SemiJoinNode) node)
+                .collect(toImmutableList());
+
+        for (SemiJoinNode semiJoinNode : semiJoinNodes) {
+            if (semiJoinNode.getFilteringSource() instanceof RemoteSourceNode) {
+                continue;
+            }
+
+            for (String filterId : semiJoinNode.getDynamicFilters().keySet()) {
+                dynamicFilterService.getFilter(queryId, filterId)
+                        .ifPresent(filter -> filter.setExpectedPartitions(taskCount));
+            }
         }
     }
 

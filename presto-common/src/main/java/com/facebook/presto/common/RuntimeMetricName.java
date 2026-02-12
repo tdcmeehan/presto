@@ -87,4 +87,17 @@ public class RuntimeMetricName
     public static final String DIRECTORY_LISTING_CACHE_MISS = "directoryListingCacheMiss";
     public static final String DIRECTORY_LISTING_TIME_NANOS = "directoryListingTimeNanos";
     public static final String FILES_READ_COUNT = "filesReadCount";
+
+    // Dynamic filter metrics
+    public static final String DYNAMIC_FILTER_SPLITS_PROCESSED = "dynamicFilterSplitsProcessed";
+    public static final String DYNAMIC_FILTER_WAIT_TIME_NANOS = "dynamicFilterWaitTimeNanos";
+    public static final String DYNAMIC_FILTER_COLLECTION_TIME_NANOS = "dynamicFilterCollectionTimeNanos";
+    public static final String DYNAMIC_FILTER_PARTITIONS_RECEIVED = "dynamicFilterPartitionsReceived";
+    public static final String DYNAMIC_FILTER_PUSHED_INTO_SCAN = "dynamicFilterPushedIntoScan";
+    public static final String DYNAMIC_FILTER_SPLITS_BEFORE_FILTER = "dynamicFilterSplitsBeforeFilter";
+    public static final String DYNAMIC_FILTER_CONSTRAINT_COLUMNS = "dynamicFilterConstraintColumns";
+    // Dynamic filter source operator metrics
+    public static final String DYNAMIC_FILTER_SOURCE_DISTINCT_VALUES = "dynamicFilterSourceDistinctValues";
+    public static final String DYNAMIC_FILTER_SOURCE_FALLBACK_TO_MIN_MAX = "dynamicFilterSourceFallbackToMinMax";
+    public static final String DYNAMIC_FILTER_SOURCE_COLLECTION_TIME_NANOS = "dynamicFilterSourceCollectionTimeNanos";
 }

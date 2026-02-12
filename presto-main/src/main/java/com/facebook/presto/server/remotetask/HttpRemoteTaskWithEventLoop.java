@@ -48,6 +48,8 @@ import com.facebook.presto.execution.TaskStatus;
 import com.facebook.presto.execution.buffer.BufferInfo;
 import com.facebook.presto.execution.buffer.OutputBuffers;
 import com.facebook.presto.execution.buffer.PageBufferInfo;
+import com.facebook.presto.execution.scheduler.DynamicFilterService;
+import com.facebook.presto.execution.scheduler.DynamicFilterStats;
 import com.facebook.presto.execution.scheduler.TableWriteInfo;
 import com.facebook.presto.metadata.HandleResolver;
 import com.facebook.presto.metadata.MetadataManager;
@@ -105,6 +107,7 @@ import static com.facebook.airlift.http.client.Request.Builder.preparePost;
 import static com.facebook.airlift.http.client.StaticBodyGenerator.createStaticBodyGenerator;
 import static com.facebook.airlift.http.client.StatusResponseHandler.createStatusResponseHandler;
 import static com.facebook.presto.SystemSessionProperties.getMaxUnacknowledgedSplitsPerTask;
+import static com.facebook.presto.SystemSessionProperties.isDistributedDynamicFilterEnabled;
 import static com.facebook.presto.execution.TaskInfo.createInitialTask;
 import static com.facebook.presto.execution.TaskState.ABORTED;
 import static com.facebook.presto.execution.TaskState.FAILED;
@@ -177,6 +180,7 @@ public final class HttpRemoteTaskWithEventLoop
     private final RemoteTaskStats stats;
     private final TaskInfoFetcherWithEventLoop taskInfoFetcher;
     private final ContinuousTaskStatusFetcherWithEventLoop taskStatusFetcher;
+    private final DynamicFilterFetcher dynamicFilterFetcher;
 
     private final LongArrayList taskUpdateTimeline = new LongArrayList();
     private Future<?> currentRequest;
@@ -234,6 +238,7 @@ public final class HttpRemoteTaskWithEventLoop
 
     private final SafeEventLoopGroup.SafeEventLoop taskEventLoop;
     private final String loggingPrefix;
+    private final boolean shouldFetchDynamicFilters;
 
     private long startTime;
     private long startedTime;
@@ -275,7 +280,10 @@ public final class HttpRemoteTaskWithEventLoop
             boolean taskUpdateSizeTrackingEnabled,
             HandleResolver handleResolver,
             SchedulerStatsTracker schedulerStatsTracker,
-            SafeEventLoopGroup.SafeEventLoop taskEventLoop)
+            SafeEventLoopGroup.SafeEventLoop taskEventLoop,
+            DynamicFilterService dynamicFilterService,
+            JsonCodec<DynamicFilterResponse> dynamicFilterResponseCodec,
+            DynamicFilterStats dynamicFilterStats)
     {
         HttpRemoteTaskWithEventLoop task = new HttpRemoteTaskWithEventLoop(session,
                 taskId,
@@ -313,7 +321,10 @@ public final class HttpRemoteTaskWithEventLoop
                 taskUpdateSizeTrackingEnabled,
                 handleResolver,
                 schedulerStatsTracker,
-                taskEventLoop);
+                taskEventLoop,
+                dynamicFilterService,
+                dynamicFilterResponseCodec,
+                dynamicFilterStats);
         task.initialize();
         return task;
     }
@@ -354,7 +365,10 @@ public final class HttpRemoteTaskWithEventLoop
             boolean taskUpdateSizeTrackingEnabled,
             HandleResolver handleResolver,
             SchedulerStatsTracker schedulerStatsTracker,
-            SafeEventLoopGroup.SafeEventLoop taskEventLoop)
+            SafeEventLoopGroup.SafeEventLoop taskEventLoop,
+            DynamicFilterService dynamicFilterService,
+            JsonCodec<DynamicFilterResponse> dynamicFilterResponseCodec,
+            DynamicFilterStats dynamicFilterStats)
     {
         requireNonNull(session, "session is null");
         requireNonNull(taskId, "taskId is null");
@@ -380,6 +394,8 @@ public final class HttpRemoteTaskWithEventLoop
         requireNonNull(taskUpdateRequestSize, "taskUpdateRequestSize cannot be null");
         requireNonNull(schedulerStatsTracker, "schedulerStatsTracker is null");
         requireNonNull(taskEventLoop, "taskEventLoop is null");
+        requireNonNull(dynamicFilterService, "dynamicFilterService is null");
+        requireNonNull(dynamicFilterResponseCodec, "dynamicFilterResponseCodec is null");
 
         this.taskEventLoop = taskEventLoop;
         this.taskId = taskId;
@@ -476,6 +492,19 @@ public final class HttpRemoteTaskWithEventLoop
                 queryManager,
                 handleResolver,
                 thriftProtocol);
+        this.dynamicFilterFetcher = new DynamicFilterFetcher(
+                taskId,
+                location,
+                httpClient,
+                taskEventLoop,
+                maxErrorDuration,
+                taskStatusRefreshMaxWait,
+                stats,
+                dynamicFilterResponseCodec,
+                dynamicFilterService,
+                dynamicFilterStats);
+        this.shouldFetchDynamicFilters = isDistributedDynamicFilterEnabled(session) &&
+                !dynamicFilterService.getAllFiltersForQuery(session.getQueryId()).isEmpty();
         this.loggingPrefix = format("Query: %s, Task: %s", session.getQueryId(), taskId);
     }
 
@@ -486,6 +515,7 @@ public final class HttpRemoteTaskWithEventLoop
             verify(taskEventLoop.inEventLoop());
 
             TaskState state = newStatus.getState();
+
             if (state.isDone()) {
                 cleanUpTask();
             }
@@ -494,6 +524,10 @@ public final class HttpRemoteTaskWithEventLoop
                 updateSplitQueueSpace();
             }
         });
+
+        if (shouldFetchDynamicFilters) {
+            dynamicFilterFetcher.start();
+        }
 
         updateTaskStats();
         safeExecuteOnEventLoop(this::updateSplitQueueSpace, "updateSplitQueueSpace");
@@ -1149,6 +1183,7 @@ public final class HttpRemoteTaskWithEventLoop
             }
 
             taskStatusFetcher.stop();
+            dynamicFilterFetcher.stop();
 
             // The remote task is likely to get a delete from the PageBufferClient first.
             // We send an additional delete anyway to get the final TaskInfo
@@ -1251,6 +1286,8 @@ public final class HttpRemoteTaskWithEventLoop
         // the entire duration of abort retries. If the task is failed, it is not that important to actually
         // record the final statistics and the final information about a failed task.
         taskInfoFetcher.updateTaskInfo(getTaskInfo().withTaskStatus(failedTaskStatus));
+
+        dynamicFilterFetcher.abort();
 
         // Initiate abort request
         abort(failedTaskStatus);
