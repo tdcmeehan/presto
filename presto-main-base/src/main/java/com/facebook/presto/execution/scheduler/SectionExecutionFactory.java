@@ -371,10 +371,6 @@ public class SectionExecutionFactory
             }
             else if (!splitSources.isEmpty()) {
                 // contains local source (co-located/bucketed joins)
-                // TODO: setExpectedPartitionsForFilters() is not called here, so DPP filters
-                // would timeout rather than complete. Not an issue today because Iceberg doesn't
-                // support bucketed execution (no TablePartitioning), but must be fixed if DPP
-                // is extended to connectors like Hive that do.
                 List<PlanNodeId> schedulingOrder = plan.getFragment().getTableScanSchedulingOrder();
                 ConnectorId connectorId = partitioningHandle.getConnectorId().orElseThrow(IllegalStateException::new);
                 List<ConnectorPartitionHandle> connectorPartitionHandles;
@@ -418,6 +414,10 @@ public class SectionExecutionFactory
                     }
                     stageNodeList = nodePartitionMap.getPartitionToNode();
                     bucketNodeMap = nodePartitionMap.asBucketNodeMap();
+                }
+
+                if (isDistributedDynamicFilterEnabled(session)) {
+                    setExpectedPartitionsForFilters(session, plan.getFragment().getRoot(), stageNodeList.size());
                 }
 
                 FixedSourcePartitionedScheduler fixedSourcePartitionedScheduler = new FixedSourcePartitionedScheduler(
