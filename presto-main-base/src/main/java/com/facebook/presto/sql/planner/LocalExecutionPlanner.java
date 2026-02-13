@@ -253,6 +253,7 @@ import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
@@ -263,6 +264,7 @@ import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -2657,20 +2659,52 @@ public class LocalExecutionPlanner
                     .collect(ImmutableSet.toImmutableSet());
             context.getTaskContext().registerDynamicFilterIds(filterIds);
 
-            int partitionCount = context.getDriverInstanceCount().orElse(1);
-            CoordinatorDynamicFilterAggregator aggregator = new CoordinatorDynamicFilterAggregator(
-                    coordinatorConsumer.get(), partitionCount);
-            Consumer<TupleDomain<String>> consumer = aggregator::addPartition;
+            // Accumulate per-operator results and flush the union to the coordinator
+            // exactly once, after all operators have finished and the factory has closed.
+            // Multiple operators can exist per task due to task.concurrency (non-grouped)
+            // or multiple lifespans (grouped execution).
+            Consumer<TupleDomain<String>> downstream = coordinatorConsumer.get();
+            List<TupleDomain<String>> partitions = Collections.synchronizedList(new ArrayList<>());
+            AtomicInteger createdCount = new AtomicInteger(0);
+            AtomicInteger finishedCount = new AtomicInteger(0);
+            AtomicBoolean factoryClosed = new AtomicBoolean(false);
+            AtomicBoolean flushed = new AtomicBoolean(false);
+
+            Runnable tryFlush = () -> {
+                if (factoryClosed.get()
+                        && finishedCount.get() >= createdCount.get()
+                        && createdCount.get() > 0
+                        && flushed.compareAndSet(false, true)) {
+                    downstream.accept(partitions.isEmpty()
+                            ? TupleDomain.none()
+                            : TupleDomain.columnWiseUnion(new ArrayList<>(partitions)));
+                }
+            };
+
+            Consumer<TupleDomain<String>> perOperator = td -> {
+                partitions.add(td);
+                finishedCount.incrementAndGet();
+                tryFlush.run();
+            };
+
+            Runnable onClose = () -> {
+                factoryClosed.set(true);
+                tryFlush.run();
+            };
+
+            Runnable onCreateOperator = createdCount::incrementAndGet;
 
             return Optional.of(new DynamicFilterSourceOperator.DynamicFilterSourceOperatorFactory(
                     context.getNextOperatorId(),
                     node.getId(),
-                    consumer,
+                    perOperator,
                     filterBuildChannels,
                     getDynamicFilteringMaxPerDriverRowCount(context.getSession()),
                     getDynamicFilteringMaxPerDriverSize(context.getSession()),
                     getDynamicFilteringRangeRowLimitPerDriver(context.getSession()),
-                    useNewNanDefinition));
+                    useNewNanDefinition,
+                    onClose,
+                    onCreateOperator));
         }
 
         private Optional<LocalDynamicFilter> createDynamicFilter(PhysicalOperation buildSource, AbstractJoinNode node, LocalExecutionPlanContext context, int partitionCount)

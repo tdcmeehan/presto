@@ -252,7 +252,7 @@ public class TestThriftServerInfoIntegration
                 @Override
                 public Map<String, TupleDomain<String>> getDynamicFiltersSince(TaskId taskId, long sinceVersion)
                 {
-                    return ImmutableMap.of();
+                    throw new UnsupportedOperationException();
                 }
 
                 @Override

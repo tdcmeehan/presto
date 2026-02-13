@@ -32,7 +32,6 @@ import com.facebook.presto.server.remotetask.DynamicFilterResponse;
 import com.facebook.presto.sql.planner.PlanFragment;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
@@ -74,6 +73,8 @@ import static com.facebook.presto.client.PrestoHeaders.PRESTO_MAX_WAIT;
 import static com.facebook.presto.server.security.RoleType.INTERNAL;
 import static com.facebook.presto.util.TaskUtils.randomizeWaitTime;
 import static com.google.common.collect.Iterables.transform;
+import static com.facebook.airlift.concurrent.MoreFutures.addExceptionCallback;
+import static com.facebook.airlift.concurrent.MoreFutures.addSuccessCallback;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static jakarta.ws.rs.core.MediaType.APPLICATION_JSON;
 import static java.util.Objects.requireNonNull;
@@ -350,20 +351,9 @@ public class TaskResource
                         ? DynamicFilterResponse.completed(result.getFilters(), result.getVersion(), result.getCompletedFilterIds())
                         : DynamicFilterResponse.incomplete(result.getFilters(), result.getVersion()),
                 directExecutor());
-        Futures.addCallback(transformedFuture, new FutureCallback<DynamicFilterResponse>()
-        {
-            @Override
-            public void onSuccess(DynamicFilterResponse result)
-            {
-                futureResponse.set(result);
-            }
-
-            @Override
-            public void onFailure(Throwable t)
-            {
-                futureResponse.set(DynamicFilterResponse.incomplete(ImmutableMap.of(), sinceVersion));
-            }
-        }, directExecutor());
+        addSuccessCallback(transformedFuture, futureResponse::set, directExecutor());
+        addExceptionCallback(transformedFuture, exception -> futureResponse.set(
+                DynamicFilterResponse.incomplete(ImmutableMap.of(), sinceVersion)), directExecutor());
 
         Duration timeout = new Duration(waitTime.toMillis() + ADDITIONAL_WAIT_TIME.toMillis(), MILLISECONDS);
         bindAsyncResponse(asyncResponse, futureResponse, responseExecutor)

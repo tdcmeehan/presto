@@ -503,8 +503,7 @@ public final class HttpRemoteTaskWithEventLoop
                 dynamicFilterResponseCodec,
                 dynamicFilterService,
                 dynamicFilterStats);
-        this.shouldFetchDynamicFilters = isDistributedDynamicFilterEnabled(session) &&
-                !dynamicFilterService.getAllFiltersForQuery(session.getQueryId()).isEmpty();
+        this.shouldFetchDynamicFilters = isDistributedDynamicFilterEnabled(session);
         this.loggingPrefix = format("Query: %s, Task: %s", session.getQueryId(), taskId);
     }
 

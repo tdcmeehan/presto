@@ -98,6 +98,8 @@ public class DynamicFilterSourceOperator
         private final DataSize maxFilterSize;
         private final int minMaxCollectionLimit;
         private final boolean useNewNanDefinition;
+        private final Runnable onClose;
+        private final Runnable onCreateOperator;
 
         private boolean closed;
 
@@ -110,6 +112,23 @@ public class DynamicFilterSourceOperator
                 DataSize maxFilterSize,
                 int minMaxCollectionLimit,
                 boolean useNewNanDefinition)
+        {
+            this(operatorId, planNodeId, dynamicPredicateConsumer, channels,
+                    maxFilterPositionsCount, maxFilterSize, minMaxCollectionLimit,
+                    useNewNanDefinition, () -> {}, () -> {});
+        }
+
+        public DynamicFilterSourceOperatorFactory(
+                int operatorId,
+                PlanNodeId planNodeId,
+                Consumer<TupleDomain<String>> dynamicPredicateConsumer,
+                List<Channel> channels,
+                int maxFilterPositionsCount,
+                DataSize maxFilterSize,
+                int minMaxCollectionLimit,
+                boolean useNewNanDefinition,
+                Runnable onClose,
+                Runnable onCreateOperator)
         {
             this.operatorId = operatorId;
             this.planNodeId = requireNonNull(planNodeId, "planNodeId is null");
@@ -125,12 +144,15 @@ public class DynamicFilterSourceOperator
             this.maxFilterSize = maxFilterSize;
             this.minMaxCollectionLimit = minMaxCollectionLimit;
             this.useNewNanDefinition = useNewNanDefinition;
+            this.onClose = requireNonNull(onClose, "onClose is null");
+            this.onCreateOperator = requireNonNull(onCreateOperator, "onCreateOperator is null");
         }
 
         @Override
         public Operator createOperator(DriverContext driverContext)
         {
             checkState(!closed, "Factory is already closed");
+            onCreateOperator.run();
             return new DynamicFilterSourceOperator(
                     driverContext.addOperatorContext(operatorId, planNodeId, DynamicFilterSourceOperator.class.getSimpleName()),
                     dynamicPredicateConsumer,
@@ -147,6 +169,7 @@ public class DynamicFilterSourceOperator
         {
             checkState(!closed, "Factory is already closed");
             closed = true;
+            onClose.run();
         }
 
         @Override
