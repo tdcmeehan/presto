@@ -26,6 +26,7 @@ import com.facebook.presto.hive.metastore.Database;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.HivePartitionMutator;
 import com.facebook.presto.hive.metastore.InMemoryCachingHiveMetastore;
+import com.facebook.presto.hive.metastore.MetastoreCacheSpecProvider;
 import com.facebook.presto.hive.metastore.MetastoreContext;
 import com.facebook.presto.hive.metastore.MetastoreOperationResult;
 import com.facebook.presto.hive.metastore.PrincipalPrivileges;
@@ -472,7 +473,7 @@ public abstract class AbstractTestHiveFileSystem
             // verify the data
             ConnectorTableLayoutResult tableLayoutResult = metadata.getTableLayoutForConstraint(session, hiveTableHandle, Constraint.alwaysTrue(), Optional.empty());
             HiveTableLayoutHandle layoutHandle = (HiveTableLayoutHandle) tableLayoutResult.getTableLayout().getHandle();
-            assertEquals(layoutHandle.getPartitions().get().size(), 1);
+            assertEquals(layoutHandle.getPartitions().map(PartitionSet::getFullyLoadedPartitions).get().size(), 1);
             ConnectorSplitSource splitSource = splitManager.getSplits(transaction.getTransactionHandle(), session, layoutHandle, SPLIT_SCHEDULING_CONTEXT);
             ConnectorSplit split = getOnlyElement(getAllSplits(splitSource));
 
@@ -508,7 +509,7 @@ public abstract class AbstractTestHiveFileSystem
 
         public TestingHiveMetastore(ExtendedHiveMetastore delegate, ExecutorService executor, MetastoreClientConfig metastoreClientConfig, Path basePath, HdfsEnvironment hdfsEnvironment)
         {
-            super(delegate, executor, NOOP_METASTORE_CACHE_STATS, metastoreClientConfig);
+            super(delegate, executor, NOOP_METASTORE_CACHE_STATS, metastoreClientConfig, new MetastoreCacheSpecProvider(metastoreClientConfig));
             this.basePath = basePath;
             this.hdfsEnvironment = hdfsEnvironment;
         }

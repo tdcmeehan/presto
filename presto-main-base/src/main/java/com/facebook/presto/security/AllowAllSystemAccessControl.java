@@ -191,6 +191,11 @@ public class AllowAllSystemAccessControl
     }
 
     @Override
+    public void checkCanCallProcedure(Identity identity, AccessControlContext context, CatalogSchemaTableName procedure)
+    {
+    }
+
+    @Override
     public void checkCanInsertIntoTable(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
     {
     }
@@ -242,6 +247,16 @@ public class AllowAllSystemAccessControl
 
     @Override
     public void checkCanRevokeTablePrivilege(Identity identity, AccessControlContext context, Privilege privilege, CatalogSchemaTableName table, PrestoPrincipal revokee, boolean grantOptionFor)
+    {
+    }
+
+    @Override
+    public void checkCanCreateBranch(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
+    {
+    }
+
+    @Override
+    public void checkCanCreateTag(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
     {
     }
 

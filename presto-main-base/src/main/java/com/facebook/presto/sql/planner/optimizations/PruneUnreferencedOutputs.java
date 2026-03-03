@@ -47,6 +47,7 @@ import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.plan.TopNNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.UnnestNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -70,7 +71,6 @@ import com.facebook.presto.sql.planner.plan.SimplePlanRewriter;
 import com.facebook.presto.sql.planner.plan.StatisticsWriterNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionProcessorNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.plan.UpdateNode;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
@@ -785,6 +785,7 @@ public class PruneUnreferencedOutputs
                     node.getStatsEquivalentPlanNode(),
                     source,
                     node.getSpecification(),
+                    node.getRankingFunction(),
                     node.getRowNumberVariable(),
                     node.getMaxRowCountPerPartition(),
                     node.isPartial(),

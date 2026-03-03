@@ -272,6 +272,11 @@ class SessionProperties {
   static constexpr const char* kMaxPartitionedOutputBufferSize =
       "native_max_page_partitioning_buffer_size";
 
+  /// If true, the PartitionedOutput operator will flush rows eagerly, without
+  /// waiting until buffers reach certain size. Default is false.
+  static constexpr const char* kPartitionedOutputEagerFlush =
+      "native_partitioned_output_eager_flush";
+
   /// Maximum number of partitions created by a local exchange.
   /// Affects concurrency for pipelines containing LocalPartitionNode.
   static constexpr const char* kMaxLocalExchangePartitionCount =
@@ -368,6 +373,14 @@ class SessionProperties {
   /// output rows.
   static constexpr const char* kMaxOutputBatchRows = "max_output_batch_rows";
 
+  /// Initial output batch size in rows for MergeJoin operator. When non-zero,
+  /// the batch size starts at this value and is dynamically adjusted based on
+  /// the average row size of previous output batches. When zero (default),
+  /// dynamic adjustment is disabled and the batch size is fixed at
+  /// preferredOutputBatchRows.
+  static constexpr const char* kMergeJoinOutputBatchStartSize =
+      "native_merge_join_output_batch_start_size";
+
   /// Enable (reader) row size tracker as a fallback to file level row size
   /// estimates.
   static constexpr const char* kRowSizeTrackingMode = "row_size_tracking_mode";
@@ -377,6 +390,24 @@ class SessionProperties {
   /// velox::core::NestedLoopJoinNode.
   static constexpr const char* kUseVeloxGeospatialJoin =
       "native_use_velox_geospatial_join";
+
+  /// Memory threshold in bytes for triggering string compaction during global
+  /// aggregation. When total string storage exceeds this limit with high unused
+  /// memory ratio, compaction is triggered to reclaim dead strings. Disabled by
+  /// default (0).
+  ///
+  /// NOTE: Currently only applies to approx_most_frequent aggregate with
+  /// StringView type during global aggregation. May extend to other aggregates.
+  static constexpr const char* kAggregationCompactionBytesThreshold =
+      "native_aggregation_compaction_bytes_threshold";
+
+  /// Ratio of unused (evicted) bytes to total bytes that triggers compaction.
+  /// The value is in the range of [0, 1). Default is 0.25.
+  ///
+  /// NOTE: Currently only applies to approx_most_frequent aggregate with
+  /// StringView type during global aggregation. May extend to other aggregates.
+  static constexpr const char* kAggregationCompactionUnusedMemoryRatio =
+      "native_aggregation_compaction_unused_memory_ratio";
 
   inline bool hasVeloxConfig(const std::string& key) {
     auto sessionProperty = sessionProperties_.find(key);

@@ -14,12 +14,13 @@
 #include "presto_cpp/main/PrestoExchangeSource.h"
 
 #include <fmt/core.h>
+#include <folly/Conv.h>
 #include <folly/SocketAddress.h>
 #include <re2/re2.h>
 #include <sstream>
 
-#include "presto_cpp/main/QueryContextManager.h"
 #include "presto_cpp/main/common/Counters.h"
+#include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/testutil/TestValue.h"
 
@@ -103,6 +104,8 @@ PrestoExchangeSource::PrestoExchangeSource(
   VELOX_CHECK_NOT_NULL(driverExecutor_);
   VELOX_CHECK_NOT_NULL(ioEventBase);
   VELOX_CHECK_NOT_NULL(pool_);
+  auto systemConfig = SystemConfig::instance();
+  auto httpClientOptions = systemConfig->httpClientOptions();
   httpClient_ = std::make_shared<http::HttpClient>(
       ioEventBase,
       connPool,
@@ -111,7 +114,9 @@ PrestoExchangeSource::PrestoExchangeSource(
       requestTimeoutMs,
       connectTimeoutMs,
       immediateBufferTransfer_ ? pool_ : nullptr,
-      sslContext_);
+      sslContext_,
+      std::move(httpClientOptions));
+  jwtOptions_ = systemConfig->jwtOptions();
 }
 
 void PrestoExchangeSource::close() {
@@ -185,7 +190,8 @@ void PrestoExchangeSource::doRequest(
   } else {
     method = proxygen::HTTPMethod::GET;
   }
-  auto requestBuilder = http::RequestBuilder().method(method).url(path);
+  auto requestBuilder =
+      http::RequestBuilder().jwtOptions(jwtOptions_).method(method).url(path);
 
   velox::common::testutil::TestValue::adjust(
       "facebook::presto::PrestoExchangeSource::doRequest", this);
@@ -292,10 +298,10 @@ void PrestoExchangeSource::processDataResponse(
         !headers->getIsChunked(),
         "Chunked http transferring encoding is not supported.");
   }
+  const auto contentLengthStr = headers->getHeaders().getSingleOrEmpty(
+      proxygen::HTTP_HEADER_CONTENT_LENGTH);
   const uint64_t contentLength =
-      atol(headers->getHeaders()
-               .getSingleOrEmpty(proxygen::HTTP_HEADER_CONTENT_LENGTH)
-               .c_str());
+      contentLengthStr.empty() ? 0 : folly::to<uint64_t>(contentLengthStr);
   VLOG(1) << "Fetched data for " << basePath_ << "/" << sequence_ << ": "
           << contentLength << " bytes";
 
@@ -326,7 +332,7 @@ void PrestoExchangeSource::processDataResponse(
     // token so we shouldn't update 'sequence_' if it is empty. Otherwise,
     // 'sequence_' gets reset and we can't fetch any data from the source with
     // the rolled back 'sequence_'.
-    ackSequenceOpt = atol(nextTokenStr.c_str());
+    ackSequenceOpt = folly::to<int64_t>(nextTokenStr);
   } else {
     VELOX_CHECK_EQ(
         contentLength, 0, "next token is not set in non-empty data response");
@@ -468,6 +474,7 @@ void PrestoExchangeSource::acknowledgeResults(int64_t ackSequence) {
   auto ackPath = fmt::format("{}/{}/acknowledge", basePath_, ackSequence);
   VLOG(1) << "Sending ack " << ackPath;
   http::RequestBuilder()
+      .jwtOptions(jwtOptions_)
       .method(proxygen::HTTPMethod::GET)
       .url(ackPath)
       .send(httpClient_.get())
@@ -512,6 +519,7 @@ void PrestoExchangeSource::abortResults() {
 
 void PrestoExchangeSource::doAbortResults(int64_t delayMs) {
   http::RequestBuilder()
+      .jwtOptions(jwtOptions_)
       .method(proxygen::HTTPMethod::DELETE)
       .url(basePath_)
       .send(httpClient_.get(), "", delayMs)

@@ -23,6 +23,7 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.WarningCollector;
+import com.facebook.presto.spi.analyzer.ViewDefinitionReferences;
 import com.facebook.presto.spi.security.AccessControl;
 import com.facebook.presto.spi.security.ViewSecurity;
 import com.facebook.presto.sql.analyzer.Analysis;
@@ -53,6 +54,7 @@ import static com.facebook.presto.sql.SqlFormatterUtil.getFormattedSql;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MATERIALIZED_VIEW_ALREADY_EXISTS;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.sql.analyzer.utils.ParameterUtils.parameterExtractor;
+import static com.facebook.presto.util.AnalyzerUtil.checkAccessPermissions;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static java.util.Objects.requireNonNull;
@@ -91,8 +93,9 @@ public class CreateMaterializedViewTask
         accessControl.checkCanCreateView(session.getRequiredTransactionId(), session.getIdentity(), session.getAccessControlContext(), viewName);
 
         Map<NodeRef<Parameter>, Expression> parameterLookup = parameterExtractor(statement, parameters);
-        Analyzer analyzer = new Analyzer(session, metadata, sqlParser, accessControl, Optional.empty(), parameters, parameterLookup, warningCollector, query);
-        Analysis analysis = analyzer.analyze(statement);
+        Analyzer analyzer = new Analyzer(session, metadata, sqlParser, accessControl, Optional.empty(), parameters, parameterLookup, warningCollector, query, new ViewDefinitionReferences());
+        Analysis analysis = analyzer.analyzeSemantic(statement, false);
+        checkAccessPermissions(analysis.getAccessControlReferences(), analysis.getViewDefinitionReferences(), query, session.getPreparedStatements(), session.getIdentity(), accessControl, session.getAccessControlContext());
 
         List<ColumnMetadata> columnMetadata = analysis.getOutputDescriptor(statement.getQuery())
                 .getVisibleFields().stream()

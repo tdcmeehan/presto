@@ -19,6 +19,7 @@ import com.facebook.presto.common.type.Type;
 import com.facebook.presto.nativeworker.PrestoNativeQueryRunnerUtils;
 import com.facebook.presto.scalar.sql.NativeSqlInvokedFunctionsPlugin;
 import com.facebook.presto.scalar.sql.SqlInvokedFunctionsPlugin;
+import com.facebook.presto.sidecar.expressions.NativeExpressionOptimizerFactory;
 import com.facebook.presto.sidecar.functionNamespace.FunctionDefinitionProvider;
 import com.facebook.presto.sidecar.functionNamespace.NativeFunctionDefinitionProvider;
 import com.facebook.presto.sidecar.functionNamespace.NativeFunctionNamespaceManager;
@@ -49,6 +50,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static com.facebook.airlift.units.DataSize.Unit.MEGABYTE;
+import static com.facebook.presto.SystemSessionProperties.EXPRESSION_OPTIMIZER_NAME;
 import static com.facebook.presto.SystemSessionProperties.INLINE_SQL_FUNCTIONS;
 import static com.facebook.presto.SystemSessionProperties.KEY_BASED_SAMPLING_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.REMOVE_MAP_CAST;
@@ -127,6 +129,7 @@ public class TestNativeSidecarPlugin
                         "sidecar.http-client.max-content-length", SIDECAR_HTTP_CLIENT_MAX_CONTENT_SIZE_MB + "MB"));
         queryRunner.loadTypeManager(NativeTypeManagerFactory.NAME);
         queryRunner.loadPlanCheckerProviderManager("native", ImmutableMap.of());
+        queryRunner.getExpressionManager().loadExpressionOptimizerFactory(NativeExpressionOptimizerFactory.NAME, "native", ImmutableMap.of());
         queryRunner.installPlugin(new NativeSqlInvokedFunctionsPlugin());
     }
 
@@ -644,6 +647,91 @@ public class TestNativeSidecarPlugin
                     .build();
             assertEquals(actual.getMaterializedRows(), expectedResult.getMaterializedRows());
         }
+    }
+
+    // TODO: Remove this test once all remaining failures
+    //  are addressed using the native expression optimizer, and it is enabled everywhere.
+
+    @Test
+    public void testNativeExpressionOptimizer()
+    {
+        Session session = Session.builder(getSession())
+                .setSystemProperty(EXPRESSION_OPTIMIZER_NAME, "native")
+                .build();
+
+        // When using the native expression optimizer, the resolved optimized expression may contain a FunctionHandle. It is important that the correct type of function handle is constructed.
+        // Previously, the optimizer returned a BuiltInFunctionHandle, which caused errors such as "function not registered/found" because the function name was prefixed with `native.default`
+        // and resolution was attempted using the BuiltInFunctionNamespaceManager.
+        // With VeloxToPrestoExpr now returning a NativeFunctionHandle for native (C++) functions, we ensure that the NativeFunctionNamespaceManager is used to resolve native (C++) functions correctly.
+
+        // By adding these test cases, we verify that the reconstructed FunctionHandle is now a NativeFunctionHandle and is resolved correctly.
+        assertQuerySucceeds(session, "SELECT array_sort(ARRAY[-3, 2, -100, 5], x -> IF(x = 5, NULL, abs(x)))");
+        assertQuerySucceeds(session, "SELECT array_sort_desc(ARRAY[-25, 20000, -17, 3672], x -> IF(x = 5, NULL, abs(x)))");
+
+        // aggregates
+        assertUpdate(session, "ANALYZE region", 5);
+        assertQuerySucceeds(session, "select count(*) from orders");
+        assertQuerySucceeds(session, "select count(regionkey) from region");
+        assertQuerySucceeds(session, "select count(1) FROM lineitem l left JOIN orders o ON l.orderkey = o.orderkey JOIN customer c ON o.custkey = c.custkey");
+        // no-op
+        assertQuerySucceeds(session, "SELECT IF(1 = 1, count(*), count(*)) FROM orders");
+        assertQuerySucceeds(session, "SELECT CASE WHEN true THEN count(*) ELSE count(*) END FROM ORDERS");
+
+        // windows
+        assertQuerySucceeds(session, "SELECT * FROM (SELECT row_number() over(partition by orderstatus order by orderkey, orderstatus) rn, * from orders) WHERE rn = 1");
+        assertQuerySucceeds(session, "WITH t AS (SELECT linenumber, row_number() over (partition by linenumber order by linenumber) as rn FROM lineitem) SELECT * FROM t WHERE rn = 1");
+        assertQuerySucceeds(session, "SELECT row_number() OVER (PARTITION BY orderdate ORDER BY orderdate) FROM orders");
+
+        // IN expressions
+        assertQuerySucceeds(session, "SELECT table_name FROM information_schema.columns WHERE table_name IN ('nation', 'region')");
+        assertQuerySucceeds(session, "SELECT name FROM nation WHERE nationkey NOT IN (1, 2, 3, 4, 5, 10, 11, 12, 13)");
+        assertQuerySucceeds(session, "SELECT orderkey FROM lineitem WHERE shipmode IN ('TRUCK', 'FOB', 'RAIL')");
+        assertQuerySucceeds(session, "SELECT table_name, COALESCE(abs(ordinal_position), 0) as abs_pos FROM information_schema.columns WHERE table_catalog = 'hive' AND table_name IN ('nation', 'region') ORDER BY table_name, ordinal_position");
+        assertQuerySucceeds(session, "SELECT table_name, ordinal_position FROM information_schema.columns  WHERE abs(ordinal_position) IN (1, 2, 3) AND table_catalog = 'hive' AND table_name != 'roles' ORDER BY table_name, ordinal_position");
+        assertQuerySucceeds(session, "select lower(table_name) from information_schema.tables where table_name = 'lineitem' or table_name = 'LINEITEM'");
+
+        // Test dereference expression.
+        assertQuerySucceeds(session,
+                "select cast(row(row(row(random(10), if(random(10) >= 0, 2)), random(10)), random(100)) AS row(x row(y row(a int, b int), c int), d int))[1][1][2]");
+        assertQuerySucceeds(session,
+                "select cast(row(row(row(random(10), if(random(10) < 0, 2)), random(10)), random(100)) AS row(x row(y row(a int, b int), c int), d int))[1][2]");
+        assertQuerySucceeds(session,
+                "select cast(row(row(null, random(10)), random(100)) AS row(x row(y row(a int, b int), c int), d int))[1][1][1]");
+        assertQuerySucceeds(session,
+                "select cast(row(row(null, if(random(100) >= 0, 4)), random(10)) AS row(x row(y row(a int, b int), c int), d int))[2]");
+
+        // Test dereference expression with SQL invoked function, array_least_frequent.
+        assertQuerySucceeds(session, "SELECT array_least_frequent(array_agg(orderkey)) from orders");
+        assertQuerySucceeds(session, "SELECT array_least_frequent(array_agg(nationkey)) from nation");
+    }
+
+    @Test
+    public void testMergeKHyperLogLog()
+    {
+        assertQuery(
+                "select cardinality(merge(khll)), uniqueness_distribution(merge(khll)) " +
+                        "from (" +
+                        "   select k1, k2, khyperloglog_agg(v1, v2) khll " +
+                        "   from (values (1, 1, 2, 3), (1, 1, 4, 0), (1, 2, 90, 20), (1, 2, 87, 1), " +
+                        "                (2, 1, 11, 30), (2, 1, 11, 11), (2, 2, 9, 1), (2, 2, 87, 2)) t(k1, k2, v1, v2) " +
+                        "   group by k1, k2" +
+                        ")");
+
+        // Test merge(KHyperLogLog) when there are no rows.
+        assertQuery(
+                "select cardinality(merge(khll)), uniqueness_distribution(merge(khll)) " +
+                        "from (" +
+                        "   select khyperloglog_agg(v1, v2) khll " +
+                        "   from (values (1, 1, 2, 3)) t(k1, k2, v1, v2) " +
+                        "   where 1 = 0" +
+                        ")");
+
+        // Verify merge(KHyperLogLog) handles null states correctly.
+        assertQuery(
+                "select cardinality(merge(khll)), uniqueness_distribution(merge(khll)) " +
+                        "from (" +
+                        "   select CAST(null AS KHYPERLOGLOG) khll" +
+                        ")");
     }
 
     private String generateRandomTableName()

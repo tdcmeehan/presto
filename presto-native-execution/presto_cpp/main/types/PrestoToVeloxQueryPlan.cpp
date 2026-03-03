@@ -65,6 +65,21 @@ bool useCachedHashTable(const protocol::PlanNode& node) {
   return false;
 }
 
+const protocol::Signature* getSignatureFromFunctionHandle(
+    const std::shared_ptr<protocol::FunctionHandle>& functionHandle) {
+  if (const auto builtin =
+          std::dynamic_pointer_cast<protocol::BuiltInFunctionHandle>(
+              functionHandle)) {
+    return &builtin->signature;
+  } else if (
+      const auto native =
+          std::dynamic_pointer_cast<protocol::NativeFunctionHandle>(
+              functionHandle)) {
+    return &native->signature;
+  }
+  return nullptr;
+}
+
 std::vector<std::string> getNames(const protocol::Assignments& assignments) {
   std::vector<std::string> names;
   names.reserve(assignments.assignments.size());
@@ -870,6 +885,7 @@ VeloxQueryPlanConverterBase::toColumnStatsSpec(
       aggregateNames,
       aggregates,
       /*ignoreNullKeys=*/false,
+      /*noGroupsSpanBatches=*/false,
       sourceVeloxPlan);
 
   // Sanity checks on aggregation node.
@@ -902,7 +918,8 @@ VeloxQueryPlanConverterBase::generateOutputVariables(
   if (statisticsAggregation == nullptr) {
     return outputVariables;
   }
-  const auto statisticsOutputVariables = statisticsAggregation->outputVariables;
+  const auto& statisticsOutputVariables =
+      statisticsAggregation->outputVariables;
   auto statisticsGroupingVariables = statisticsAggregation->groupingVariables;
   outputVariables.insert(
       outputVariables.end(),
@@ -932,12 +949,10 @@ void VeloxQueryPlanConverterBase::toAggregations(
     aggregate.call = std::dynamic_pointer_cast<const core::CallTypedExpr>(
         exprConverter_.toVeloxExpr(prestoAggregation.call));
 
-    if (const auto builtin =
-            std::dynamic_pointer_cast<protocol::BuiltInFunctionHandle>(
-                prestoAggregation.functionHandle)) {
-      const auto& signature = builtin->signature;
-      aggregate.rawInputTypes.reserve(signature.argumentTypes.size());
-      for (const auto& argumentType : signature.argumentTypes) {
+    if (const auto signature =
+            getSignatureFromFunctionHandle(prestoAggregation.functionHandle)) {
+      aggregate.rawInputTypes.reserve(signature->argumentTypes.size());
+      for (const auto& argumentType : signature->argumentTypes) {
         aggregate.rawInputTypes.push_back(
             stringToType(argumentType, typeParser_));
       }
@@ -1104,6 +1119,7 @@ VeloxQueryPlanConverterBase::toVeloxQueryPlan(
       globalGroupingSets,
       groupIdField,
       /*ignoreNullKeys=*/false,
+      /*noGroupsSpanBatches=*/false,
       toVeloxQueryPlan(node->source, tableWriteInfo, taskId));
 }
 
@@ -1184,6 +1200,7 @@ VeloxQueryPlanConverterBase::toVeloxQueryPlan(
           /*aggregateNames=*/std::vector<std::string>{},
           /*aggregates=*/std::vector<core::AggregationNode::Aggregate>{},
           /*ignoreNullKeys=*/false,
+          /*noGroupsSpanBatches=*/false,
           toVeloxQueryPlan(node->source, tableWriteInfo, taskId)));
 }
 
@@ -1736,7 +1753,7 @@ toSortFieldsAndOrders(
   std::vector<core::FieldAccessTypedExprPtr> sortFields;
   std::vector<core::SortOrder> sortOrders;
   if (orderingScheme != nullptr) {
-    auto nodeSpecOrdering = orderingScheme->orderBy;
+    const auto& nodeSpecOrdering = orderingScheme->orderBy;
     sortFields.reserve(nodeSpecOrdering.size());
     sortOrders.reserve(nodeSpecOrdering.size());
     for (const auto& [variable, sortOrder] : nodeSpecOrdering) {
@@ -1820,6 +1837,22 @@ VeloxQueryPlanConverterBase::toVeloxQueryPlan(
       toVeloxQueryPlan(node->source, tableWriteInfo, taskId));
 }
 
+namespace {
+core::TopNRowNumberNode::RankFunction prestoToVeloxRankFunction(
+    protocol::RankingFunction rankingFunction) {
+  switch (rankingFunction) {
+    case protocol::RankingFunction::ROW_NUMBER:
+      return core::TopNRowNumberNode::RankFunction::kRowNumber;
+    case protocol::RankingFunction::RANK:
+      return core::TopNRowNumberNode::RankFunction::kRank;
+    case protocol::RankingFunction::DENSE_RANK:
+      return core::TopNRowNumberNode::RankFunction::kDenseRank;
+    default:
+      VELOX_UNREACHABLE();
+  }
+}
+}; // namespace
+
 std::shared_ptr<const core::PlanNode>
 VeloxQueryPlanConverterBase::toVeloxQueryPlan(
     const std::shared_ptr<const protocol::TopNRowNumberNode>& node,
@@ -1855,7 +1888,7 @@ VeloxQueryPlanConverterBase::toVeloxQueryPlan(
 
   return std::make_shared<core::TopNRowNumberNode>(
       node->id,
-      core::TopNRowNumberNode::RankFunction::kRowNumber,
+      prestoToVeloxRankFunction(node->rankingType),
       partitionFields,
       sortFields,
       sortOrders,

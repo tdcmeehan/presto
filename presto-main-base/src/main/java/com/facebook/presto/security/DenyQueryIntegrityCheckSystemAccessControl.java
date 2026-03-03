@@ -95,12 +95,22 @@ public class DenyQueryIntegrityCheckSystemAccessControl
     }
 
     @Override
+    public void checkCanCreateView(Identity identity, AccessControlContext context, CatalogSchemaTableName view)
+    {
+    }
+
+    @Override
     public void checkCanShowCreateTable(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
     {
     }
 
     @Override
     public void checkCanSelectFromColumns(Identity identity, AccessControlContext context, CatalogSchemaTableName table, Set<String> columns)
+    {
+    }
+
+    @Override
+    public void checkCanCallProcedure(Identity identity, AccessControlContext context, CatalogSchemaTableName procedure)
     {
     }
 }

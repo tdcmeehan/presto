@@ -36,6 +36,7 @@ import com.facebook.presto.spi.plan.OrderingScheme;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
 import com.facebook.presto.spi.plan.ProjectNode;
+import com.facebook.presto.spi.plan.ProjectNode.Locality;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.ConstantExpression;
@@ -84,6 +85,7 @@ import static com.facebook.presto.sql.analyzer.TypeSignatureProvider.fromTypes;
 import static com.facebook.presto.sql.planner.iterative.Lookup.noLookup;
 import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static com.facebook.presto.sql.relational.Expressions.call;
+import static com.facebook.presto.sql.relational.Expressions.callOperator;
 import static com.facebook.presto.sql.relational.Expressions.constant;
 import static com.facebook.presto.sql.relational.Expressions.variable;
 import static com.facebook.presto.type.TypeUtils.NULL_HASH_CODE;
@@ -183,6 +185,11 @@ public class PlannerUtils
 
     public static PlanNode addProjections(PlanNode source, PlanNodeIdAllocator planNodeIdAllocator, Map<VariableReferenceExpression, RowExpression> variableMap)
     {
+        return addProjections(source, planNodeIdAllocator, variableMap, LOCAL);
+    }
+
+    public static PlanNode addProjections(PlanNode source, PlanNodeIdAllocator planNodeIdAllocator, Map<VariableReferenceExpression, RowExpression> variableMap, Locality locality)
+    {
         Assignments.Builder assignments = Assignments.builder();
         for (VariableReferenceExpression variableReferenceExpression : source.getOutputVariables()) {
             assignments.put(variableReferenceExpression, variableReferenceExpression);
@@ -194,7 +201,7 @@ public class PlannerUtils
                 planNodeIdAllocator.getNextId(),
                 source,
                 assignments.build(),
-                LOCAL);
+                locality);
     }
 
     // Add a projection node, which assignment new value if output exists in variableMap, otherwise identity assignment
@@ -576,5 +583,20 @@ public class PlannerUtils
             castToVarchar = call("CAST", functionAndTypeManager.lookupCast(CAST, keyExpression.getType(), VARCHAR), VARCHAR, keyExpression);
         }
         return new SpecialFormExpression(COALESCE, VARCHAR, ImmutableList.of(castToVarchar, concatExpression));
+    }
+
+    public static RowExpression getVariableHash(List<VariableReferenceExpression> inputVariables, FunctionAndTypeManager functionAndTypeManager)
+    {
+        checkArgument(!inputVariables.isEmpty());
+        List<CallExpression> hashExpressionList = inputVariables.stream().map(keyVariable ->
+                callOperator(functionAndTypeManager.getFunctionAndTypeResolver(), OperatorType.XX_HASH_64, BIGINT, keyVariable)).collect(toImmutableList());
+        RowExpression hashExpression = hashExpressionList.get(0);
+        if (hashExpressionList.size() > 1) {
+            hashExpression = orNullHashCode(hashExpression);
+            for (int i = 1; i < hashExpressionList.size(); ++i) {
+                hashExpression = call(functionAndTypeManager, "combine_hash", BIGINT, hashExpression, orNullHashCode(hashExpressionList.get(i)));
+            }
+        }
+        return hashExpression;
     }
 }

@@ -46,9 +46,9 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.PrestoWarning;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.StandardErrorCode;
+import com.facebook.presto.spi.StandardWarningCode;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.WarningCollector;
-import com.facebook.presto.spi.analyzer.AccessControlInfo;
 import com.facebook.presto.spi.analyzer.AccessControlInfoForTable;
 import com.facebook.presto.spi.analyzer.MetadataResolver;
 import com.facebook.presto.spi.analyzer.ViewDefinition;
@@ -103,6 +103,7 @@ import com.facebook.presto.sql.tree.AlterFunction;
 import com.facebook.presto.sql.tree.Analyze;
 import com.facebook.presto.sql.tree.Call;
 import com.facebook.presto.sql.tree.Commit;
+import com.facebook.presto.sql.tree.CreateBranch;
 import com.facebook.presto.sql.tree.CreateFunction;
 import com.facebook.presto.sql.tree.CreateMaterializedView;
 import com.facebook.presto.sql.tree.CreateSchema;
@@ -412,8 +413,6 @@ class StatementAnalyzer
         this.metadataResolver = requireNonNull(metadata.getMetadataResolver(session), "metadataResolver is null");
         requireNonNull(metadata.getFunctionAndTypeManager(), "functionAndTypeManager is null");
         this.functionAndTypeResolver = requireNonNull(metadata.getFunctionAndTypeManager().getFunctionAndTypeResolver(), "functionAndTypeResolver is null");
-
-        analysis.addQueryAccessControlInfo(new AccessControlInfo(accessControl, session.getIdentity(), session.getTransactionId(), session.getAccessControlContext()));
     }
 
     public Scope analyze(Node node, Scope outerQueryScope)
@@ -765,6 +764,9 @@ class StatementAnalyzer
             if (metadataResolver.tableExists(targetTable)) {
                 if (node.isNotExists()) {
                     analysis.setCreateTableAsSelectNoOp(true);
+                    warningCollector.add(new PrestoWarning(
+                            StandardWarningCode.SEMANTIC_WARNING,
+                            format("Table '%s' already exists, skipping table creation", targetTable)));
                     return createAndAssignScope(node, scope, Field.newUnqualified(node.getLocation(), "rows", BIGINT));
                 }
                 throw new SemanticException(TABLE_ALREADY_EXISTS, node, "Destination table '%s' already exists", targetTable);
@@ -1198,6 +1200,12 @@ class StatementAnalyzer
         }
 
         @Override
+        protected Scope visitCreateBranch(CreateBranch node, Optional<Scope> scope)
+        {
+            return createAndAssignScope(node, scope);
+        }
+
+        @Override
         protected Scope visitDropTag(DropTag node, Optional<Scope> scope)
         {
             return createAndAssignScope(node, scope);
@@ -1316,6 +1324,7 @@ class StatementAnalyzer
             }
             DistributedProcedure procedure = metadata.getProcedureRegistry().resolveDistributed(connectorId, toSchemaTableName(procedureName));
             Object[] values = extractParameterValuesInOrder(call, procedure, metadata, session, analysis.getParameters());
+            accessControl.checkCanCallProcedure(session.getRequiredTransactionId(), session.getIdentity(), session.getAccessControlContext(), procedureName);
 
             analysis.setUpdateInfo(call.getUpdateInfo());
             analysis.setDistributedProcedureType(Optional.of(procedure.getType()));
@@ -1325,6 +1334,23 @@ class StatementAnalyzer
                     TableDataRewriteDistributedProcedure tableDataRewriteDistributedProcedure = (TableDataRewriteDistributedProcedure) procedure;
                     QualifiedName qualifiedName = QualifiedName.of(tableDataRewriteDistributedProcedure.getSchema(values), tableDataRewriteDistributedProcedure.getTableName(values));
                     QualifiedObjectName tableName = createQualifiedObjectName(session, call, qualifiedName, metadata);
+
+                    analysis.addAccessControlCheckForTable(
+                            TABLE_INSERT,
+                            new AccessControlInfoForTable(
+                                    accessControl,
+                                    session.getIdentity(),
+                                    session.getTransactionId(),
+                                    session.getAccessControlContext(),
+                                    tableName));
+                    analysis.addAccessControlCheckForTable(
+                            TABLE_DELETE,
+                            new AccessControlInfoForTable(
+                                    accessControl,
+                                    session.getIdentity(),
+                                    session.getTransactionId(),
+                                    session.getAccessControlContext(),
+                                    tableName));
 
                     String filter = tableDataRewriteDistributedProcedure.getFilter(values);
                     Expression filterExpression = sqlParser.createExpression(filter);
@@ -2203,7 +2229,7 @@ class StatementAnalyzer
                 else {
                     // when stitching is not enabled, still check permission of each base table
                     MaterializedViewDefinition materializedViewDefinition = optionalMaterializedView.get();
-                    analysis.getAccessControlReferences().addMaterializedViewDefinitionReference(name, materializedViewDefinition);
+                    analysis.getViewDefinitionReferences().addMaterializedViewDefinitionReference(name, materializedViewDefinition);
 
                     Query viewQuery = (Query) sqlParser.createStatement(
                             materializedViewDefinition.getOriginalSql(),
@@ -2319,6 +2345,7 @@ class StatementAnalyzer
             }
             throw new SemanticException(NOT_SUPPORTED, "Table version type %s not supported." + type);
         }
+
         private Optional<TableHandle> processTableVersion(Table table, QualifiedObjectName name, Optional<Scope> scope)
         {
             Expression stateExpr = table.getTableVersionExpression().get().getStateExpression();
@@ -2391,7 +2418,7 @@ class StatementAnalyzer
             }
             ViewDefinition view = optionalView.get();
 
-            analysis.getAccessControlReferences().addViewDefinitionReference(name, view);
+            analysis.getViewDefinitionReferences().addViewDefinitionReference(name, view);
 
             Optional<Expression> savedViewAccessorWhereClause = analysis.getCurrentQuerySpecification()
                     .flatMap(QuerySpecification::getWhere);
@@ -2445,7 +2472,7 @@ class StatementAnalyzer
         {
             MaterializedViewPlanValidator.validate((Query) sqlParser.createStatement(materializedViewDefinition.getOriginalSql(), createParsingOptions(session, warningCollector)));
 
-            analysis.getAccessControlReferences().addMaterializedViewDefinitionReference(materializedViewName, materializedViewDefinition);
+            analysis.getViewDefinitionReferences().addMaterializedViewDefinitionReference(materializedViewName, materializedViewDefinition);
 
             analysis.registerMaterializedViewForAnalysis(materializedViewName, materializedView, materializedViewDefinition.getOriginalSql());
 
@@ -2495,10 +2522,16 @@ class StatementAnalyzer
                     if (!owner.isPresent()) {
                         throw new SemanticException(NOT_SUPPORTED, "Owner must be present for DEFINER security mode");
                     }
-                    queryIdentity = new Identity(owner.get(), Optional.empty(), session.getIdentity().getExtraCredentials());
-                    // For materialized views, use regular access control (not ViewAccessControl)
-                    // to check SELECT permissions on base tables, not CREATE VIEW permissions
-                    queryAccessControl = accessControl;
+                    queryIdentity = new Identity(owner.get(), Optional.empty(), emptyMap(), session.getIdentity().getExtraCredentials(), emptyMap(), Optional.empty(), session.getIdentity().getReasonForSelect(), emptyList());
+                    // Use ViewAccessControl when the session user is not the owner, matching regular view behavior.
+                    // This checks CREATE_VIEW_WITH_SELECT_COLUMNS permissions to prevent privilege escalation
+                    // where a user with only SELECT could grant access to others via a DEFINER MV.
+                    if (!owner.get().equals(session.getIdentity().getUser())) {
+                        queryAccessControl = new ViewAccessControl(accessControl);
+                    }
+                    else {
+                        queryAccessControl = accessControl;
+                    }
                 }
                 else {
                     queryIdentity = session.getIdentity();
@@ -4279,7 +4312,7 @@ class StatementAnalyzer
                 AccessControl viewAccessControl;
                 if (owner.isPresent() && !owner.get().equals(session.getIdentity().getUser())) {
                     // definer mode
-                    identity = new Identity(owner.get(), Optional.empty(), session.getIdentity().getExtraCredentials());
+                    identity = new Identity(owner.get(), Optional.empty(), emptyMap(), session.getIdentity().getExtraCredentials(), emptyMap(), Optional.empty(), session.getIdentity().getReasonForSelect(), emptyList());
                     viewAccessControl = new ViewAccessControl(accessControl);
                 }
                 else {

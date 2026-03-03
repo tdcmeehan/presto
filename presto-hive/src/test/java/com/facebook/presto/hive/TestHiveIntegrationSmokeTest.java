@@ -30,6 +30,7 @@ import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.TableMetadata;
 import com.facebook.presto.spi.plan.MarkDistinctNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.WindowNode;
 import com.facebook.presto.spi.security.Identity;
 import com.facebook.presto.spi.security.SelectedRole;
@@ -38,7 +39,6 @@ import com.facebook.presto.sql.planner.Plan;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.ColumnConstraint;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.FormattedDomain;
 import com.facebook.presto.sql.planner.planPrinter.IOPlanPrinter.FormattedMarker;
@@ -163,6 +163,7 @@ import static io.airlift.tpch.TpchTable.ORDERS;
 import static io.airlift.tpch.TpchTable.PART_SUPPLIER;
 import static java.lang.String.format;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Locale.ENGLISH;
 import static java.util.Locale.ROOT;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.joining;
@@ -210,12 +211,16 @@ public class TestHiveIntegrationSmokeTest
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        return HiveQueryRunner.createQueryRunner(ORDERS, CUSTOMER, LINE_ITEM, PART_SUPPLIER, NATION);
+        return HiveQueryRunner.createQueryRunner(ImmutableList.of(ORDERS, CUSTOMER, LINE_ITEM, PART_SUPPLIER, NATION),
+                ImmutableMap.of(),
+                "sql-standard",
+                ImmutableMap.of("hive.restrict-procedure-call", "false"),
+                Optional.empty());
     }
 
     private List<?> getPartitions(HiveTableLayoutHandle tableLayoutHandle)
     {
-        return tableLayoutHandle.getPartitions().get();
+        return tableLayoutHandle.getPartitions().map(PartitionSet::getFullyLoadedPartitions).get();
     }
 
     @Test
@@ -352,6 +357,43 @@ public class TestHiveIntegrationSmokeTest
                         Optional.of(new CatalogSchemaTableName(catalog, "tpch", "test_orders"))));
 
         assertUpdate("DROP TABLE test_orders");
+    }
+
+    @Test
+    public void testIOExplainWithTemporalTypes()
+    {
+        computeActual("CREATE TABLE test_temporal_io " +
+                "WITH (partitioned_by = ARRAY['dt', 'ts']) " +
+                "AS SELECT orderkey, " +
+                "CAST('2020-03-25' AS DATE) AS dt, " +
+                "CAST('2020-01-15 10:30:45.000' AS TIMESTAMP) AS ts " +
+                "FROM orders WHERE orderkey = 1");
+
+        try {
+            MaterializedResult result = computeActual("EXPLAIN (TYPE IO, FORMAT JSON) SELECT * FROM test_temporal_io " +
+                    "WHERE dt = DATE '2020-03-25' " +
+                    "AND ts = TIMESTAMP '2020-01-15 10:30:45.000'");
+            IOPlan ioPlan = jsonCodec(IOPlan.class).fromJson((String) getOnlyElement(result.getOnlyColumnAsSet()));
+            assertEquals(ioPlan.getInputTableColumnInfos().size(), 1);
+            TableColumnInfo tableInfo = ioPlan.getInputTableColumnInfos().iterator().next();
+
+            Optional<ColumnConstraint> dtConstraint = tableInfo.getColumnConstraints().stream()
+                    .filter(c -> c.getColumnName().equals("dt"))
+                    .findFirst();
+            assertTrue(dtConstraint.isPresent(), "Expected date column constraint");
+            assertEquals(dtConstraint.get().getDomain().getRanges().iterator().next().getLow().getValue().get(), "2020-03-25");
+
+            Optional<ColumnConstraint> tsConstraint = tableInfo.getColumnConstraints().stream()
+                    .filter(c -> c.getColumnName().equals("ts"))
+                    .findFirst();
+            assertTrue(tsConstraint.isPresent(), "Expected timestamp column constraint");
+            String tsValue = tsConstraint.get().getDomain().getRanges().iterator().next().getLow().getValue().get();
+            assertTrue(tsValue.matches("^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}$"),
+                    "Timestamp should be formatted as yyyy-MM-dd HH:mm:ss.SSS but was: " + tsValue);
+        }
+        finally {
+            assertUpdate("DROP TABLE test_temporal_io");
+        }
     }
 
     @Test
@@ -6911,6 +6953,292 @@ public class TestHiveIntegrationSmokeTest
 
         String dropTableStmt = format("DROP TABLE %s.%s.%s", getSession().getCatalog().get(), getSession().getSchema().get(), tableName);
         assertUpdate(getSession(), dropTableStmt);
+    }
+
+    private void testCreateTableWithHeaderAndFooter(String format)
+    {
+        String name = format.toLowerCase(ENGLISH);
+        String catalog = getSession().getCatalog().get();
+        String schema = getSession().getSchema().get();
+        @Language("SQL") String createTableSql =
+                format("CREATE TABLE %s.%s.%s_table_skip_header (\n" +
+                                "   \"name\" varchar\n" +
+                                ")\n" +
+                                "WITH (\n" +
+                                "   format = '%s',\n" +
+                                "   skip_header_line_count = 1\n" +
+                                ")",
+                        catalog, schema, name, format);
+
+        assertUpdate(createTableSql);
+        MaterializedResult actual =
+                computeActual(format("SHOW CREATE TABLE %s_table_skip_header", name));
+        assertEquals(actual.getOnlyValue(), createTableSql);
+        assertUpdate(format("DROP TABLE %s_table_skip_header", name));
+
+        @Language("SQL") String createFooter =
+                format("CREATE TABLE %s.%s.%s_table_skip_footer (\n" +
+                                "   \"name\" varchar\n" +
+                                ")\n" +
+                                "WITH (\n" +
+                                "   format = '%s',\n" +
+                                "   skip_footer_line_count = 1\n" +
+                                ")",
+                        catalog, schema, name, format);
+
+        assertThatThrownBy(() -> assertUpdate(createFooter))
+                .hasMessageContaining("Cannot create non external table with skip.footer.line.count property");
+
+        @Language("SQL") String createHeaderFooter =
+                format("CREATE TABLE %s.%s.%s_table_skip_header_footer (\n" +
+                                "   \"name\" varchar\n" +
+                                ")\n" +
+                                "WITH (\n" +
+                                "   format = '%s',\n" +
+                                "   skip_footer_line_count = 1,\n" +
+                                "   skip_header_line_count = 1\n" +
+                                ")",
+                        catalog, schema, name, format);
+
+        assertThatThrownBy(() -> assertUpdate(createHeaderFooter))
+                .hasMessageContaining("Cannot create non external table with skip.footer.line.count property");
+
+        createTableSql =
+                format("CREATE TABLE %s.%s.%s_table_skip_header " +
+                                "WITH (\n" +
+                                "   format = '%s',\n" +
+                                "   skip_header_line_count = 1\n" +
+                                ") AS SELECT CAST(1 AS VARCHAR) AS col_name1, CAST(2 AS VARCHAR) AS col_name2",
+                        catalog, schema, name, format);
+
+        assertUpdate(createTableSql, 1);
+        assertUpdate(
+                format("INSERT INTO %s.%s.%s_table_skip_header VALUES('3', '4')",
+                        catalog, schema, name),
+                1);
+
+        MaterializedResult materializedRows =
+                computeActual(format("SELECT * FROM %s_table_skip_header", name));
+
+        assertEqualsIgnoreOrder(
+                materializedRows,
+                resultBuilder(getSession(), VARCHAR, VARCHAR)
+                        .row("1", "2")
+                        .row("3", "4")
+                        .build()
+                        .getMaterializedRows());
+
+        assertUpdate(format("DROP TABLE %s_table_skip_header", name));
+    }
+
+    @Test
+    public void testCreateTableWithHeaderAndFooterForCsv()
+    {
+        testCreateTableWithHeaderAndFooter("CSV");
+    }
+    @Test
+    public void testInsertTableWithHeaderAndFooterForCsv()
+    {
+        String catalog = getSession().getCatalog().get();
+        String schema = getSession().getSchema().get();
+
+        @Language("SQL") String createHeader =
+                format("CREATE TABLE %s.%s.csv_table_skip_header (\n" +
+                                "   name VARCHAR\n" +
+                                ")\n" +
+                                "WITH (\n" +
+                                "   format = 'CSV',\n" +
+                                "   skip_header_line_count = 2\n" +
+                                ")",
+                        catalog, schema);
+
+        assertUpdate(createHeader);
+
+        assertThatThrownBy(() ->
+                assertUpdate(format(
+                        "INSERT INTO %s.%s.csv_table_skip_header VALUES ('name')",
+                        catalog, schema)))
+                .hasMessageMatching("INSERT into .* skip.header.line.count property greater than 1 is not supported");
+
+        assertUpdate("DROP TABLE csv_table_skip_header");
+
+        createHeader =
+                format("CREATE TABLE %s.%s.csv_table_skip_header (\n" +
+                                "   name VARCHAR\n" +
+                                ")\n" +
+                                "WITH (\n" +
+                                "   format = 'CSV',\n" +
+                                "   skip_header_line_count = 1\n" +
+                                ")",
+                        catalog, schema);
+
+        assertUpdate(createHeader);
+
+        assertUpdate(format(
+                "INSERT INTO %s.%s.csv_table_skip_header VALUES ('name')", catalog, schema), 1);
+
+        MaterializedResult materializedRows =
+                computeActual(format("SELECT * FROM %s.%s.csv_table_skip_header", catalog, schema));
+
+        assertEqualsIgnoreOrder(
+                materializedRows,
+                resultBuilder(getSession(), VARCHAR)
+                        .row("name")
+                        .build()
+                        .getMaterializedRows());
+
+        assertUpdate("DROP TABLE csv_table_skip_header");
+    }
+
+    @Test
+    public void testSerdeParametersForTextfileRead()
+            throws Exception
+    {
+        File tempDir = createTempDir();
+        File dataFile = new File(tempDir, "custom-delim.txt");
+        Files.write(
+                "1001" +
+                "|he\u0001|llo" +
+                "|true" +
+                "|88.5" +
+                "|alpha;beta;gamma" +
+                "|size:large;color:blue" +
+                "|42;1.1:2.2:3.3;20\u0004bar:10\u0004foo\n", dataFile, UTF_8);
+
+        String catalog = getSession().getCatalog().get();
+        String schema = getSession().getSchema().get();
+        String table = "test_textfile_custom_delim";
+        String path = new Path(tempDir.toURI().toASCIIString()).toString();
+
+        String createTableWithCustomSerdeFormat =
+                "CREATE TABLE %s.%s.%s (\n" +
+                        "   %s bigint,\n" +
+                        "   %s varchar,\n" +
+                        "   %s boolean,\n" +
+                        "   %s double,\n" +
+                        "   %s array(varchar),\n" +
+                        "   %s map(varchar, varchar),\n" +
+                        "   %s row(%s integer, %s array(real), %s map(smallint, varchar))\n" +
+                        ")\n" +
+                        "WITH (\n" +
+                        "   external_location = '%s',\n" +
+                        "   format = 'TEXTFILE',\n" +
+                        "   textfile_collection_delim = ';',\n" +
+                        "   textfile_escape_delim = %s,\n" +
+                        "   textfile_field_delim = '|',\n" +
+                        "   textfile_mapkey_delim = ':'\n" +
+                        ")";
+
+        @Language("SQL") String createTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "c1", "c2", "c3", "c4", "c5", "c6", "c7",
+                "s_int", "s_arr", "s_map",
+                path,
+                "'\u0001'");
+
+        String expectedCreateTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "\"c1\"", "\"c2\"", "\"c3\"", "\"c4\"", "\"c5\"", "\"c6\"", "\"c7\"",
+                "\"s_int\"", "\"s_arr\"", "\"s_map\"",
+                path,
+                "U&'\\0001'");
+
+        try {
+            assertUpdate(createTableSql);
+
+            MaterializedResult actualCreateTableSql = computeActual(format("SHOW CREATE TABLE %s.%s.%s", catalog, schema, table));
+            assertEquals(actualCreateTableSql.getOnlyValue(), expectedCreateTableSql);
+
+            assertQuery(
+                    format(
+                            "SELECT\n" +
+                                    "c1, c2, c3, c4, c5, \n" +
+                                    "element_at(c6, 'size'), element_at(c6, 'color'), \n" +
+                                    "c7.s_arr, element_at(c7.s_map, 10), element_at(c7.s_map, 20) FROM %s.%s.%s", catalog, schema, table),
+                    "VALUES(" +
+                            "1001, 'he|llo', true, 88.5, \n" +
+                            "ARRAY['alpha', 'beta', 'gamma'], \n" +
+                            "'large', 'blue', \n" +
+                            "ARRAY[CAST(1.1 AS REAL), CAST(2.2 AS REAL), CAST(3.3 AS REAL)], 'foo', 'bar')");
+        }
+        finally {
+            assertUpdate(format("DROP TABLE IF EXISTS %s.%s.%s", catalog, schema, table));
+            deleteRecursively(tempDir.toPath(), ALLOW_INSECURE);
+        }
+    }
+
+    @Test
+    public void testSerdeParametersForTextfileWrite()
+    {
+        String catalog = getSession().getCatalog().get();
+        String schema = getSession().getSchema().get();
+        String table = "test_textfile_custom_delim";
+
+        String createTableWithCustomSerdeFormat =
+                "CREATE TABLE %s.%s.%s (\n" +
+                        "   %s bigint,\n" +
+                        "   %s varchar,\n" +
+                        "   %s boolean,\n" +
+                        "   %s double,\n" +
+                        "   %s array(varchar),\n" +
+                        "   %s map(varchar, varchar),\n" +
+                        "   %s row(%s integer, %s array(real), %s map(smallint, varchar))\n" +
+                        ")\n" +
+                        "WITH (\n" +
+                        "   format = 'TEXTFILE',\n" +
+                        "   textfile_collection_delim = ';',\n" +
+                        "   textfile_escape_delim = %s,\n" +
+                        "   textfile_field_delim = '|',\n" +
+                        "   textfile_mapkey_delim = ':'\n" +
+                        ")";
+
+        @Language("SQL") String createTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "c1", "c2", "c3", "c4", "c5", "c6", "c7",
+                "s_int", "s_arr", "s_map",
+                "'\u0001'");
+
+        String expectedCreateTableSql = format(
+                createTableWithCustomSerdeFormat,
+                catalog, schema, table,
+                "\"c1\"", "\"c2\"", "\"c3\"", "\"c4\"", "\"c5\"", "\"c6\"", "\"c7\"",
+                "\"s_int\"", "\"s_arr\"", "\"s_map\"",
+                "U&'\\0001'");
+
+        try {
+            assertUpdate(createTableSql);
+
+            MaterializedResult actualCreateTableSql = computeActual(format("SHOW CREATE TABLE %s.%s.%s", catalog, schema, table));
+            assertEquals(actualCreateTableSql.getOnlyValue(), expectedCreateTableSql);
+
+            assertUpdate(format(
+                    "INSERT INTO %s.%s.%s VALUES (" +
+                            "1001, " +
+                            "'he|llo', " +
+                            "true, " +
+                            "88.5, " +
+                            "ARRAY['alpha','beta', 'gamma'], " +
+                            "MAP(ARRAY['size', 'color'], ARRAY['large', 'blue']), " +
+                            "ROW(42, ARRAY[REAL '1.1', REAL '2.2',REAL '3.3'], MAP(ARRAY[SMALLINT '10', SMALLINT '20'], ARRAY['foo', 'bar'])))", catalog, schema, table), 1);
+
+            assertQuery(
+                    format(
+                            "SELECT\n" +
+                                    "c1, c2, c3, c4, c5, \n" +
+                                    "element_at(c6, 'size'), element_at(c6, 'color'), \n" +
+                                    "c7.s_arr, element_at(c7.s_map, 10), element_at(c7.s_map, 20) FROM %s.%s.%s", catalog, schema, table),
+                    "VALUES(" +
+                            "1001, 'he|llo', true, 88.5, \n" +
+                            "ARRAY['alpha', 'beta', 'gamma'], \n" +
+                            "'large', 'blue', \n" +
+                            "ARRAY[CAST(1.1 AS REAL), CAST(2.2 AS REAL), CAST(3.3 AS REAL)], 'foo', 'bar')");
+        }
+        finally {
+            assertUpdate(format("DROP TABLE IF EXISTS %s.%s.%s", catalog, schema, table));
+        }
     }
 
     protected String retentionDays(int days)

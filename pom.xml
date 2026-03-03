@@ -44,7 +44,7 @@
         <air.maven.version>3.3.9</air.maven.version>
 
         <dep.antlr.version>4.13.2</dep.antlr.version>
-        <dep.airlift.version>0.225</dep.airlift.version>
+        <dep.airlift.version>0.227</dep.airlift.version>
         <dep.packaging.version>${dep.airlift.version}</dep.packaging.version>
         <dep.slice.version>0.38</dep.slice.version>
         <dep.testing-mysql-server-5.version>0.6</dep.testing-mysql-server-5.version>
@@ -55,23 +55,24 @@
         <dep.drift.version>${dep.airlift.version}</dep.drift.version>
         <!-- Changing joda version changes tzdata which must match deployed JVM tzdata
              Do not change this without also making sure it matches -->
-        <dep.joda.version>2.13.1</dep.joda.version>
+        <dep.joda.version>2.14.0</dep.joda.version>
         <dep.tempto.version>1.55</dep.tempto.version>
         <dep.testng.version>7.5</dep.testng.version>
         <dep.lucene.version>9.12.0</dep.lucene.version>
         <dep.assertj-core.version>3.8.0</dep.assertj-core.version>
-        <dep.parquet.version>1.13.1</dep.parquet.version>
+        <dep.parquet.version>1.16.0</dep.parquet.version>
+        <dep.iceberg.version>1.10.0</dep.iceberg.version>
         <dep.asm.version>9.7.1</dep.asm.version>
         <dep.gcs.version>1.9.17</dep.gcs.version>
         <dep.alluxio.version>313</dep.alluxio.version>
         <dep.slf4j.version>2.0.16</dep.slf4j.version>
         <dep.kafka.version>3.9.1</dep.kafka.version>
-        <dep.pinot.version>1.3.0</dep.pinot.version>
-        <dep.druid.version>30.0.1</dep.druid.version>
+        <dep.pinot.version>1.4.0</dep.pinot.version>
+        <dep.druid.version>35.0.1</dep.druid.version>
         <dep.jaxb.version>2.3.1</dep.jaxb.version>
-        <dep.jaxb.runtime.version>4.0.5</dep.jaxb.runtime.version>
+        <dep.jaxb.runtime.version>4.0.6</dep.jaxb.runtime.version>
         <dep.hudi.version>0.14.0</dep.hudi.version>
-        <dep.testcontainers.version>1.20.5</dep.testcontainers.version>
+        <dep.testcontainers.version>2.0.3</dep.testcontainers.version>
         <dep.docker-java.version>3.4.1</dep.docker-java.version>
         <dep.jayway.version>2.9.0</dep.jayway.version>
         <dep.ratis.version>3.1.3</dep.ratis.version>
@@ -79,17 +80,17 @@
         <dep.guava.version>32.1.0-jre</dep.guava.version>
         <dep.jackson.version>2.15.4</dep.jackson.version>
         <dep.j2objc.version>3.0.0</dep.j2objc.version>
-        <dep.avro.version>1.11.4</dep.avro.version>
+        <dep.avro.version>1.12.0</dep.avro.version>
         <dep.commons.compress.version>1.27.1</dep.commons.compress.version>
-        <dep.protobuf-java.version>4.29.0</dep.protobuf-java.version>
+        <dep.protobuf-java.version>4.30.2</dep.protobuf-java.version>
         <dep.jetty.version>12.0.29</dep.jetty.version>
-        <dep.netty.version>4.1.128.Final</dep.netty.version>
+        <dep.netty.version>4.1.130.Final</dep.netty.version>
         <dep.reactor-netty.version>1.2.8</dep.reactor-netty.version>
         <dep.snakeyaml.version>2.5</dep.snakeyaml.version>
         <dep.gson.version>2.12.1</dep.gson.version>
         <dep.commons.lang3.version>3.18.0</dep.commons.lang3.version>
         <dep.guice.version>6.0.0</dep.guice.version>
-        <dep.arrow.version>17.0.0</dep.arrow.version>
+        <dep.arrow.version>18.3.0</dep.arrow.version>
         <dep.mariadb.version>3.5.4</dep.mariadb.version>
         <dep.spark.version>2.0.2-6</dep.spark.version>
         <dep.hadoop.version>3.4.1-1</dep.hadoop.version>
@@ -110,11 +111,12 @@
         <air.javadoc.lint>-missing</air.javadoc.lint>
         <dep.commons.codec.version>1.17.2</dep.commons.codec.version>
         <aws.sdk.version>2.32.9</aws.sdk.version>
-        <dep.jts.version>1.19.0</dep.jts.version>
+        <dep.jts.version>1.20.0</dep.jts.version>
 
         <dep.fastutil.version>8.5.2</dep.fastutil.version>
         <dep.datasketches-memory.version>2.2.0</dep.datasketches-memory.version>
         <dep.datasketches-java.version>5.0.1</dep.datasketches-java.version>
+        <dep.io.opentelemetry.version>1.58.0</dep.io.opentelemetry.version>
 
         <release.autoPublish>true</release.autoPublish>
     </properties>
@@ -160,6 +162,7 @@
         <module>presto-bytecode</module>
         <module>presto-client</module>
         <module>presto-parser</module>
+        <module>presto-internal-communication</module>
         <module>presto-main-base</module>
         <module>presto-main-tests</module>
         <module>presto-main</module>
@@ -501,6 +504,13 @@
             </dependency>
 
             <dependency>
+                <groupId>com.facebook.presto</groupId>
+                <artifactId>presto-delta</artifactId>
+                <version>${project.version}</version>
+                <type>test-jar</type>
+            </dependency>
+
+            <dependency>
                 <groupId>com.teradata</groupId>
                 <artifactId>re2j-td</artifactId>
                 <version>1.4</version>
@@ -587,6 +597,12 @@
             <dependency>
                 <groupId>com.facebook.presto</groupId>
                 <artifactId>presto-prometheus</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>com.facebook.presto</groupId>
+                <artifactId>presto-internal-communication</artifactId>
                 <version>${project.version}</version>
             </dependency>
 
@@ -1082,7 +1098,7 @@
             <dependency>
                 <groupId>com.facebook.presto.hive</groupId>
                 <artifactId>hive-apache</artifactId>
-                <version>3.0.0-10</version>
+                <version>3.0.0-11</version>
             </dependency>
 
             <dependency>
@@ -1200,7 +1216,7 @@
             <dependency>
                 <groupId>io.airlift</groupId>
                 <artifactId>aircompressor</artifactId>
-                <version>0.27</version>
+                <version>2.0.3</version>
             </dependency>
 
             <dependency>
@@ -1529,7 +1545,7 @@
             <dependency>
                 <groupId>org.postgresql</groupId>
                 <artifactId>postgresql</artifactId>
-                <version>42.6.1</version>
+                <version>42.7.9</version>
             </dependency>
 
             <dependency>
@@ -2575,19 +2591,19 @@
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-api</artifactId>
-                <version>1.19.0</version>
+                <version>${dep.io.opentelemetry.version}</version>
             </dependency>
 
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-context</artifactId>
-                <version>1.19.0</version>
+                <version>${dep.io.opentelemetry.version}</version>
             </dependency>
 
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-exporter-otlp</artifactId>
-                <version>1.19.0</version>
+                <version>${dep.io.opentelemetry.version}</version>
                 <exclusions>
                     <exclusion>
                         <groupId>com.squareup.okhttp3</groupId>
@@ -2599,31 +2615,31 @@
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-extension-trace-propagators</artifactId>
-                <version>1.19.0</version>
+                <version>${dep.io.opentelemetry.version}</version>
             </dependency>
 
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-sdk</artifactId>
-                <version>1.19.0</version>
+                <version>${dep.io.opentelemetry.version}</version>
             </dependency>
 
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-sdk-common</artifactId>
-                <version>1.19.0</version>
+                <version>${dep.io.opentelemetry.version}</version>
             </dependency>
 
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-sdk-trace</artifactId>
-                <version>1.19.0</version>
+                <version>${dep.io.opentelemetry.version}</version>
             </dependency>
 
             <dependency>
-                <groupId>io.opentelemetry</groupId>
+                <groupId>io.opentelemetry.semconv</groupId>
                 <artifactId>opentelemetry-semconv</artifactId>
-                <version>1.19.0-alpha</version>
+                <version>1.37.0</version>
             </dependency>
 
             <dependency>

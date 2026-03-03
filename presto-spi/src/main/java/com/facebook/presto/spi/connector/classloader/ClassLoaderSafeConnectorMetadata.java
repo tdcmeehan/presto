@@ -877,6 +877,38 @@ public class ClassLoaderSafeConnectorMetadata
     }
 
     @Override
+    public void createBranch(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            String branchName,
+            boolean replace,
+            boolean ifNotExists,
+            Optional<ConnectorTableVersion> tableVersion,
+            Optional<Long> retainDays,
+            Optional<Integer> minSnapshotsToKeep,
+            Optional<Long> maxSnapshotAgeDays)
+    {
+        try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {
+            delegate.createBranch(session, tableHandle, branchName, replace, ifNotExists, tableVersion, retainDays, minSnapshotsToKeep, maxSnapshotAgeDays);
+        }
+    }
+
+    @Override
+    public void createTag(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            String tagName,
+            boolean replace,
+            boolean ifNotExists,
+            Optional<ConnectorTableVersion> tableVersion,
+            Optional<Long> retainDays)
+    {
+        try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {
+            delegate.createTag(session, tableHandle, tagName, replace, ifNotExists, tableVersion, retainDays);
+        }
+    }
+
+    @Override
     public void dropTag(ConnectorSession session, ConnectorTableHandle tableHandle, String tagName, boolean tagExists)
     {
         try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {

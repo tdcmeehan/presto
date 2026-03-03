@@ -575,6 +575,12 @@ public class TestAccessControlManager
         }
 
         @Override
+        public void checkCanCallProcedure(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName procedureName)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
         public void checkCanSetCatalogSessionProperty(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, String propertyName)
         {
             throw new UnsupportedOperationException();
@@ -594,6 +600,18 @@ public class TestAccessControlManager
 
         @Override
         public void checkCanDropBranch(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void checkCanCreateBranch(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void checkCanCreateTag(ConnectorTransactionHandle transactionHandle, ConnectorIdentity identity, AccessControlContext context, SchemaTableName tableName)
         {
             throw new UnsupportedOperationException();
         }

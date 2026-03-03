@@ -24,6 +24,7 @@ import com.facebook.presto.sql.analyzer.FeaturesConfig.CteMaterializationStrateg
 import com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType;
 import com.facebook.presto.sql.analyzer.FeaturesConfig.JoinReorderingStrategy;
 import com.facebook.presto.sql.analyzer.FeaturesConfig.LeftJoinArrayContainsToInnerJoinStrategy;
+import com.facebook.presto.sql.analyzer.FeaturesConfig.LocalExchangeParentPreferenceStrategy;
 import com.facebook.presto.sql.analyzer.FeaturesConfig.PartialAggregationStrategy;
 import com.facebook.presto.sql.analyzer.FeaturesConfig.PartitioningPrecisionStrategy;
 import com.facebook.presto.sql.analyzer.FeaturesConfig.PushDownFilterThroughCrossJoinStrategy;
@@ -135,6 +136,8 @@ public class TestFeaturesConfig
                 .setExchangeChecksumEnabled(false)
                 .setEnableIntermediateAggregations(false)
                 .setPushAggregationThroughJoin(true)
+                .setPushSemiJoinThroughUnion(false)
+                .setPushdownThroughUnnest(false)
                 .setForceSingleNodeOutput(true)
                 .setPagesIndexEagerCompactionEnabled(false)
                 .setFilterAndProjectMinOutputPageSize(new DataSize(500, KILOBYTE))
@@ -146,7 +149,9 @@ public class TestFeaturesConfig
                 .setPartialAggregationByteReductionThreshold(0.5)
                 .setAdaptivePartialAggregationEnabled(false)
                 .setAdaptivePartialAggregationRowsReductionRatioThreshold(0.8)
+                .setLocalExchangeParentPreferenceStrategy(LocalExchangeParentPreferenceStrategy.ALWAYS)
                 .setOptimizeTopNRowNumber(true)
+                .setOptimizeTopNRank(false)
                 .setOptimizeCaseExpressionPredicate(false)
                 .setDistributedSortEnabled(true)
                 .setMaxGroupingSets(2048)
@@ -271,15 +276,23 @@ public class TestFeaturesConfig
                 .setExcludeInvalidWorkerSessionProperties(false)
                 .setAddExchangeBelowPartialAggregationOverGroupId(false)
                 .setAddDistinctBelowSemiJoinBuild(false)
+                .setTryFunctionCatchableErrors("")
                 .setPushdownSubfieldForMapFunctions(true)
+                .setPushdownSubfieldForCardinality(false)
                 .setUtilizeUniquePropertyInQueryPlanning(true)
+                .setExpressionOptimizerUsedInRowExpressionRewrite("")
                 .setInnerJoinPushdownEnabled(false)
                 .setBroadcastSemiJoinForDelete(true)
                 .setInEqualityJoinPushdownEnabled(false)
                 .setRewriteMinMaxByToTopNEnabled(false)
                 .setPrestoSparkExecutionEnvironment(false)
                 .setMaxSerializableObjectSize(1000)
-                .setUseConnectorProvidedSerializationCodecs(false));
+                .setTableScanShuffleParallelismThreshold(0.1)
+                .setTableScanShuffleStrategy(FeaturesConfig.ShuffleForTableScanStrategy.DISABLED)
+                .setSkipPushdownThroughExchangeForRemoteProjection(false)
+                .setUseConnectorProvidedSerializationCodecs(false)
+                .setRemoteFunctionNamesForFixedParallelism("")
+                .setRemoteFunctionFixedParallelismTaskCount(10));
     }
 
     @Test
@@ -345,7 +358,10 @@ public class TestFeaturesConfig
                 .put("optimizer.retry-query-with-history-based-optimization", "true")
                 .put("optimizer.treat-low-confidence-zero-estimation-as-unknown", "true")
                 .put("optimizer.push-aggregation-through-join", "false")
+                .put("optimizer.push-semi-join-through-union", "true")
+                .put("optimizer.pushdown-through-unnest", "true")
                 .put("optimizer.aggregation-partition-merging", "top_down")
+                .put("optimizer.local-exchange-parent-preference-strategy", "automatic")
                 .put("experimental.spill-enabled", "true")
                 .put("experimental.join-spill-enabled", "false")
                 .put("experimental.spiller-spill-path", "/tmp/custom/spill/path1,/tmp/custom/spill/path2")
@@ -373,6 +389,7 @@ public class TestFeaturesConfig
                 .put("experimental.adaptive-partial-aggregation", "true")
                 .put("experimental.adaptive-partial-aggregation-rows-reduction-ratio-threshold", "0.9")
                 .put("optimizer.optimize-top-n-row-number", "false")
+                .put("optimizer.optimize-top-n-rank", "true")
                 .put("optimizer.optimize-case-expression-predicate", "true")
                 .put("distributed-sort", "false")
                 .put("analyzer.max-grouping-sets", "2047")
@@ -500,11 +517,19 @@ public class TestFeaturesConfig
                 .put("expression-optimizer-name", "custom")
                 .put("exclude-invalid-worker-session-properties", "true")
                 .put("optimizer.add-distinct-below-semi-join-build", "true")
+                .put("try-function-catchable-errors", "GENERIC_INTERNAL_ERROR,INVALID_ARGUMENTS")
                 .put("optimizer.pushdown-subfield-for-map-functions", "false")
+                .put("optimizer.pushdown-subfield-for-cardinality", "true")
                 .put("optimizer.utilize-unique-property-in-query-planning", "false")
+                .put("optimizer.expression-optimizer-used-in-expression-rewrite", "custom")
                 .put("optimizer.add-exchange-below-partial-aggregation-over-group-id", "true")
                 .put("max_serializable_object_size", "50")
+                .put("optimizer.table-scan-shuffle-parallelism-threshold", "0.3")
+                .put("optimizer.table-scan-shuffle-strategy", "ALWAYS_ENABLED")
+                .put("optimizer.skip-pushdown-through-exchange-for-remote-projection", "true")
                 .put("use-connector-provided-serialization-codecs", "true")
+                .put("optimizer.remote-function-names-for-fixed-parallelism", "remote_.*")
+                .put("optimizer.remote-function-fixed-parallelism-task-count", "100")
                 .build();
 
         FeaturesConfig expected = new FeaturesConfig()
@@ -567,6 +592,8 @@ public class TestFeaturesConfig
                 .setTreatLowConfidenceZeroEstimationAsUnknownEnabled(true)
                 .setAggregationPartitioningMergingStrategy(TOP_DOWN)
                 .setPushAggregationThroughJoin(false)
+                .setPushSemiJoinThroughUnion(true)
+                .setPushdownThroughUnnest(true)
                 .setSpillEnabled(true)
                 .setJoinSpillingEnabled(false)
                 .setSpillerSpillPaths("/tmp/custom/spill/path1,/tmp/custom/spill/path2")
@@ -593,7 +620,9 @@ public class TestFeaturesConfig
                 .setPartialAggregationByteReductionThreshold(0.8)
                 .setAdaptivePartialAggregationEnabled(true)
                 .setAdaptivePartialAggregationRowsReductionRatioThreshold(0.9)
+                .setLocalExchangeParentPreferenceStrategy(LocalExchangeParentPreferenceStrategy.AUTOMATIC)
                 .setOptimizeTopNRowNumber(false)
+                .setOptimizeTopNRank(true)
                 .setOptimizeCaseExpressionPredicate(true)
                 .setDistributedSortEnabled(false)
                 .setMaxGroupingSets(2047)
@@ -720,15 +749,23 @@ public class TestFeaturesConfig
                 .setExcludeInvalidWorkerSessionProperties(true)
                 .setAddExchangeBelowPartialAggregationOverGroupId(true)
                 .setAddDistinctBelowSemiJoinBuild(true)
+                .setTryFunctionCatchableErrors("GENERIC_INTERNAL_ERROR,INVALID_ARGUMENTS")
                 .setPushdownSubfieldForMapFunctions(false)
+                .setPushdownSubfieldForCardinality(true)
                 .setUtilizeUniquePropertyInQueryPlanning(false)
+                .setExpressionOptimizerUsedInRowExpressionRewrite("custom")
                 .setInEqualityJoinPushdownEnabled(true)
                 .setBroadcastSemiJoinForDelete(false)
                 .setRewriteMinMaxByToTopNEnabled(true)
                 .setInnerJoinPushdownEnabled(true)
                 .setPrestoSparkExecutionEnvironment(true)
                 .setMaxSerializableObjectSize(50)
-                .setUseConnectorProvidedSerializationCodecs(true);
+                .setTableScanShuffleParallelismThreshold(0.3)
+                .setTableScanShuffleStrategy(FeaturesConfig.ShuffleForTableScanStrategy.ALWAYS_ENABLED)
+                .setSkipPushdownThroughExchangeForRemoteProjection(true)
+                .setUseConnectorProvidedSerializationCodecs(true)
+                .setRemoteFunctionNamesForFixedParallelism("remote_.*")
+                .setRemoteFunctionFixedParallelismTaskCount(100);
         assertFullMapping(properties, expected);
     }
 

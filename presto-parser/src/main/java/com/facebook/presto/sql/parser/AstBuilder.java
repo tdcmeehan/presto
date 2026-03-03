@@ -39,12 +39,14 @@ import com.facebook.presto.sql.tree.ColumnDefinition;
 import com.facebook.presto.sql.tree.Commit;
 import com.facebook.presto.sql.tree.ComparisonExpression;
 import com.facebook.presto.sql.tree.ConstraintSpecification;
+import com.facebook.presto.sql.tree.CreateBranch;
 import com.facebook.presto.sql.tree.CreateFunction;
 import com.facebook.presto.sql.tree.CreateMaterializedView;
 import com.facebook.presto.sql.tree.CreateRole;
 import com.facebook.presto.sql.tree.CreateSchema;
 import com.facebook.presto.sql.tree.CreateTable;
 import com.facebook.presto.sql.tree.CreateTableAsSelect;
+import com.facebook.presto.sql.tree.CreateTag;
 import com.facebook.presto.sql.tree.CreateType;
 import com.facebook.presto.sql.tree.CreateView;
 import com.facebook.presto.sql.tree.Cube;
@@ -603,6 +605,74 @@ class AstBuilder
                 ((StringLiteral) visit(context.name)).getValue(),
                 context.EXISTS().stream().anyMatch(node -> node.getSymbol().getTokenIndex() < context.BRANCH().getSymbol().getTokenIndex()),
                 context.EXISTS().stream().anyMatch(node -> node.getSymbol().getTokenIndex() > context.BRANCH().getSymbol().getTokenIndex()));
+    }
+
+    @Override
+    public Node visitCreateBranch(SqlBaseParser.CreateBranchContext context)
+    {
+        boolean tableExists = context.EXISTS().stream()
+                .anyMatch(node -> node.getSymbol().getTokenIndex() > context.TABLE().getSymbol().getTokenIndex() &&
+                        node.getSymbol().getTokenIndex() < context.CREATE().getSymbol().getTokenIndex());
+        boolean replace = context.REPLACE() != null;
+        boolean ifNotExists = context.EXISTS().stream()
+                .anyMatch(node -> node.getSymbol().getTokenIndex() > context.BRANCH().getSymbol().getTokenIndex());
+
+        Optional<TableVersionExpression> tableVersion = context.tableVersionExpression() != null
+                ? Optional.of((TableVersionExpression) visit(context.tableVersionExpression()))
+                : Optional.empty();
+
+        Optional<Long> retainDays = context.retainDays != null
+                ? Optional.of(Long.parseLong(context.retainDays.getText()))
+                : Optional.empty();
+
+        Optional<Integer> minSnapshotsToKeep = context.minSnapshots != null
+                ? Optional.of(Integer.parseInt(context.minSnapshots.getText()))
+                : Optional.empty();
+
+        Optional<Long> maxSnapshotAgeDays = context.maxSnapshotAge != null
+                ? Optional.of(Long.parseLong(context.maxSnapshotAge.getText()))
+                : Optional.empty();
+
+        return new CreateBranch(
+                getLocation(context),
+                getQualifiedName(context.tableName),
+                tableExists,
+                replace,
+                ifNotExists,
+                ((StringLiteral) visit(context.name)).getValue(),
+                tableVersion,
+                retainDays,
+                minSnapshotsToKeep,
+                maxSnapshotAgeDays);
+    }
+
+    @Override
+    public Node visitCreateTag(SqlBaseParser.CreateTagContext context)
+    {
+        boolean tableExists = context.EXISTS().stream()
+                .anyMatch(node -> node.getSymbol().getTokenIndex() > context.TABLE().getSymbol().getTokenIndex() &&
+                        node.getSymbol().getTokenIndex() < context.CREATE().getSymbol().getTokenIndex());
+        boolean replace = context.REPLACE() != null;
+        boolean ifNotExists = context.EXISTS().stream()
+                .anyMatch(node -> node.getSymbol().getTokenIndex() > context.TAG().getSymbol().getTokenIndex());
+
+        Optional<TableVersionExpression> tableVersion = context.tableVersionExpression() != null
+                ? Optional.of((TableVersionExpression) visit(context.tableVersionExpression()))
+                : Optional.empty();
+
+        Optional<Long> retainDays = context.retainDays != null
+                ? Optional.of(Long.parseLong(context.retainDays.getText()))
+                : Optional.empty();
+
+        return new CreateTag(
+                getLocation(context),
+                getQualifiedName(context.tableName),
+                tableExists,
+                replace,
+                ifNotExists,
+                ((StringLiteral) visit(context.name)).getValue(),
+                tableVersion,
+                retainDays);
     }
 
     @Override

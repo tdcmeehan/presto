@@ -206,6 +206,11 @@ public class AllowAllAccessControl
     }
 
     @Override
+    public void checkCanCallProcedure(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName procedureName)
+    {
+    }
+
+    @Override
     public void checkCanCreateRole(TransactionId transactionId, Identity identity, AccessControlContext context, String role, Optional<PrestoPrincipal> grantor, String catalogName)
     {
     }
@@ -247,6 +252,16 @@ public class AllowAllAccessControl
 
     @Override
     public void checkCanDropBranch(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName)
+    {
+    }
+
+    @Override
+    public void checkCanCreateBranch(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName)
+    {
+    }
+
+    @Override
+    public void checkCanCreateTag(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName)
     {
     }
 

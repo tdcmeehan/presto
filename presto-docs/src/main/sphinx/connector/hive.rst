@@ -164,9 +164,18 @@ Property Name                                            Description            
                                                          absolutely necessary to access HDFS.
                                                          Example: ``/etc/hdfs-site.xml``
 
-``hive.storage-format``                                  The default file format used when creating new tables.       ``ORC``
+``hive.storage-format``                                  The default file format used when creating new tables. The   ``ORC``
+                                                         available values are ``ORC``, ``PARQUET``, ``AVRO``,
+                                                         ``RCBINARY``, ``RCTEXT``, ``SEQUENCEFILE``, ``JSON``,
+                                                         and ``TEXTFILE``.
 
-``hive.compression-codec``                               The compression codec to use when writing files.             ``GZIP``
+``hive.compression-codec``                               The compression codec to use when writing files. The         ``GZIP``
+                                                         available values are ``NONE``, ``SNAPPY``, ``GZIP``,
+                                                         ``LZ4``, and ``ZSTD``.
+                                                         
+                                                         Note: ``LZ4`` is only available when
+                                                         ``hive.storage-format=ORC``. ``ZSTD`` is available
+                                                         for both ``ORC`` and ``PARQUET`` formats.
 
 ``hive.force-local-scheduling``                          Force splits to be scheduled on the same node as the Hadoop  ``false``
                                                          DataNode process serving the split data. This is useful for
@@ -236,6 +245,18 @@ Property Name                                            Description            
 
 .. _constructor: https://github.com/apache/hadoop/blob/02a9190af5f8264e25966a80c8f9ea9bb6677899/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/conf/Configuration.java#L844-L875
 
+Hive Session Properties
+-----------------------
+
+======================================================== ============================================================ ============
+Property Name                                            Description                                                  Default
+======================================================== ============================================================ ============
+``native_max_target_file_size``                          Native Execution only. Maximum target file size. When a      ``0B``
+                                                         file exceeds this size during writing, the writer will
+                                                         close the current file and start writing to a new file.
+                                                         Zero means no limit.
+======================================================== ============================================================ ============
+
 Avro Configuration Properties
 -----------------------------
 
@@ -253,6 +274,14 @@ Property Name                                            Description            
                                                          reading an Avro-formatted table. If specified, Presto will fetch                override schema)
                                                          and use this schema instead of relying on any schema in the
                                                          Metastore.
+
+``skip_header_line_count``                               Number of header lines to skip when reading CSV or TEXTFILE tables.             None (ignored if not set). Must be non-negative. Only valid for
+                                                         When set to ``1``, a header row will be written when creating new               CSV and TEXTFILE formats. Values greater than ``1`` are not
+                                                         CSV or TEXTFILE tables.                                                         supported for ``CREATE TABLE AS`` or ``INSERT`` operations.
+
+``skip_footer_line_count``                               Number of footer lines to skip when reading CSV or TEXTFILE tables.             None (ignored if not set). Must be non-negative. Only valid for
+                                                         Cannot be used when inserting into a table.                                     CSV and TEXTFILE formats. This property is not
+                                                                                                                                         supported for ``CREATE TABLE AS`` or ``INSERT`` operations.
 ======================================================== ============================================================================== ======================================================================================
 
 Hive Metastore Configuration for Avro
@@ -271,6 +300,33 @@ Add the ``metastore.storage.schema.reader.impl`` property to ``hive-site.xml`` w
 
 You must restart the metastore service for this configuration to take effect. This setting allows the metastore to read storage schemas for Avro tables and avoids ``Storage schema reading not supported`` errors.
 
+Textfile Configuration Properties
+---------------------------------
+
+Table Properties
+^^^^^^^^^^^^^^^^
+
+These properties can be used when creating TEXTFILE tables in Presto:
+
+======================================================== ============================================================================== =============================
+Property Name                                            Description                                                                    Default
+======================================================== ============================================================================== =============================
+``textfile_field_delim``                                 A custom single-character delimiter to separate fields.                        NONE
+
+``textfile_escape_delim``                                A custom single-character delimiter to escape characters.                      NONE
+
+``textfile_collection_delim``                            A custom single-character delimiter to separate collection elements.           NONE
+
+``textfile_mapkey_delim``                                A custom single-character delimiter to separate map keys.                      NONE
+
+======================================================== ============================================================================== =============================
+
+.. note::
+These properties are mapped to the corresponding properties in Hive ``LazySerDeParameters`` during serialization and
+follow the same behaviors with ``LazySimpleSerDe``.
+If they are not defined, the Hive defaults are used, which are typically ``\001`` for field delimiter, ``\002`` for
+collection delimiter, ``\003`` for map key delimiter, and escape character is disabled.
+
 Metastore Configuration Properties
 ----------------------------------
 
@@ -281,14 +337,28 @@ Property Name                                                         Descriptio
 ======================================================== ============================================================= ============
 ``hive.metastore-timeout``                               Timeout for Hive metastore requests.                           ``10s``
 
-``hive.metastore-cache-ttl``                             Duration how long cached metastore data should be considered   ``0s``
+``hive.metastore.cache.enabled-caches``                  Comma-separated list of metastore cache types to enable.        NONE
+                                                         The value should be a valid <CACHE_TYPE>.
+
+``hive.metastore.cache.disabled-caches``                 Comma-separated list of metastore cache types to disable.       NONE
+                                                         The value should be a valid <CACHE_TYPE>.
+
+``hive.metastore.cache.ttl.default``                     Duration how long cached metastore data should be considered   ``0s``
                                                          valid.
+
+``hive.metastore.cache.ttl-by-type``                     Per-cache time-to-live (TTL) overrides for Hive metastore       NONE
+                                                         caches. The value is a comma-separated list of
+                                                         <CACHE_TYPE>:<DURATION> pairs.
 
 ``hive.metastore-cache-maximum-size``                    Hive metastore cache maximum size.                              10000
 
-``hive.metastore-refresh-interval``                      Asynchronously refresh cached metastore data after access      ``0s``
+``hive.metastore.cache.refresh-interval.default``        Asynchronously refresh cached metastore data after access      ``0s``
                                                          if it is older than this but is not yet expired, allowing
                                                          subsequent accesses to see fresh data.
+
+``hive.metastore.cache.refresh-interval-by-type``        Per-cache refresh interval overrides for Hive metastore         NONE
+                                                         caches. The value is a comma-separated list of
+                                                         <CACHE_TYPE>:<DURATION> pairs.
 
 ``hive.metastore-refresh-max-threads``                   Maximum threads used to refresh cached metastore data.          100
 
@@ -306,6 +376,26 @@ Property Name                                                         Descriptio
 ``hive.metastore.thrift.client.tls.truststore-password`` Password for the trust store.                                   NONE
 
 ======================================================== ============================================================= ============
+
+.. note::
+
+  The supported values for ``CACHE_TYPE`` when enabling Hive Metastore Cache are:
+
+  * ``ALL``: Represents all supported Hive metastore cache types.
+  * ``DATABASE``: Caches metadata for individual Hive databases.
+  * ``DATABASE_NAMES``: Caches the list of all database names in the metastore.
+  * ``TABLE``: Caches metadata for individual Hive tables.
+  * ``TABLE_NAMES``: Caches the list of table names within a database.
+  * ``TABLE_STATISTICS``: Caches column-level statistics for Hive tables.
+  * ``TABLE_CONSTRAINTS``: Caches table constraint metadata such as primary and unique keys.
+  * ``PARTITION``: Caches metadata for individual Hive partitions.
+  * ``PARTITION_STATISTICS``: Caches column-level statistics for individual partitions.
+  * ``PARTITION_FILTER``: Caches partition name lookups based on partition filter predicates.
+  * ``PARTITION_NAMES``: Caches the list of partition names for a table.
+  * ``VIEW_NAMES``: Caches the list of view names within a database.
+  * ``TABLE_PRIVILEGES``: Caches table-level privilege information for users and roles.
+  * ``ROLES``: Caches the list of available Hive roles.
+  * ``ROLE_GRANTS``: Caches role grant mappings for principals.
 
 AWS Glue Catalog Configuration Properties
 -----------------------------------------

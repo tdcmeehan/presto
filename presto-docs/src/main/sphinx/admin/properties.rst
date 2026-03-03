@@ -2,12 +2,12 @@
 Presto Configuration Properties
 ===============================
 
-This section describes configuration properties that may be used to tune 
+This section describes configuration properties that may be used to tune
 Presto or alter its behavior when required.
 
-The following is not a complete list of all configuration properties 
+The following is not a complete list of all configuration properties
 available in Presto, and does not include any connector-specific
-catalog configuration properties. 
+catalog configuration properties.
 
 For information on catalog configuration properties, see the :doc:`connector documentation </connector/>`.
 
@@ -40,24 +40,43 @@ only need to fit in distributed memory across all nodes. When set to ``AUTOMATIC
 Presto will make a cost based decision as to which distribution type is optimal.
 It will also consider switching the left and right inputs to the join.  In ``AUTOMATIC``
 mode, Presto will default to hash distributed joins if no cost could be computed, such as if
-the tables do not have statistics. 
+the tables do not have statistics.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`join_distribution_type\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`join_distribution_type\`\``.
 
 
 ``redistribute-writes``
 ^^^^^^^^^^^^^^^^^^^^^^^
 
 * **Type:** ``boolean``
-* **Default value:** ``true``
+* **Default value:** ``false``
 
 This property enables redistribution of data before writing. This can
 eliminate the performance impact of data skew when writing by hashing it
 across nodes in the cluster. It can be disabled when it is known that the
 output data set is not skewed in order to avoid the overhead of hashing and
-redistributing all the data across the network. 
+redistributing all the data across the network.
+
+When both ``scale-writers`` and ``redistribute-writes`` are set to ``true``,
+``scale-writers`` takes precedence.
 
 The corresponding session property is :ref:`admin/properties-session:\`\`redistribute_writes\`\``.
+
+``scale-writers``
+^^^^^^^^^^^^^^^^^
+
+* **Type:** ``boolean``
+* **Default value:** ``true``
+
+This property enables dynamic scaling of writer tasks based on throughput. When enabled,
+Presto automatically adjusts the number of writer tasks to use the minimum necessary
+for optimal performance. This can improve resource utilization by scaling out writers
+only when needed based on data throughput.
+
+When both ``scale-writers`` and ``redistribute-writes`` are set to ``true``,
+``scale-writers`` takes precedence.
+
+The corresponding session property is :ref:`admin/properties-session:\`\`scale_writers\`\``.
 
 ``check-access-control-on-utilized-columns-only``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -124,8 +143,8 @@ session properties are included.
 * **Minimum value:** ``0``
 * **Default value:** ``0``
 
-The number of times that a query is automatically retried in the case of a transient query or communications failure. 
-The default value ``0`` means that retries are disabled. 
+The number of times that a query is automatically retried in the case of a transient query or communications failure.
+The default value ``0`` means that retries are disabled.
 
 ``http-server.max-request-header-size``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -133,10 +152,10 @@ The default value ``0`` means that retries are disabled.
 * **Type:** ``data size``
 * **Default value:** ``8 kB``
 
-The maximum size of the request header from the HTTP server. 
+The maximum size of the request header from the HTTP server.
 
-Note: The default value can cause errors when large session properties 
-or other large session information is involved. 
+Note: The default value can cause errors when large session properties
+or other large session information is involved.
 See :ref:`troubleshoot/query:\`\`Request Header Fields Too Large\`\``.
 
 ``offset-clause-enabled``
@@ -147,7 +166,7 @@ See :ref:`troubleshoot/query:\`\`Request Header Fields Too Large\`\``.
 
 To enable the ``OFFSET`` clause in SQL query expressions, set this property to ``true``.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`offset_clause_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`offset_clause_enabled\`\``.
 
 ``max-serializable-object-size``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -178,8 +197,25 @@ The corresponding session property is :ref:`admin/properties-session:\`\`max_pre
 * **Type:** ``string``
 * **Default value:** (none)
 
-An optional identifier for the cluster. When set, this tag is included in the response from the 
+An optional identifier for the cluster. When set, this tag is included in the response from the
 ``/v1/cluster`` REST API endpoint, allowing clients to identify which cluster provided the response.
+
+``try-function-catchable-errors``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``string``
+* **Default value:** ``""`` (empty string)
+
+A comma-separated list of error code names that the ``TRY()`` function should catch
+and return ``NULL`` for, in addition to the default catchable errors (such as
+``DIVISION_BY_ZERO``, ``INVALID_CAST_ARGUMENT``, ``INVALID_FUNCTION_ARGUMENT``,
+and ``NUMERIC_VALUE_OUT_OF_RANGE``).
+
+This allows administrators to configure which additional errors ``TRY()`` should suppress
+at the server level. Error codes are matched by their name (such as ``GENERIC_INTERNAL_ERROR``,
+``INVALID_ARGUMENTS``).
+
+The corresponding session property is :ref:`admin/properties-session:\`\`try_function_catchable_errors\`\``.
 
 Memory Management Properties
 ----------------------------
@@ -274,13 +310,12 @@ Spilling Properties
 Try spilling memory to disk to avoid exceeding memory limits for the query.
 
 Spilling works by offloading memory to disk. This process can allow a query with a large memory
-footprint to pass at the cost of slower execution times. Currently, spilling is supported only for
-aggregations and joins (inner and outer), so this property will not reduce memory usage required for
-window functions, sorting and other join types.
+footprint to pass at the cost of slower execution times. See :ref:`spill-operations`
+for a list of operations that support spilling.
 
 Be aware that this is an experimental feature and should be used with care.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`spill_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`spill_enabled\`\``.
 
 ``experimental.join-spill-enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -291,7 +326,7 @@ The corresponding session property is :ref:`admin/properties-session:\`\`spill_e
 When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for joins to
 avoid exceeding memory limits for the query.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`join_spill_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`join_spill_enabled\`\``.
 
 ``experimental.aggregation-spill-enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -302,7 +337,7 @@ The corresponding session property is :ref:`admin/properties-session:\`\`join_sp
 When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for aggregations to
 avoid exceeding memory limits for the query.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`aggregation_spill_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`aggregation_spill_enabled\`\``.
 
 ``experimental.distinct-aggregation-spill-enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -313,7 +348,7 @@ The corresponding session property is :ref:`admin/properties-session:\`\`aggrega
 When ``aggregation_spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for distinct
 aggregations to avoid exceeding memory limits for the query.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`distinct_aggregation_spill_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`distinct_aggregation_spill_enabled\`\``.
 
 ``experimental.order-by-aggregation-spill-enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -324,7 +359,7 @@ The corresponding session property is :ref:`admin/properties-session:\`\`distinc
 When ``aggregation_spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for order by
 aggregations to avoid exceeding memory limits for the query.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`order_by_aggregation_spill_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`order_by_aggregation_spill_enabled\`\``.
 
 ``experimental.window-spill-enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -335,7 +370,7 @@ The corresponding session property is :ref:`admin/properties-session:\`\`order_b
 When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for window functions to
 avoid exceeding memory limits for the query.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`window_spill_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`window_spill_enabled\`\``.
 
 ``experimental.order-by-spill-enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -346,7 +381,7 @@ The corresponding session property is :ref:`admin/properties-session:\`\`window_
 When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for order by to
 avoid exceeding memory limits for the query.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`order_by_spill_enabled\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`order_by_spill_enabled\`\``.
 
 ``experimental.spiller.task-spilling-strategy``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -472,7 +507,7 @@ Max spill space to be used by a single query on a single node.
 
 Limit for memory used for unspilling a single aggregation operator instance.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`aggregation_operator_unspill_memory_limit\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`aggregation_operator_unspill_memory_limit\`\``.
 
 ``experimental.spill-compression-codec``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -599,16 +634,16 @@ network has high latency or if there are many nodes in the cluster.
 * **Type:** ``boolean``
 * **Default value:** ``false``
 
-Enables the use of custom connector-provided serialization codecs for handles. 
+Enables the use of custom connector-provided serialization codecs for handles.
 This feature allows connectors to use their own serialization format for
 handle objects (such as table handles, column handles, and splits) instead
 of standard JSON serialization.
 
-When enabled, connectors that provide a ``ConnectorCodecProvider`` with 
-appropriate codecs will have their handles serialized using custom binary 
-formats, which are then Base64-encoded for transport. Connectors without 
-codec support automatically fall back to standard JSON serialization. 
-Internal Presto handles (prefixed with ``$``) always use JSON serialization 
+When enabled, connectors that provide a ``ConnectorCodecProvider`` with
+appropriate codecs will have their handles serialized using custom binary
+formats, which are then Base64-encoded for transport. Connectors without
+codec support automatically fall back to standard JSON serialization.
+Internal Presto handles (prefixed with ``$``) always use JSON serialization
 regardless of this setting.
 
 .. _task-properties:
@@ -629,9 +664,9 @@ resource utilization. Lower values are better for clusters that run many queries
 concurrently because the cluster will already be utilized by all the running
 queries, so adding more concurrency will result in slow downs due to context
 switching and other overhead. Higher values are better for clusters that only run
-one or a few queries at a time. 
+one or a few queries at a time.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`task_concurrency\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`task_concurrency\`\``.
 
 ``task.http-response-threads``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -722,9 +757,9 @@ The number of concurrent writer threads per worker per query. Increasing this va
 increase write speed, especially when a query is not I/O bound and can take advantage
 of additional CPU for parallel writes (some connectors can be bottlenecked on CPU when
 writing due to compression or other factors). Setting this too high may cause the cluster
-to become overloaded due to excessive resource utilization. 
+to become overloaded due to excessive resource utilization.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`task_writer_count\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`task_writer_count\`\``.
 
 ``task.interrupt-runaway-splits-timeout``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -840,9 +875,9 @@ Optimizer Properties
 * **Type:** ``boolean``
 * **Default value:** ``false``
 
-Enables optimization for aggregations on dictionaries. 
+Enables optimization for aggregations on dictionaries.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`dictionary_aggregation\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`dictionary_aggregation\`\``.
 
 ``optimizer.optimize-hash-generation``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -854,12 +889,12 @@ Compute hash codes for distribution, joins, and aggregations early during execut
 allowing result to be shared between operations later in the query. This can reduce
 CPU usage by avoiding computing the same hash multiple times, but at the cost of
 additional network transfer for the hashes. In most cases it will decrease overall
-query processing time. 
+query processing time.
 
 It is often helpful to disable this property when using :doc:`/sql/explain` in order
 to make the query plan easier to read.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`optimize_hash_generation\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`optimize_hash_generation\`\``.
 
 ``optimizer.optimize-metadata-queries``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -905,9 +940,9 @@ over an outer join. For example::
 
 Enabling this optimization can substantially speed up queries by reducing
 the amount of data that needs to be processed by the join.  However, it may slow down some
-queries that have very selective joins. 
+queries that have very selective joins.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`push_aggregation_through_join\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`push_aggregation_through_join\`\``.
 
 ``optimizer.push-table-write-through-union``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -919,9 +954,9 @@ Parallelize writes when using ``UNION ALL`` in queries that write data. This imp
 speed of writing output tables in ``UNION ALL`` queries because these writes do not require
 additional synchronization when collecting results. Enabling this optimization can improve
 ``UNION ALL`` speed when write speed is not yet saturated. However, it may slow down queries
-in an already heavily loaded system. 
+in an already heavily loaded system.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`push_table_write_through_union\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`push_table_write_through_union\`\``.
 
 ``optimizer.join-reordering-strategy``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -935,9 +970,9 @@ query.  ``ELIMINATE_CROSS_JOINS`` reorders joins to eliminate cross joins where 
 otherwise maintains the original query order. When reordering joins it also strives to maintain the
 original table order as much as possible. ``AUTOMATIC`` enumerates possible orders and uses
 statistics-based cost estimation to determine the least cost order. If stats are not available or if
-for any reason a cost could not be computed, the ``ELIMINATE_CROSS_JOINS`` strategy is used. 
+for any reason a cost could not be computed, the ``ELIMINATE_CROSS_JOINS`` strategy is used.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`join_reordering_strategy\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`join_reordering_strategy\`\``.
 
 ``optimizer.max-reordered-joins``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1020,7 +1055,7 @@ Enable broadcasting based on the confidence of the statistics that are being use
 broadcasting the side of a joinNode which has the highest (``HIGH`` or ``FACT``) confidence statistics.
 If both sides have the same confidence statistics, then the original behavior will be followed.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`confidence_based_broadcast\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`confidence_based_broadcast\`\``.
 
 ``optimizer.treat-low-confidence-zero-estimation-as-unknown``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1028,9 +1063,9 @@ The corresponding session property is :ref:`admin/properties-session:\`\`confide
 * **Type:** ``boolean``
 * **Default value:** ``false``
 
-Enable treating ``LOW`` confidence, zero estimations as ``UNKNOWN`` during joins. 
+Enable treating ``LOW`` confidence, zero estimations as ``UNKNOWN`` during joins.
 
-The corresponding session property is :ref:`admin/properties-session:\`\`treat-low-confidence-zero-estimation-as-unknown\`\``. 
+The corresponding session property is :ref:`admin/properties-session:\`\`treat-low-confidence-zero-estimation-as-unknown\`\``.
 
 ``optimizer.retry-query-with-history-based-optimization``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1038,7 +1073,7 @@ The corresponding session property is :ref:`admin/properties-session:\`\`treat-l
 * **Type:** ``boolean``
 * **Default value:** ``false``
 
-Enable retry for failed queries who can potentially be helped by HBO. 
+Enable retry for failed queries who can potentially be helped by HBO.
 
 The corresponding session property is :ref:`admin/properties-session:\`\`retry-query-with-history-based-optimization\`\``.
 
@@ -1073,6 +1108,85 @@ during query optimization. When set to ``false``, this parameter prevents histog
 being collected by ``ANALYZE``, and also prevents the existing histograms from being used
 during query optimization. This behavior can be controlled on a per-query basis using the
 ``optimizer_use_histograms`` session property.
+
+``optimizer.table-scan-shuffle-parallelism-threshold``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``double``
+* **Default value:** ``0.1``
+
+Parallelism threshold for adding a shuffle above table scan. When the table's parallelism factor
+is below this threshold (0.0-1.0) and ``optimizer.table-scan-shuffle-strategy`` is ``COST_BASED``,
+a round-robin shuffle exchange is added above the table scan to redistribute data.
+
+The corresponding session property is :ref:`admin/properties-session:\`\`table_scan_shuffle_parallelism_threshold\`\``.
+
+``optimizer.table-scan-shuffle-strategy``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``string``
+* **Allowed values:** ``DISABLED``, ``ALWAYS_ENABLED``, ``COST_BASED``
+* **Default value:** ``DISABLED``
+
+Strategy for adding shuffle above table scan to redistribute data. When set to ``DISABLED``,
+no shuffle is added. When set to ``ALWAYS_ENABLED``, a round-robin shuffle exchange is always
+added above table scans. When set to ``COST_BASED``, a shuffle is added only when the table's
+parallelism factor is below the ``optimizer.table-scan-shuffle-parallelism-threshold``.
+
+The corresponding session property is :ref:`admin/properties-session:\`\`table_scan_shuffle_strategy\`\``.
+
+``optimizer.remote-function-names-for-fixed-parallelism``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``string``
+* **Default value:** ``""`` (empty string, disabled)
+
+A regular expression pattern to match fully qualified remote function names, such as ``catalog.schema.function_name``,
+that should use fixed parallelism. When a remote function matches this pattern, the optimizer inserts
+round-robin shuffle exchanges before and after the projection containing the remote function call.
+This ensures that the remote function executes with a fixed degree of parallelism, which can be useful
+for controlling resource usage when calling external services.
+
+This property only applies to external/remote functions (functions where ``isExternalExecution()`` returns ``true``,
+such as functions using THRIFT, GRPC, or REST implementation types).
+
+Example patterns:
+
+* ``myschema.myfunction`` - matches an exact function name
+* ``catalog.schema.remote_.*`` - matches all functions starting with ``remote_`` in the specified catalog and schema
+* ``.*remote.*`` - matches any function containing ``remote`` in its fully qualified name
+
+The corresponding session property is :ref:`admin/properties-session:\`\`remote_function_names_for_fixed_parallelism\`\``.
+
+``optimizer.remote-function-fixed-parallelism-task-count``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``integer``
+* **Default value:** ``null`` (uses the default hash partition count)
+
+The number of tasks to use for remote functions matching the ``optimizer.remote-function-names-for-fixed-parallelism`` pattern.
+When set, this value determines the degree of parallelism for the round-robin shuffle exchanges inserted
+around matching remote function projections. If not set, the default hash partition count will be used.
+
+This property is only effective when ``optimizer.remote-function-names-for-fixed-parallelism`` is set to a non-empty pattern.
+
+The corresponding session property is :ref:`admin/properties-session:\`\`remote_function_fixed_parallelism_task_count\`\``.
+
+``optimizer.local-exchange-parent-preference-strategy``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``string``
+* **Allowed values:** ``ALWAYS``, ``NEVER``, ``AUTOMATIC``
+* **Default value:** ``ALWAYS``
+
+Strategy to consider parent preferences when adding local exchange partitioning for aggregations.
+When set to ``ALWAYS``, the optimizer always uses parent preferences for local exchange partitioning.
+When set to ``NEVER``, it never uses parent preferences and instead uses the aggregation's own
+grouping keys. When set to ``AUTOMATIC``, the optimizer makes a cost-based decision, using parent
+preferences only when the estimated partition cardinality is greater than or equal to the task
+concurrency.
+
+The corresponding session property is :ref:`admin/properties-session:\`\`local_exchange_parent_preference_strategy\`\``.
 
 Planner Properties
 ------------------
@@ -1221,6 +1335,72 @@ The corresponding session property is :ref:`admin/properties-session:\`\`query_c
 Use to configure how long a query can be queued before it is terminated.
 
 The corresponding session property is :ref:`admin/properties-session:\`\`query_max_queued_time\`\``.
+
+``query-manager.query-pacing.max-queries-per-second``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``integer``
+* **Minimum value:** ``1``
+* **Default value:** ``2147483647`` (unlimited)
+
+Maximum number of queries that can be admitted per second globally across
+all resource groups. This property enables query admission pacing to prevent
+worker overload when many queries start simultaneously. Pacing only activates
+when the number of running queries exceeds the threshold configured by
+``query-manager.query-pacing.min-running-queries``.
+
+Set to a lower value such as ``10`` to limit query admission rate during
+periods of high cluster load. The default value effectively disables pacing.
+
+``query-manager.query-pacing.min-running-queries``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``integer``
+* **Minimum value:** ``0``
+* **Default value:** ``30``
+
+Minimum number of running queries required before query admission pacing
+is applied. When the total number of running queries is below this threshold,
+queries are admitted immediately without rate limiting, regardless of the
+``query-manager.query-pacing.max-queries-per-second`` setting.
+
+This allows the cluster to quickly ramp up when idle while still providing
+protection against overload when the cluster is busy. Set to ``0`` to always
+apply pacing when ``max-queries-per-second`` is configured.
+
+``max-total-running-task-count-to-not-execute-new-query``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``integer``
+* **Minimum value:** ``1``
+* **Default value:** ``2147483647`` (unlimited)
+
+Maximum total running task count across all queries on the coordinator. When
+this threshold is exceeded, new queries are held in the queue rather than
+being scheduled for execution. This helps prevent coordinator overload by
+limiting the number of concurrent tasks being managed.
+
+Unlike ``max-total-running-task-count-to-kill-query`` which kills queries when
+the limit is exceeded, this property proactively prevents new queries from
+starting while allowing existing queries to complete normally.
+
+This property works in conjunction with query admission pacing
+(``query-manager.query-pacing.max-queries-per-second``) to provide
+comprehensive coordinator load management. When both are configured:
+
+1. Pacing controls the rate at which queries are admitted
+2. This property provides a hard cap on total concurrent tasks
+
+Without query-pacing, the cluster can admit multiple queries at once, which
+can lead to significantly more concurrent tasks than expected over this limit.
+
+Set to a lower value (e.g., ``50000``) to limit coordinator task management
+overhead. The default value effectively disables this feature.
+
+.. note::
+
+    For backwards compatibility, this property can also be configured using the
+    legacy name ``experimental.max-total-running-task-count-to-not-execute-new-query``.
 
 Query Retry Properties
 ----------------------

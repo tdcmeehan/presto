@@ -201,6 +201,12 @@ public abstract class ForwardingSystemAccessControl
     }
 
     @Override
+    public void checkCanCallProcedure(Identity identity, AccessControlContext context, CatalogSchemaTableName procedure)
+    {
+        delegate().checkCanCallProcedure(identity, context, procedure);
+    }
+
+    @Override
     public void checkCanInsertIntoTable(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
     {
         delegate().checkCanInsertIntoTable(identity, context, table);
@@ -264,6 +270,18 @@ public abstract class ForwardingSystemAccessControl
     public void checkCanRevokeTablePrivilege(Identity identity, AccessControlContext context, Privilege privilege, CatalogSchemaTableName table, PrestoPrincipal revokee, boolean grantOptionFor)
     {
         delegate().checkCanRevokeTablePrivilege(identity, context, privilege, table, revokee, grantOptionFor);
+    }
+
+    @Override
+    public void checkCanCreateBranch(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
+    {
+        delegate().checkCanCreateBranch(identity, context, table);
+    }
+
+    @Override
+    public void checkCanCreateTag(Identity identity, AccessControlContext context, CatalogSchemaTableName table)
+    {
+        delegate().checkCanCreateTag(identity, context, table);
     }
 
     @Override

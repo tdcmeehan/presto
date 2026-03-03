@@ -45,6 +45,7 @@ import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.plan.TableWriterNode.CallDistributedProcedureTarget;
 import com.facebook.presto.spi.plan.TopNNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.UnnestNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -73,7 +74,6 @@ import com.facebook.presto.sql.planner.plan.StatisticsWriterNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionProcessorNode;
 import com.facebook.presto.sql.planner.plan.TableWriterMergeNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.facebook.presto.sql.planner.plan.UpdateNode;
 import com.facebook.presto.sql.planner.planPrinter.RowExpressionFormatter;
 import com.facebook.presto.sql.tree.ComparisonExpression;
@@ -448,9 +448,11 @@ public final class GraphvizPrinter
         {
             printNode(node,
                     "TopNRowNumber",
-                    format("partition by = %s|order by = %s|n = %s",
+                    format("function = %s|partition by = %s|order by = %s|n = %s",
+                            node.getRankingFunction(),
                             Joiner.on(", ").join(node.getPartitionBy()),
-                            Joiner.on(", ").join(node.getOrderingScheme().getOrderByVariables()), node.getMaxRowCountPerPartition()),
+                            Joiner.on(", ").join(node.getOrderingScheme().getOrderByVariables()),
+                            node.getMaxRowCountPerPartition()),
                     NODE_COLORS.get(NodeType.WINDOW));
             return node.getSource().accept(this, context);
         }

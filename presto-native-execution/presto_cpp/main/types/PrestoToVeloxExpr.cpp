@@ -125,8 +125,8 @@ velox::variant VeloxExprConverter::getConstantValue(
               0));
     case TypeKind::VARBINARY:
       return velox::variant::binary(
-          valueVector->as<velox::SimpleVector<velox::StringView>>()->valueAt(
-              0));
+          std::string(valueVector->as<velox::SimpleVector<velox::StringView>>()
+                          ->valueAt(0)));
     default:
       throw std::invalid_argument(
           fmt::format("Unexpected Block type: {}", typeKind));
@@ -520,24 +520,32 @@ TypedExprPtr VeloxExprConverter::toVeloxExpr(
     auto returnType = typeParser_->parse(pexpr.returnType);
     return std::make_shared<CallTypedExpr>(
         returnType, args, getFunctionName(signature));
+  }
 
-  } else if (
-      auto sqlFunctionHandle =
+  // Parse args and returnType once for all remaining branches
+  auto args = toVeloxExpr(pexpr.arguments);
+  auto returnType = typeParser_->parse(pexpr.returnType);
+
+  if (auto sqlFunctionHandle =
           std::dynamic_pointer_cast<protocol::SqlFunctionHandle>(
               pexpr.functionHandle)) {
-    auto args = toVeloxExpr(pexpr.arguments);
-    auto returnType = typeParser_->parse(pexpr.returnType);
     return std::make_shared<CallTypedExpr>(
         returnType, args, getFunctionName(sqlFunctionHandle->functionId));
+  }
+
+  else if (
+      auto nativeFunctionHandle =
+          std::dynamic_pointer_cast<protocol::NativeFunctionHandle>(
+              pexpr.functionHandle)) {
+    auto signature = nativeFunctionHandle->signature;
+    return std::make_shared<CallTypedExpr>(
+        returnType, args, getFunctionName(signature));
   }
 #ifdef PRESTO_ENABLE_REMOTE_FUNCTIONS
   else if (
       auto restFunctionHandle =
           std::dynamic_pointer_cast<protocol::RestFunctionHandle>(
               pexpr.functionHandle)) {
-    auto args = toVeloxExpr(pexpr.arguments);
-    auto returnType = typeParser_->parse(pexpr.returnType);
-
     functions::remote::rest::PrestoRestFunctionRegistration::getInstance()
         .registerFunction(*restFunctionHandle);
     return std::make_shared<CallTypedExpr>(

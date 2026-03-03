@@ -62,6 +62,7 @@ public class NativeWorkerSessionPropertyProvider
     public static final String NATIVE_MAX_EXTENDED_PARTIAL_AGGREGATION_MEMORY = "native_max_extended_partial_aggregation_memory";
     public static final String NATIVE_MAX_SPILL_BYTES = "native_max_spill_bytes";
     public static final String NATIVE_MAX_PAGE_PARTITIONING_BUFFER_SIZE = "native_max_page_partitioning_buffer_size";
+    public static final String NATIVE_PARTITIONED_OUTPUT_EAGER_FLUSH = "native_partitioned_output_eager_flush";
     public static final String NATIVE_MAX_OUTPUT_BUFFER_SIZE = "native_max_output_buffer_size";
     public static final String NATIVE_QUERY_TRACE_ENABLED = "native_query_trace_enabled";
     public static final String NATIVE_QUERY_TRACE_DIR = "native_query_trace_dir";
@@ -88,6 +89,9 @@ public class NativeWorkerSessionPropertyProvider
     public static final String NATIVE_INDEX_LOOKUP_JOIN_SPLIT_OUTPUT = "native_index_lookup_join_split_output";
     public static final String NATIVE_UNNEST_SPLIT_OUTPUT = "native_unnest_split_output";
     public static final String NATIVE_USE_VELOX_GEOSPATIAL_JOIN = "native_use_velox_geospatial_join";
+    public static final String NATIVE_AGGREGATION_COMPACTION_BYTES_THRESHOLD = "native_aggregation_compaction_bytes_threshold";
+    public static final String NATIVE_AGGREGATION_COMPACTION_UNUSED_MEMORY_RATIO = "native_aggregation_compaction_unused_memory_ratio";
+    public static final String NATIVE_MERGE_JOIN_OUTPUT_BATCH_START_SIZE = "native_merge_join_output_batch_start_size";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -315,6 +319,11 @@ public class NativeWorkerSessionPropertyProvider
                                 "producing a SerializedPage.",
                         24L << 20,
                         !nativeExecution),
+                booleanProperty(NATIVE_PARTITIONED_OUTPUT_EAGER_FLUSH,
+                        "Native Execution only. If true, the PartitionedOutput operator will flush rows eagerly, without " +
+                                "waiting until buffers reach certain size. Default is false.",
+                        false,
+                        !nativeExecution),
                 integerProperty(
                         NATIVE_MAX_LOCAL_EXCHANGE_PARTITION_COUNT,
                         "Maximum number of partitions created by a local exchange. " +
@@ -432,6 +441,30 @@ public class NativeWorkerSessionPropertyProvider
                                 "velox::core::SpatialJoinNode. Otherwise, it is converted to a " +
                                 "velox::core::NestedLoopJoinNode.",
                         true,
+                        !nativeExecution),
+                longProperty(
+                        NATIVE_AGGREGATION_COMPACTION_BYTES_THRESHOLD,
+                        "Memory threshold in bytes for triggering string compaction during " +
+                                "global aggregation. When total string storage exceeds this limit with " +
+                                "high unused memory ratio, compaction is triggered to reclaim dead strings. " +
+                                "Disabled by default (0). NOTE: Currently only applies to approx_most_frequent " +
+                                "aggregate with StringView type during global aggregation.",
+                        0L,
+                        !nativeExecution),
+                doubleProperty(
+                        NATIVE_AGGREGATION_COMPACTION_UNUSED_MEMORY_RATIO,
+                        "Ratio of unused (evicted) bytes to total bytes that triggers compaction. " +
+                                "The value is in the range of [0, 1). NOTE: Currently only applies to approx_most_frequent " +
+                                "aggregate with StringView type during global aggregation.",
+                        0.25,
+                        !nativeExecution),
+                integerProperty(
+                        NATIVE_MERGE_JOIN_OUTPUT_BATCH_START_SIZE,
+                        "Initial output batch size in rows for MergeJoin operator. When non-zero, " +
+                                "the batch size starts at this value and is dynamically adjusted based on " +
+                                "the average row size of previous output batches. When zero (default), " +
+                                "dynamic adjustment is disabled and the batch size is fixed at preferred_output_batch_rows.",
+                        0,
                         !nativeExecution));
     }
 

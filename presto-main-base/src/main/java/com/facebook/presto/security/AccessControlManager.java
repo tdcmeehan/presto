@@ -706,6 +706,26 @@ public class AccessControlManager
     }
 
     @Override
+    public void checkCanCallProcedure(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName procedureName)
+    {
+        requireNonNull(identity, "identity is null");
+        requireNonNull(procedureName, "procedureName is null");
+
+        authenticationCheck(() -> checkCanAccessCatalog(identity, context, procedureName.getCatalogName()));
+
+        authorizationCheck(() -> systemAccessControl.checkCanCallProcedure(
+                identity,
+                context,
+                toCatalogSchemaTableName(procedureName)));
+
+        CatalogAccessControlEntry entry = getConnectorAccessControl(transactionId, procedureName.getCatalogName());
+        if (entry != null) {
+            authorizationCheck(() -> entry.getAccessControl().checkCanCallProcedure(entry.getTransactionHandle(transactionId),
+                    identity.toConnectorIdentity(procedureName.getCatalogName()), context, toSchemaTableName(procedureName)));
+        }
+    }
+
+    @Override
     public void checkCanCreateRole(TransactionId transactionId, Identity identity, AccessControlContext context, String role, Optional<PrestoPrincipal> grantor, String catalogName)
     {
         requireNonNull(identity, "identity is null");
@@ -840,6 +860,38 @@ public class AccessControlManager
         CatalogAccessControlEntry entry = getConnectorAccessControl(transactionId, tableName.getCatalogName());
         if (entry != null) {
             authorizationCheck(() -> entry.getAccessControl().checkCanDropBranch(entry.getTransactionHandle(transactionId), identity.toConnectorIdentity(tableName.getCatalogName()), context, toSchemaTableName(tableName)));
+        }
+    }
+
+    @Override
+    public void checkCanCreateBranch(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName)
+    {
+        requireNonNull(identity, "identity is null");
+        requireNonNull(tableName, "tableName is null");
+
+        authenticationCheck(() -> checkCanAccessCatalog(identity, context, tableName.getCatalogName()));
+
+        authorizationCheck(() -> systemAccessControl.checkCanCreateBranch(identity, context, toCatalogSchemaTableName(tableName)));
+
+        CatalogAccessControlEntry entry = getConnectorAccessControl(transactionId, tableName.getCatalogName());
+        if (entry != null) {
+            authorizationCheck(() -> entry.getAccessControl().checkCanCreateBranch(entry.getTransactionHandle(transactionId), identity.toConnectorIdentity(tableName.getCatalogName()), context, toSchemaTableName(tableName)));
+        }
+    }
+
+    @Override
+    public void checkCanCreateTag(TransactionId transactionId, Identity identity, AccessControlContext context, QualifiedObjectName tableName)
+    {
+        requireNonNull(identity, "identity is null");
+        requireNonNull(tableName, "tableName is null");
+
+        authenticationCheck(() -> checkCanAccessCatalog(identity, context, tableName.getCatalogName()));
+
+        authorizationCheck(() -> systemAccessControl.checkCanCreateTag(identity, context, toCatalogSchemaTableName(tableName)));
+
+        CatalogAccessControlEntry entry = getConnectorAccessControl(transactionId, tableName.getCatalogName());
+        if (entry != null) {
+            authorizationCheck(() -> entry.getAccessControl().checkCanCreateTag(entry.getTransactionHandle(transactionId), identity.toConnectorIdentity(tableName.getCatalogName()), context, toSchemaTableName(tableName)));
         }
     }
 

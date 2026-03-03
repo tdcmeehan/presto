@@ -13,6 +13,7 @@
  */
 
 #include "presto_cpp/main/common/Configs.h"
+#include <folly/system/HardwareConcurrency.h>
 #include "presto_cpp/main/common/ConfigReader.h"
 #include "presto_cpp/main/common/Utils.h"
 #include "velox/core/QueryConfig.h"
@@ -39,9 +40,9 @@ std::string bool2String(bool value) {
 }
 
 uint32_t hardwareConcurrency() {
-  const auto numLogicalCores = std::thread::hardware_concurrency();
-  // The spec says std::thread::hardware_concurrency() might return 0.
-  // But we depend on std::thread::hardware_concurrency() to create executors.
+  const auto numLogicalCores = folly::hardware_concurrency();
+  // The spec says folly::hardware_concurrency() might return 0.
+  // But we depend on folly::hardware_concurrency() to create executors.
   // Check to ensure numThreads is > 0.
   VELOX_CHECK_GT(numLogicalCores, 0);
   return numLogicalCores;
@@ -208,6 +209,8 @@ SystemConfig::SystemConfig() {
           NUM_PROP(kAsyncCacheMaxSsdWriteRatio, 0.7),
           NUM_PROP(kAsyncCacheSsdSavableRatio, 0.125),
           NUM_PROP(kAsyncCacheMinSsdSavableBytes, 1 << 24 /*16MB*/),
+          NUM_PROP(kAsyncCacheNumShards, 4),
+          NUM_PROP(kAsyncCacheSsdFlushThresholdBytes, 0),
           STR_PROP(kAsyncCachePersistenceInterval, "0s"),
           BOOL_PROP(kAsyncCacheSsdDisableFileCow, false),
           BOOL_PROP(kSsdCacheChecksumEnabled, false),
@@ -247,6 +250,7 @@ SystemConfig::SystemConfig() {
           NUM_PROP(kHttpClientHttp2InitialStreamWindow, 1 << 23 /*8MB*/),
           NUM_PROP(kHttpClientHttp2StreamWindow, 1 << 23 /*8MB*/),
           NUM_PROP(kHttpClientHttp2SessionWindow, 1 << 26 /*64MB*/),
+          BOOL_PROP(kHttpClientConnectionReuseCounterEnabled, true),
           STR_PROP(kExchangeMaxErrorDuration, "3m"),
           STR_PROP(kExchangeRequestTimeout, "20s"),
           STR_PROP(kExchangeConnectTimeout, "20s"),
@@ -373,6 +377,25 @@ uint32_t SystemConfig::httpServerZstdContentCompressionLevel() const {
 
 bool SystemConfig::httpServerEnableGzipCompression() const {
   return optionalProperty<bool>(kHttpServerEnableGzipCompression).value();
+}
+
+http::HttpServerStartupOptions SystemConfig::httpServerStartupOptions() const {
+  http::HttpServerStartupOptions options;
+  options.idleTimeoutMs = httpServerIdleTimeoutMs();
+  options.http2InitialReceiveWindow = httpServerHttp2InitialReceiveWindow();
+  options.http2ReceiveStreamWindowSize =
+      httpServerHttp2ReceiveStreamWindowSize();
+  options.http2ReceiveSessionWindowSize =
+      httpServerHttp2ReceiveSessionWindowSize();
+  options.http2MaxConcurrentStreams = httpServerHttp2MaxConcurrentStreams();
+  options.enableContentCompression = httpServerEnableContentCompression();
+  options.contentCompressionLevel = httpServerContentCompressionLevel();
+  options.contentCompressionMinimumSize =
+      httpServerContentCompressionMinimumSize();
+  options.enableZstdCompression = httpServerEnableZstdCompression();
+  options.zstdContentCompressionLevel = httpServerZstdContentCompressionLevel();
+  options.enableGzipCompression = httpServerEnableGzipCompression();
+  return options;
 }
 
 std::string SystemConfig::httpsSupportedCiphers() const {
@@ -693,6 +716,14 @@ int32_t SystemConfig::asyncCacheMinSsdSavableBytes() const {
   return optionalProperty<int32_t>(kAsyncCacheMinSsdSavableBytes).value();
 }
 
+int32_t SystemConfig::asyncCacheNumShards() const {
+  return optionalProperty<int32_t>(kAsyncCacheNumShards).value();
+}
+
+uint64_t SystemConfig::asyncCacheSsdFlushThresholdBytes() const {
+  return optionalProperty<uint64_t>(kAsyncCacheSsdFlushThresholdBytes).value();
+}
+
 std::chrono::duration<double> SystemConfig::asyncCachePersistenceInterval()
     const {
   return velox::config::toDuration(
@@ -951,6 +982,25 @@ uint32_t SystemConfig::httpClientHttp2SessionWindow() const {
   return optionalProperty<uint32_t>(kHttpClientHttp2SessionWindow).value();
 }
 
+bool SystemConfig::httpClientConnectionReuseCounterEnabled() const {
+  return optionalProperty<bool>(kHttpClientConnectionReuseCounterEnabled)
+      .value();
+}
+
+http::HttpClientOptions SystemConfig::httpClientOptions() const {
+  http::HttpClientOptions options;
+  options.http2Enabled = httpClientHttp2Enabled();
+  options.http2MaxStreamsPerConnection =
+      httpClientHttp2MaxStreamsPerConnection();
+  options.http2InitialStreamWindow = httpClientHttp2InitialStreamWindow();
+  options.http2StreamWindow = httpClientHttp2StreamWindow();
+  options.http2SessionWindow = httpClientHttp2SessionWindow();
+  options.maxAllocateBytes = httpMaxAllocateBytes();
+  options.connectionReuseCounterEnabled =
+      httpClientConnectionReuseCounterEnabled();
+  return options;
+}
+
 std::chrono::duration<double> SystemConfig::exchangeMaxErrorDuration() const {
   return velox::config::toDuration(
       optionalProperty(kExchangeMaxErrorDuration).value());
@@ -1013,6 +1063,17 @@ std::string SystemConfig::internalCommunicationSharedSecret() const {
 int32_t SystemConfig::internalCommunicationJwtExpirationSeconds() const {
   return optionalProperty<int32_t>(kInternalCommunicationJwtExpirationSeconds)
       .value();
+}
+
+http::JwtOptions SystemConfig::jwtOptions() const {
+  http::JwtOptions options;
+  options.jwtEnabled = internalCommunicationJwtEnabled();
+  if (options.jwtEnabled) {
+    options.sharedSecret = internalCommunicationSharedSecret();
+    options.jwtExpirationSeconds = internalCommunicationJwtExpirationSeconds();
+    options.nodeId = NodeConfig::instance()->nodeId();
+  }
+  return options;
 }
 
 bool SystemConfig::useLegacyArrayAgg() const {

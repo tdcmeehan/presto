@@ -50,6 +50,7 @@ import com.facebook.presto.spi.plan.TableFinishNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TableWriterNode;
 import com.facebook.presto.spi.plan.TopNNode;
+import com.facebook.presto.spi.plan.TopNRowNumberNode;
 import com.facebook.presto.spi.plan.UnionNode;
 import com.facebook.presto.spi.plan.UnnestNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -64,7 +65,6 @@ import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SequenceNode;
-import com.facebook.presto.sql.planner.plan.TopNRowNumberNode;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -699,6 +699,7 @@ public class CanonicalPlanGenerator
                 new DataOrganizationSpecification(
                         partitionBy,
                         node.getSpecification().getOrderingScheme().map(scheme -> getCanonicalOrderingScheme(scheme, context.getExpressions()))),
+                node.getRankingFunction(),
                 rowNumberVariable,
                 node.getMaxRowCountPerPartition(),
                 node.isPartial(),

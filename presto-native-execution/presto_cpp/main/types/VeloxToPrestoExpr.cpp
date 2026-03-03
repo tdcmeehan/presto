@@ -13,9 +13,11 @@
  */
 #include "presto_cpp/main/types/VeloxToPrestoExpr.h"
 #include <boost/algorithm/string.hpp>
+#include "presto_cpp/main/common/Utils.h"
 #include "presto_cpp/main/types/PrestoToVeloxExpr.h"
 #include "velox/core/ITypedExpr.h"
 #include "velox/expression/ExprConstants.h"
+#include "velox/vector/BaseVector.h"
 #include "velox/vector/ConstantVector.h"
 
 using namespace facebook::presto;
@@ -96,6 +98,30 @@ const std::unordered_map<std::string, std::string>& veloxToPrestoOperatorMap() {
   }
   return veloxToPrestoOperatorMap;
 }
+
+// If the function name prefix starts from "presto.default", then it is a built
+// in function handle. Otherwise, it is a native function handle.
+std::shared_ptr<protocol::FunctionHandle> getFunctionHandle(
+    const std::string& name,
+    const protocol::Signature& signature) {
+  static constexpr char const* kStatic = "$static";
+  static constexpr char const* kNativeFunctionHandle = "native";
+  static constexpr char const* builtInCatalog = "presto";
+  static constexpr char const* builtInSchema = "default";
+
+  const auto parts = util::getFunctionNameParts(name);
+  if ((parts[0] == builtInCatalog) && (parts[1] == builtInSchema)) {
+    auto handle = std::make_shared<protocol::BuiltInFunctionHandle>();
+    handle->_type = kStatic;
+    handle->signature = signature;
+    return handle;
+  } else {
+    auto handle = std::make_shared<protocol::NativeFunctionHandle>();
+    handle->_type = kNativeFunctionHandle;
+    handle->signature = signature;
+    return handle;
+  }
+}
 } // namespace
 
 std::string VeloxToPrestoExprConverter::getValueBlock(
@@ -136,6 +162,78 @@ VeloxToPrestoExprConverter::getSwitchSpecialFormExpressionArgs(
   return result;
 }
 
+void VeloxToPrestoExprConverter::getArgsFromConstantInList(
+    const velox::core::ConstantTypedExpr* inList,
+    std::vector<RowExpressionPtr>& result) const {
+  const auto inListVector = inList->toConstantVector(pool_);
+  auto* constantVector =
+      inListVector->as<velox::ConstantVector<velox::ComplexType>>();
+  VELOX_CHECK_NOT_NULL(
+      constantVector, "Expected ConstantVector of Array type for IN-list.");
+  const auto* arrayVector =
+      constantVector->wrappedVector()->as<velox::ArrayVector>();
+  VELOX_CHECK_NOT_NULL(
+      arrayVector,
+      "Expected constant IN-list to be of Array type, but got {}.",
+      constantVector->wrappedVector()->type()->toString());
+
+  auto wrappedIdx = constantVector->wrappedIndex(0);
+  auto size = arrayVector->sizeAt(wrappedIdx);
+  auto offset = arrayVector->offsetAt(wrappedIdx);
+  auto elementsVector = arrayVector->elements();
+
+  for (velox::vector_size_t i = 0; i < size; i++) {
+    auto elementIndex = offset + i;
+    auto elementConstant =
+        velox::BaseVector::wrapInConstant(1, elementIndex, elementsVector);
+    // Construct a core::ConstantTypedExpr from the constant value at this
+    // index in array vector, then convert it to a protocol::RowExpression.
+    const auto constantExpr =
+        std::make_shared<velox::core::ConstantTypedExpr>(elementConstant);
+    result.push_back(getConstantExpression(constantExpr.get()));
+  }
+}
+
+// IN expression in Presto is of form `expr0 IN [expr1, expr2, ..., exprN]`.
+// The Velox representation of IN expression has the same form as Presto when
+// any of the expressions in the IN list is non-constant; when the IN list only
+// has constant expressions, it is of form `expr0 IN constantExpr(ARRAY[
+// expr1.constantValue(), expr2.constantValue(), ..., exprN.constantValue()])`.
+// This function retrieves the arguments to Presto IN expression from Velox IN
+// expression in both of these forms.
+std::vector<RowExpressionPtr>
+VeloxToPrestoExprConverter::getInSpecialFormExpressionArgs(
+    const velox::core::CallTypedExpr* inExpr) const {
+  std::vector<RowExpressionPtr> result;
+  const auto& inputs = inExpr->inputs();
+  const auto numInputs = inputs.size();
+  VELOX_CHECK_GE(numInputs, 2, "IN expression should have at least 2 inputs");
+
+  // Value being searched for with this `IN` expression is always the first
+  // input, convert it to a Presto expression.
+  result.push_back(getRowExpression(inputs.at(0)));
+  const auto& inList = inputs.at(1);
+  if (numInputs == 2 && inList->isConstantKind()) {
+    // Converts inputs from constant Velox IN-list to arguments in the Presto
+    // `IN` expression. Eg: For expression `col0 IN ['apple', 'foo', `bar`]`,
+    // `apple`, `foo`, and `bar` from the IN-list are converted to equivalent
+    // Presto constant expressions.
+    const auto* constantInList =
+        inList->asUnchecked<velox::core::ConstantTypedExpr>();
+    getArgsFromConstantInList(constantInList, result);
+  } else {
+    // Converts inputs from the Velox IN-list to arguments in the Presto `IN`
+    // expression when the Velox IN-list has at least one non-constant
+    // expression. Eg: For expression `col0 IN ['apple', col1, 'foo']`, `apple`,
+    // col1, and `foo` from the IN-list are converted to equivalent
+    // Presto expressions.
+    for (auto i = 1; i < numInputs; i++) {
+      result.push_back(getRowExpression(inputs[i]));
+    }
+  }
+  return result;
+}
+
 SpecialFormExpressionPtr VeloxToPrestoExprConverter::getSpecialFormExpression(
     const velox::core::CallTypedExpr* expr) const {
   VELOX_CHECK(
@@ -156,11 +254,14 @@ SpecialFormExpressionPtr VeloxToPrestoExprConverter::getSpecialFormExpression(
   // Arguments for switch expression include 'WHEN' special form expression(s)
   // so they are constructed separately.
   static constexpr char const* kSwitch = "SWITCH";
+  static constexpr char const* kIn = "IN";
   if (name == kSwitch) {
     result.arguments = getSwitchSpecialFormExpressionArgs(expr);
+  } else if (name == kIn) {
+    result.arguments = getInSpecialFormExpressionArgs(expr);
   } else {
-    // Presto special form expressions that are not of type `SWITCH`, such as
-    // `IN`, `AND`, `OR` etc,. are handled in this clause. The list of Presto
+    // Presto special form expressions that are not of type `SWITCH` and `IN`,
+    // such as `AND`, `OR`, are handled in this clause. The list of Presto
     // special form expressions can be found in `kPrestoSpecialForms` in the
     // helper function `isPrestoSpecialForm`.
     auto exprInputs = expr->inputs();
@@ -218,7 +319,7 @@ SpecialFormExpressionPtr VeloxToPrestoExprConverter::getDereferenceExpression(
   const auto dereferenceInputs = std::vector<velox::core::TypedExprPtr>{
       dereferenceExpr->inputs().at(0),
       std::make_shared<velox::core::ConstantTypedExpr>(
-          velox::BIGINT(), static_cast<int64_t>(dereferenceExpr->index()))};
+          velox::INTEGER(), static_cast<int32_t>(dereferenceExpr->index()))};
   for (const auto& input : dereferenceInputs) {
     const auto rowExpr = getRowExpression(input);
     protocol::to_json(j, rowExpr);
@@ -228,10 +329,33 @@ SpecialFormExpressionPtr VeloxToPrestoExprConverter::getDereferenceExpression(
   return result;
 }
 
+LambdaDefinitionExpressionPtr VeloxToPrestoExprConverter::getLambdaExpression(
+    const velox::core::LambdaTypedExpr* lambdaExpr) const {
+  static constexpr char const* kLambda = "lambda";
+
+  json result;
+  result["@type"] = kLambda;
+  const auto& signature = lambdaExpr->signature();
+  std::vector<protocol::TypeSignature> argumentTypes;
+  argumentTypes.reserve(signature->children().size());
+  for (const auto& type : signature->children()) {
+    argumentTypes.emplace_back(getTypeSignature(type));
+  }
+  result["argumentTypes"] = argumentTypes;
+
+  std::vector<std::string> arguments;
+  arguments.reserve(signature->names().size());
+  for (const auto& name : signature->names()) {
+    arguments.emplace_back(name);
+  }
+  result["arguments"] = arguments;
+  result["body"] = getRowExpression(lambdaExpr->body());
+  return result;
+}
+
 CallExpressionPtr VeloxToPrestoExprConverter::getCallExpression(
     const velox::core::CallTypedExpr* expr) const {
   static constexpr char const* kCall = "call";
-  static constexpr char const* kStatic = "$static";
 
   json result;
   result["@type"] = kCall;
@@ -257,10 +381,7 @@ CallExpressionPtr VeloxToPrestoExprConverter::getCallExpression(
   signature.argumentTypes = argumentTypes;
   signature.variableArity = false;
 
-  protocol::BuiltInFunctionHandle builtInFunctionHandle;
-  builtInFunctionHandle._type = kStatic;
-  builtInFunctionHandle.signature = signature;
-  result["functionHandle"] = builtInFunctionHandle;
+  result["functionHandle"] = getFunctionHandle(exprName, signature);
   result["returnType"] = getTypeSignature(expr->type());
   result["arguments"] = json::array();
   for (const auto& exprInput : exprInputs) {
@@ -271,8 +392,7 @@ CallExpressionPtr VeloxToPrestoExprConverter::getCallExpression(
 }
 
 RowExpressionPtr VeloxToPrestoExprConverter::getRowExpression(
-    const velox::core::TypedExprPtr& expr,
-    const RowExpressionPtr& inputRowExpr) const {
+    const velox::core::TypedExprPtr& expr) const {
   switch (expr->kind()) {
     case velox::core::ExprKind::kConstant: {
       const auto* constantExpr =
@@ -312,24 +432,23 @@ RowExpressionPtr VeloxToPrestoExprConverter::getRowExpression(
       }
       return getCallExpression(callTypedExpr);
     }
+    case velox::core::ExprKind::kLambda: {
+      const auto* lambdaExpr =
+          expr->asUnchecked<velox::core::LambdaTypedExpr>();
+      return getLambdaExpression(lambdaExpr);
+    }
     // Presto does not have a RowExpression type for kConcat and kInput Velox
-    // expressions. Presto's expression optimizer does not support optimization
-    // of lambda expressions.
+    // expressions. Presto to Velox expression conversion should not generate
+    // Velox expressions of these types.
     case velox::core::ExprKind::kConcat:
       [[fallthrough]];
     case velox::core::ExprKind::kInput:
       [[fallthrough]];
-    case velox::core::ExprKind::kLambda:
-      [[fallthrough]];
-    default: {
-      // Log Velox to Presto expression conversion error and return the
-      // unoptimized input RowExpression.
-      LOG(ERROR) << fmt::format(
+    default:
+      VELOX_FAIL(
           "Unable to convert Velox expression: {} of kind: {} to Presto RowExpression.",
           expr->toString(),
           velox::core::ExprKindName::toName(expr->kind()));
-      return inputRowExpr;
-    }
   }
 }
 

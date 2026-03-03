@@ -110,8 +110,10 @@ import com.facebook.presto.sql.planner.iterative.rule.PushProjectionThroughExcha
 import com.facebook.presto.sql.planner.iterative.rule.PushProjectionThroughUnion;
 import com.facebook.presto.sql.planner.iterative.rule.PushRemoteExchangeThroughAssignUniqueId;
 import com.facebook.presto.sql.planner.iterative.rule.PushRemoteExchangeThroughGroupId;
+import com.facebook.presto.sql.planner.iterative.rule.PushSemiJoinThroughUnion;
 import com.facebook.presto.sql.planner.iterative.rule.PushTableWriteThroughUnion;
 import com.facebook.presto.sql.planner.iterative.rule.PushTopNThroughUnion;
+import com.facebook.presto.sql.planner.iterative.rule.PushdownThroughUnnest;
 import com.facebook.presto.sql.planner.iterative.rule.RandomizeSourceKeyInSemiJoin;
 import com.facebook.presto.sql.planner.iterative.rule.RemoveCrossJoinWithConstantInput;
 import com.facebook.presto.sql.planner.iterative.rule.RemoveEmptyDelete;
@@ -141,6 +143,7 @@ import com.facebook.presto.sql.planner.iterative.rule.RewriteCaseToMap;
 import com.facebook.presto.sql.planner.iterative.rule.RewriteConstantArrayContainsToInExpression;
 import com.facebook.presto.sql.planner.iterative.rule.RewriteExcludeColumnsFunctionToProjection;
 import com.facebook.presto.sql.planner.iterative.rule.RewriteFilterWithExternalFunctionToProject;
+import com.facebook.presto.sql.planner.iterative.rule.RewriteRowExpressions;
 import com.facebook.presto.sql.planner.iterative.rule.RewriteSpatialPartitioningAggregation;
 import com.facebook.presto.sql.planner.iterative.rule.RuntimeReorderJoinSides;
 import com.facebook.presto.sql.planner.iterative.rule.ScaledWriterRule;
@@ -355,7 +358,8 @@ public class PlanOptimizers
                 estimatedExchangesCostCalculator,
                 ImmutableSet.of(
                         new PushProjectionThroughUnion(),
-                        new PushProjectionThroughExchange()));
+                        new PushProjectionThroughExchange(),
+                        new PushdownThroughUnnest(metadata.getFunctionAndTypeManager())));
 
         IterativeOptimizer simplifyRowExpressionOptimizer = new IterativeOptimizer(
                 metadata,
@@ -570,6 +574,9 @@ public class PlanOptimizers
                         ImmutableSet.<Rule<?>>builder().add(new RemoveRedundantCastToVarcharInJoinClause(metadata.getFunctionAndTypeManager()))
                                 .addAll(new RemoveMapCastRule(metadata.getFunctionAndTypeManager()).rules()).build()));
 
+        builder.add(new IterativeOptimizer(metadata, ruleStats, statsCalculator, estimatedExchangesCostCalculator,
+                new RewriteRowExpressions(expressionOptimizerManager).rules()));
+
         builder.add(new IterativeOptimizer(
                 metadata,
                 ruleStats,
@@ -639,6 +646,12 @@ public class PlanOptimizers
                         statsCalculator,
                         estimatedExchangesCostCalculator,
                         ImmutableSet.of(new LeftJoinNullFilterToSemiJoin(metadata.getFunctionAndTypeManager()))),
+                new IterativeOptimizer(
+                        metadata,
+                        ruleStats,
+                        statsCalculator,
+                        estimatedExchangesCostCalculator,
+                        ImmutableSet.of(new PushSemiJoinThroughUnion())),
                 new IterativeOptimizer(
                         metadata,
                         ruleStats,
@@ -997,7 +1010,7 @@ public class PlanOptimizers
                 featuresConfig.isNativeExecutionEnabled() && featuresConfig.isPrestoSparkExecutionEnvironment()));
 
         // Optimizers above this don't understand local exchanges, so be careful moving this.
-        builder.add(new AddLocalExchanges(metadata, featuresConfig.isNativeExecutionEnabled()));
+        builder.add(new AddLocalExchanges(metadata, statsCalculator, featuresConfig.isNativeExecutionEnabled()));
 
         // Optimizers above this do not need to care about aggregations with the type other than SINGLE
         // This optimizer must be run after all exchange-related optimizers
@@ -1069,7 +1082,7 @@ public class PlanOptimizers
                         featuresConfig.isPrestoSparkExecutionEnvironment()))));
         builder.add(new MetadataDeleteOptimizer(metadata));
 
-        builder.add(new RewriteWriterTarget());
+        builder.add(new RewriteWriterTarget(metadata, accessControl));
 
         // TODO: consider adding a formal final plan sanitization optimizer that prepares the plan for transmission/execution/logging
         // TODO: figure out how to improve the set flattening optimizer so that it can run at any point
