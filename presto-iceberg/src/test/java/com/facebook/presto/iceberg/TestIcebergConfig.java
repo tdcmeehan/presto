@@ -77,7 +77,7 @@ public class TestIcebergConfig
                 .setMaterializedViewStoragePrefix("__mv_storage__")
                 .setDynamicFilterExtendedMetrics(false)
                 .setDynamicFilterWarmupEnabled(true)
-                .setDynamicFilterWarmupWeightPerTask(1.0));
+                .setDynamicFilterWarmupWeightPerTask(Runtime.getRuntime().availableProcessors()));
     }
 
     @Test

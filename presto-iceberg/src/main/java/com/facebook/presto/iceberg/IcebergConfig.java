@@ -79,7 +79,18 @@ public class IcebergConfig
     private String materializedViewStoragePrefix = "__mv_storage__";
     private boolean dynamicFilterExtendedMetrics;
     private boolean dynamicFilterWarmupEnabled = true;
-    private double dynamicFilterWarmupWeightPerTask = 1.0;
+    // Controls how many splits (by weight) each source stage task receives during the warmup
+    // phase before dynamic filters are available. The total warmup budget is:
+    // warmupWeightPerTask * taskCount. The goal is to keep all drivers on a worker busy
+    // during warmup rather than idling while waiting for the dynamic filter from the build
+    // side. Each worker task runs up to max-drivers-per-task concurrent drivers (typically
+    // equal to the number of CPU cores), so this value should approximate the worker's core
+    // count to fully utilize the pipeline during the warmup window.
+    //
+    // We default to the coordinator's core count as a proxy, since in most deployments the
+    // coordinator and workers use the same instance type. Override this if workers have a
+    // different core count or a non-default max-drivers-per-task configuration.
+    private double dynamicFilterWarmupWeightPerTask = Runtime.getRuntime().availableProcessors();
 
     @NotNull
     public FileFormat getFileFormat()
