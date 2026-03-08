@@ -24,10 +24,12 @@ import com.facebook.presto.cost.TaskCountEstimator;
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
 import com.facebook.presto.spi.plan.CteConsumerNode;
+import com.facebook.presto.spi.plan.EquiJoinClause;
 import com.facebook.presto.spi.plan.JoinNode;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.ValuesNode;
+import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.spi.statistics.HistoryBasedSourceInfo;
 import com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType;
 import com.facebook.presto.sql.planner.iterative.Lookup;
@@ -39,19 +41,31 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Ordering;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static com.facebook.presto.SystemSessionProperties.confidenceBasedBroadcastEnabled;
+import static com.facebook.presto.SystemSessionProperties.getDistributedDynamicFilterCardinalityRatioThreshold;
+import static com.facebook.presto.SystemSessionProperties.getDistributedDynamicFilterStrategy;
 import static com.facebook.presto.SystemSessionProperties.getJoinDistributionType;
 import static com.facebook.presto.SystemSessionProperties.getJoinMaxBroadcastTableSize;
+import static com.facebook.presto.SystemSessionProperties.isDistributedDynamicFilterEnabled;
+import static com.facebook.presto.SystemSessionProperties.isDistributedDynamicFilterExtendedMetrics;
 import static com.facebook.presto.SystemSessionProperties.isSizeBasedJoinDistributionTypeEnabled;
 import static com.facebook.presto.SystemSessionProperties.isUseBroadcastJoinWhenBuildSizeSmallProbeSizeUnknownEnabled;
 import static com.facebook.presto.SystemSessionProperties.treatLowConfidenceZeroEstimationAsUnknownEnabled;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PLAN_CREATED_FAVORABLE_RATIO;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PLAN_SKIPPED_HIGH_CARDINALITY;
+import static com.facebook.presto.common.RuntimeUnit.NONE;
 import static com.facebook.presto.cost.CostCalculatorWithEstimatedExchanges.calculateJoinCostWithoutOutput;
 import static com.facebook.presto.spi.plan.JoinDistributionType.PARTITIONED;
 import static com.facebook.presto.spi.plan.JoinDistributionType.REPLICATED;
+import static com.facebook.presto.spi.plan.JoinType.INNER;
+import static com.facebook.presto.spi.plan.JoinType.RIGHT;
 import static com.facebook.presto.spi.statistics.SourceInfo.ConfidenceLevel.LOW;
+import static com.facebook.presto.sql.analyzer.FeaturesConfig.DistributedDynamicFilterStrategy.COST_BASED;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType.AUTOMATIC;
 import static com.facebook.presto.sql.planner.iterative.ConfidenceBasedBroadcastUtil.confidenceBasedBroadcast;
 import static com.facebook.presto.sql.planner.iterative.ConfidenceBasedBroadcastUtil.treatLowConfidenceZeroEstimationsAsUnknown;
@@ -62,6 +76,8 @@ import static com.facebook.presto.sql.planner.plan.Patterns.join;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static java.lang.Double.NaN;
+import static java.lang.Double.isFinite;
+import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 public class DetermineJoinDistributionType
@@ -103,12 +119,16 @@ public class DetermineJoinDistributionType
     public Result apply(JoinNode joinNode, Captures captures, Context context)
     {
         JoinDistributionType joinDistributionType = getJoinDistributionType(context.getSession());
+        JoinNode resultNode;
         if (joinDistributionType == AUTOMATIC) {
-            PlanNode resultNode = getCostBasedJoin(joinNode, context);
+            resultNode = (JoinNode) getCostBasedJoin(joinNode, context);
             statsSource = context.getStatsProvider().getStats(joinNode).getSourceInfo().getSourceInfoName();
-            return Result.ofPlanNode(resultNode);
         }
-        return Result.ofPlanNode(getSyntacticOrderJoin(joinNode, context, joinDistributionType));
+        else {
+            resultNode = getSyntacticOrderJoin(joinNode, context, joinDistributionType);
+        }
+        resultNode = maybeAddDynamicFilters(resultNode, context);
+        return Result.ofPlanNode(resultNode);
     }
 
     public static boolean isBelowMaxBroadcastSize(JoinNode joinNode, Context context)
@@ -317,5 +337,71 @@ public class DetermineJoinDistributionType
     {
         PlanNodeStatsEstimate statsEstimate = context.getStatsProvider().getStats(planNode);
         return statsEstimate.confidenceLevel() == LOW && statsEstimate.getOutputRowCount() == 0;
+    }
+
+    private static JoinNode maybeAddDynamicFilters(JoinNode node, Context context)
+    {
+        Session session = context.getSession();
+        if (!isDistributedDynamicFilterEnabled(session)) {
+            return node;
+        }
+        if (node.getType() != INNER && node.getType() != RIGHT) {
+            return node;
+        }
+        if (!node.getDynamicFilters().isEmpty() || node.getCriteria().isEmpty()) {
+            return node;
+        }
+
+        boolean costBased = getDistributedDynamicFilterStrategy(session) == COST_BASED;
+        boolean extendedMetrics = isDistributedDynamicFilterExtendedMetrics(session);
+        Map<String, VariableReferenceExpression> dynamicFilters = new LinkedHashMap<>();
+        for (EquiJoinClause clause : node.getCriteria()) {
+            if (costBased && !shouldCreateFilter(clause.getLeft().getName(),
+                    context.getStatsProvider().getStats(node.getRight()),
+                    context.getStatsProvider().getStats(node.getLeft()),
+                    session, extendedMetrics)) {
+                continue;
+            }
+            String filterId = context.getIdAllocator().getNextId().toString();
+            dynamicFilters.put(filterId, clause.getRight());
+        }
+
+        if (dynamicFilters.isEmpty()) {
+            return node;
+        }
+
+        return new JoinNode(
+                node.getSourceLocation(),
+                node.getId(),
+                node.getStatsEquivalentPlanNode(),
+                node.getType(),
+                node.getLeft(),
+                node.getRight(),
+                node.getCriteria(),
+                node.getOutputVariables(),
+                node.getFilter(),
+                node.getLeftHashVariable(),
+                node.getRightHashVariable(),
+                node.getDistributionType(),
+                dynamicFilters);
+    }
+
+    private static boolean shouldCreateFilter(String columnName, PlanNodeStatsEstimate buildStats, PlanNodeStatsEstimate probeStats, Session session, boolean extendedMetrics)
+    {
+        double buildRowCount = buildStats.getOutputRowCount();
+        double probeRowCount = probeStats.getOutputRowCount();
+
+        if (!isFinite(buildRowCount) || !isFinite(probeRowCount)) {
+            return true;
+        }
+
+        double threshold = getDistributedDynamicFilterCardinalityRatioThreshold(session);
+        boolean create = probeRowCount > 0 && (buildRowCount / probeRowCount) < threshold;
+        if (extendedMetrics) {
+            session.getRuntimeStats().addMetricValue(
+                    format("%s[%s]", create ? DYNAMIC_FILTER_PLAN_CREATED_FAVORABLE_RATIO : DYNAMIC_FILTER_PLAN_SKIPPED_HIGH_CARDINALITY, columnName),
+                    NONE, 1);
+        }
+        return create;
     }
 }
