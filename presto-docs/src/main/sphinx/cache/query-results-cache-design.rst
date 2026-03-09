@@ -684,6 +684,7 @@ Property                                           Default    Description
 ``query-results-cache.input-stats-threshold``      ``0.1``    Threshold for input stats comparison
 ``query-results-cache.max-cache-entries``           ``1000``   Max entries in the cache
 ``query-results-cache.cleanup-interval``           ``5m``     How often to clean up expired entries
+``query-results-cache.encryption-enabled``         ``true``   Encrypt cached result pages (AES-256-CTR)
 =================================================  =========  =============================================
 
 Session properties
@@ -755,8 +756,9 @@ Modified files
 File                                                      Change
 ========================================================  ==========================================
 ``PlanVisitor.java``                                      Add ``visitCachedResult()``
-``SpoolingOutputBuffer.java``                             Add ``retainHandlesForCache`` flag +
-                                                          ``getRetainedHandles()``
+``SpoolingOutputBuffer.java``                             Add ``retainHandlesForCache`` flag,
+                                                          ``getRetainedHandles()``, and
+                                                          ``Optional<SpillCipher>`` for encryption
 ``SystemSessionProperties.java``                          Add cache session properties
 ``FeaturesConfig.java`` (or new config)                   Add cache config properties
 ``PlanOptimizers.java``                                   Register ``QueryResultsCacheOptimizer``
@@ -815,6 +817,259 @@ Queries containing non-deterministic functions (``rand()``, ``now()``,
 ``QueryResultsCacheOptimizer`` checks for these by traversing the plan and
 examining each ``CallExpression`` against a list of known non-deterministic
 functions.
+
+
+Encryption
+==========
+
+Cached result files live in ``TempStorage`` for extended periods (hours, unlike
+spill files which are ephemeral). They must be protected against unauthorized
+access at the storage layer.
+
+Current state: spooling has no encryption
+-----------------------------------------
+
+Today, the ``SpoolingOutputBuffer`` writes raw ``SerializedPage`` bytes to
+``TempStorage`` with **no encryption**. The existing encryption infrastructure
+— ``AesSpillCipher`` (AES-256-CTR) and ``PagesSerde`` with ``SpillCipher``
+support — is wired only for spill-to-disk (hash joins, sorts exceeding memory),
+not for spooling output buffers.
+
+=======================  ==============================  ============================
+Aspect                   Spill (joins/sorts)             Spooling Output Buffer
+=======================  ==============================  ============================
+Encryption               AES-256-CTR via ``SpillCipher`` None
+Config                   ``spill-encryption-enabled``    No equivalent
+Key lifetime             Per-spiller, destroyed on close N/A
+Pages written by         ``PagesSerde`` with cipher      ``PageDataOutput`` — raw
+=======================  ==============================  ============================
+
+Existing encryption primitives
+------------------------------
+
+Presto already has a complete page-level encryption pipeline:
+
+1. **``SpillCipher``** interface
+   (``presto-spi/.../spi/spiller/SpillCipher.java``):
+   ``encrypt(byte[])`` and ``decrypt(byte[])`` with ``destroy()`` for key
+   lifecycle.
+
+2. **``AesSpillCipher``** implementation
+   (``presto-main-base/.../spiller/AesSpillCipher.java``):
+   AES-256-CTR with a fresh 256-bit key per cipher instance and a new IV per
+   encryption operation.
+
+3. **``PagesSerde``** (``presto-spi/.../spi/page/PagesSerde.java``):
+   ``serialize()`` applies compression then encryption (if cipher present);
+   ``deserialize()`` applies decryption then decompression. The ``ENCRYPTED``
+   bit in ``PageCodecMarker`` tracks whether a ``SerializedPage`` is encrypted.
+
+4. **``PageCodecMarker``** (``presto-spi/.../spi/page/PageCodecMarker.java``):
+   Bit-flag enum with ``COMPRESSED`` (bit 1), ``ENCRYPTED`` (bit 2),
+   ``CHECKSUMMED`` (bit 3).
+
+The data flow for encrypted spill is::
+
+    Write: Page → serialize → compress → encrypt → set ENCRYPTED marker → write
+    Read:  read → check ENCRYPTED marker → decrypt → decompress → Page
+
+Threat model
+------------
+
+Three threats to address:
+
+**1. Storage-level access** — An attacker reads ``TempStorage`` files directly
+(filesystem access for local storage, bucket access for S3).
+
+*Mitigation*: Encrypt pages before writing, using the existing
+``AesSpillCipher`` / ``PagesSerde`` pipeline.
+
+**2. Key management** — Where does the encryption key live, and how long?
+
+For spill, each ``AesSpillCipher`` generates a fresh key in memory and destroys
+it when the spiller closes. The key never leaves the JVM and the same JVM that
+writes also reads. For the results cache, data outlives the query (and
+potentially the JVM), so the key must be persisted alongside the cache entry.
+
+*Mitigation*: Store the data encryption key (DEK) in the cache metadata entry.
+See `Key management options`_ below.
+
+**3. Handle guessability** — An attacker constructs a ``TempStorageHandle``
+path and reads cached results without going through Presto.
+
+*Mitigation*: ``LocalTempStorage`` already uses ``randomUUID()`` for filenames.
+Combined with encryption, knowing the path is insufficient — the data is
+ciphertext without the key.
+
+Encryption design
+-----------------
+
+Wire ``SpillCipher`` into the spooling + cache path
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: java
+
+    public class SpoolingOutputBuffer implements OutputBuffer {
+
+        // NEW: optional cipher for encrypting spooled pages
+        private final Optional<SpillCipher> spillCipher;
+
+        private synchronized void flush() {
+            // Instead of raw PageDataOutput, use cipher-aware serialization
+            PagesSerde serde = pagesSerdeFactory.createPagesSerdeForSpill(spillCipher);
+            List<DataOutput> dataOutputs = pages.stream()
+                .map(page -> new PageDataOutput(serde.serialize(page)))
+                .collect(toImmutableList());
+
+            ListenableFuture<TempStorageHandle> handleFuture = executor.submit(() -> {
+                TempDataSink dataSink = tempStorage.create(tempDataOperationContext);
+                dataSink.write(dataOutputs);
+                return dataSink.commit();
+            });
+            // ... rest of existing flush logic
+        }
+    }
+
+This also fixes the pre-existing gap where spooled output data is unencrypted,
+independent of the cache feature.
+
+Store the DEK in the cache entry
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: java
+
+    public class QueryResultsCacheEntry {
+        // ... existing fields ...
+        private final Optional<byte[]> encryptionKey;  // 256-bit AES DEK
+    }
+
+The ``QueryResultsCacheWriter`` extracts the key from the ``SpillCipher``
+before it is destroyed:
+
+.. code-block:: java
+
+    // In QueryResultsCacheWriter.cacheResults():
+    Optional<byte[]> encryptionKey = Optional.empty();
+    if (spillCipher.isPresent()) {
+        encryptionKey = Optional.of(spillCipher.get().getKey());
+        // Do NOT destroy the cipher yet — the key is transferred to the cache entry
+    }
+
+The ``CachedResultOperator`` reconstructs the cipher from the stored key for
+decryption:
+
+.. code-block:: java
+
+    // In CachedResultOperator:
+    SpillCipher cipher = new AesSpillCipher(entry.getEncryptionKey().get());
+    PagesSerde serde = pagesSerdeFactory.createPagesSerdeForSpill(Optional.of(cipher));
+
+    try (SliceInput input = ...) {
+        Iterator<SerializedPage> pages = readSerializedPages(input);
+        // Pages are decrypted during deserialization via the serde
+    }
+    finally {
+        cipher.destroy();  // Nullify key from memory
+    }
+
+.. _`Key management options`:
+
+Key management options
+~~~~~~~~~~~~~~~~~~~~~~
+
+Three options with different security/complexity tradeoffs:
+
+**Option A: DEK stored in cache metadata store (recommended for v1)**
+
+The 256-bit AES key is stored as a field in ``QueryResultsCacheEntry``,
+persisted in the ``QueryResultsCacheProvider`` (in-memory map, Redis, etc.).
+
+- *Pro*: Simple. No external dependencies. Matches existing spill model.
+- *Con*: If the metadata store is compromised, the attacker has both key and
+  data location. Security depends entirely on the metadata store's access
+  control.
+- *Assessment*: Acceptable for v1. An attacker with access to the metadata
+  store can already see query text, schemas, and table names. The DEK being
+  co-located does not significantly worsen the threat model. Encryption still
+  protects against storage-only attacks (e.g., S3 bucket misconfiguration).
+
+**Option B: Envelope encryption with external KMS (future)**
+
+Generate a fresh DEK per cache entry. Encrypt the DEK with a KMS master key.
+Store only the wrapped (encrypted) DEK in the cache entry. On read, call KMS
+to unwrap the DEK, then decrypt pages.
+
+- *Pro*: Proper key management. Compromise of metadata store alone is
+  insufficient — attacker also needs KMS access.
+- *Con*: Adds KMS dependency and latency on cache reads.
+- *Assessment*: Right for security-sensitive deployments. Implement as a v2
+  enhancement, potentially as a pluggable ``CacheKeyManager`` SPI.
+
+**Option C: Storage-layer encryption (defense in depth)**
+
+Use S3 server-side encryption (SSE-S3, SSE-KMS) or encrypted filesystems
+(LUKS, dm-crypt) for local disk. This is orthogonal to Presto-level encryption
+and can be enabled independently.
+
+- *Pro*: Zero code in Presto. Transparent.
+- *Con*: SSE-S3 decrypts transparently on read, so does not protect against
+  an attacker with S3 API access. SSE-KMS helps but requires IAM policy.
+- *Assessment*: Recommended as a **complementary** layer, not a replacement
+  for Presto-level encryption.
+
+**v1 recommendation**: Option A + Option C. Presto-level AES-256-CTR encryption
+with the DEK in the metadata store, plus storage-layer encryption as defense in
+depth. Option B (KMS) as a future enhancement.
+
+Key lifecycle
+~~~~~~~~~~~~~
+
+1. **Generation**: When a query is registered for caching, a new
+   ``AesSpillCipher`` is created with a fresh 256-bit key. The cipher is
+   passed to the ``SpoolingOutputBuffer`` for encrypting pages during flush.
+
+2. **Persistence**: After the query completes, the key bytes are extracted
+   from the cipher and stored in the ``QueryResultsCacheEntry``.
+
+3. **Read**: On cache hit, the ``CachedResultOperator`` reconstructs an
+   ``AesSpillCipher`` from the stored key, uses it for decryption, then
+   calls ``cipher.destroy()`` to nullify the key in memory.
+
+4. **Expiration**: When the cache entry is evicted or invalidated, the entry
+   (including the key) is removed from the metadata store. The associated
+   ``TempStorage`` files (which are ciphertext) are deleted.
+
+Configuration
+~~~~~~~~~~~~~
+
+====================================================  =========  =====================================
+Property                                              Default    Description
+====================================================  =========  =====================================
+``query-results-cache.encryption-enabled``            ``true``   Encrypt cached result pages
+====================================================  =========  =====================================
+
+Default is **on**. Unlike spill encryption (which trades CPU for security on
+ephemeral data), cached data lives for hours and the performance cost of
+AES-256-CTR is negligible relative to I/O.
+
+Security summary
+~~~~~~~~~~~~~~~~
+
+=========================  ================================================  =============
+Layer                      Protection                                        Status
+=========================  ================================================  =============
+Page-level encryption      AES-256-CTR via existing ``SpillCipher``/          Wire into
+                           ``PagesSerde``                                     spooling path
+Key storage                DEK stored in ``QueryResultsCacheEntry``           New field
+Key management             In-process generation, metadata store storage      v1
+                           KMS envelope encryption                            Future (v2)
+Storage-layer encryption   S3-SSE or encrypted disk                           Orthogonal
+Handle guessability        UUID-based filenames                               Already exists
+Access control             User-scoped cache keys                             Already in
+                                                                              design
+Key lifecycle              ``cipher.destroy()`` nullifies in-memory key       Follow spill
+                                                                              pattern
+=========================  ================================================  =============
 
 
 .. _`Future Work`:
