@@ -17,11 +17,14 @@ The design reuses two existing Presto subsystems:
 
 - **HBO canonicalization** — produces a deterministic hash of the query plan,
   used as the cache key.
-- **Spooling output buffers + TempStorage** — already serialize result pages to
-  pluggable storage (local disk, S3), used as the cache storage.
+- **TempStorage** — pluggable storage (local disk, S3) for serialized result
+  pages.
 
-The new component — the **QueryResultsCacheManager** — coordinates lookup,
-validation, population, and invalidation.
+The design is modeled on the **Fragment Result Cache (FRC)**, which caches
+per-fragment results at the execution boundary without modifying the query
+plan. The query results cache applies the same principle at the whole-query
+level: intercept at the execution boundary (``SqlQueryExecution.start()``),
+not in the optimizer chain.
 
 
 Goals and Non-Goals
@@ -31,13 +34,13 @@ Goals
 -----
 
 - Eliminate redundant execution of identical SELECT queries.
-- Zero-copy cache population by retaining spooled output files that are already
-  written during normal query execution.
 - Pluggable metadata store so deployments can choose in-memory, Redis, or other
   backends.
 - Pluggable result storage via the existing ``TempStorage`` SPI.
 - Input-table-aware invalidation: cache entries are invalidated when underlying
   table data changes beyond a configurable threshold.
+- No plan modifications — caching is transparent to the optimizer, fragmenter,
+  and execution engine.
 
 Non-Goals (v1)
 --------------
@@ -54,28 +57,102 @@ Architecture
 
 ::
 
-                                                       ┌─── Cache MISS ────┐
-                                                       │                   │
-    SQL query                                          v                   │
-       │                                        Normal execution           │
-       v                                        (with spooling)            │
-    Parse → Analyze → Optimize                         │                   │
-       │                                               v                   │
-       └──> QueryResultsCacheOptimizer ──┐      Plan fragmenter            │
-                    │                    │      AddExchanges               │
-               Cache HIT                │      Distribute                  │
-                    │                    │      Execute                     │
-                    v                    │             │                    │
-            CachedResultNode             │             v                   │
-            (single fragment,            │      SpoolingOutputBuffer        │
-             coordinator only)           │      (retainHandles=true)       │
-                    │                    │             │                    │
-                    v                    │             v                   │
-            CachedResultOperator         │      QueryResultsCacheWriter    │
-            reads from TempStorage       │      stores handles in cache    │
-                    │                    │                                  │
-                    v                    v                                  │
-               Serve to client    Serve to client                          │
+    SQL query
+       │
+       v
+    Parse → Analyze → Optimize → Compute canonical plan hash
+       │
+       ├── Cache HIT ──────────────────────────────┐
+       │   (skip scheduling, skip execution)        │
+       │                                            v
+       │                              Read pages from TempStorage
+       │                              Feed into output buffer
+       │                              Serve to client
+       │
+       └── Cache MISS ─────────────────────────────┐
+            (normal execution)                      │
+                                                    v
+            Plan fragmenter → AddExchanges → Distribute → Execute
+                                                    │
+                                                    v
+                                              Query completes
+                                              QueryResultsCacheWriter
+                                              collects output pages,
+                                              writes to TempStorage,
+                                              stores cache entry
+
+The key insight, borrowed from the Fragment Result Cache, is: **don't modify
+the plan to support caching — intercept at the execution boundary**. On a
+cache hit, the coordinator reads pages directly from ``TempStorage`` and feeds
+them to the client without creating a scheduler, distributing fragments, or
+running any operators.
+
+
+Lesson from the Fragment Result Cache
+=====================================
+
+Presto already has a **fragment result cache** (FRC) that caches per-fragment
+results. Studying how it works informs this design.
+
+How FRC works
+-------------
+
+FRC operates inside the ``Driver`` at the operator pipeline boundary:
+
+1. **Read path**: When a new split is assigned, the ``Driver`` checks the cache
+   (``FragmentResultCacheManager.get(hashedPlan, split)``). On a cache hit,
+   cached pages are fed directly to the output operator, bypassing the entire
+   operator pipeline (``Driver.java:422-433``).
+
+2. **Write path**: On a cache miss, as pages flow from the second-to-last
+   operator to the output operator, the ``Driver`` intercepts and accumulates
+   them (``Driver.java:452-454``). After the pipeline completes, the pages are
+   written to the cache (``Driver.java:489-498``).
+
+Key properties of FRC:
+
+- **No plan modification**. The plan is identical whether FRC hits or misses.
+  The ``Driver`` short-circuits at runtime.
+- **Split-granular**. Cache key is ``(hashedCanonicalPlan, SplitIdentifier)``.
+- **Worker-local**. Pages never cross the network for caching.
+- **No new PlanNode, no new Operator**. It is purely a ``Driver``-level concern.
+
+Why this is better than plan rewriting
+--------------------------------------
+
+An earlier draft of this design proposed a ``CachedResultNode`` PlanNode, a
+``CachedResultOperator``, and a ``QueryResultsCacheOptimizer`` that rewrites
+the plan on cache hit. This had several problems:
+
+- **Large surface area**: Every plan validator, optimizer, and visitor must
+  handle the new node type.
+- **Coupling to SpoolingOutputBuffer**: The write path depended on retaining
+  handles from the spooling output buffer, tangling cache lifecycle with
+  output buffer lifecycle.
+- **Fragile write path**: Reaching into the output stage's task after query
+  completion to extract buffer state is timing-dependent.
+
+The FRC approach — intercept at the boundary, leave the plan alone — is
+simpler and more robust.
+
+Comparison table
+----------------
+
+=========================  ===========================  ===============================
+Aspect                     Fragment Result Cache        Query Results Cache
+=========================  ===========================  ===============================
+**Level**                  Per-fragment, per-split      Entire query result
+**Intercept point**        ``Driver`` (worker)          ``SqlQueryExecution`` (coord.)
+**Cache key**              ``(plan hash, split ID)``    ``(canonical plan hash, user)``
+**Plan changes**           None                         None
+**New operators**          None                         None
+**What's cached**          ``List<Page>`` on local disk ``SerializedPage`` in TempStorage
+**Where it runs**          Worker nodes                 Coordinator
+**Bypass**                 Skips operator pipeline      Skips entire query execution
+**Invalidation**           TTL + LRU eviction           TTL + input stats comparison
+=========================  ===========================  ===============================
+
+Both caches are **complementary** and can be enabled simultaneously.
 
 
 Cache Key
@@ -147,8 +224,8 @@ session property.
 What gets hashed
 ----------------
 
-The hash is computed over the **OutputNode** — the root of every SELECT plan.
-This includes the entire plan subtree: all joins, filters, aggregations,
+The hash is computed over the **OutputNode's source** — the root of the query
+plan subtree below the output. This includes all joins, filters, aggregations,
 projections, and table scans. Two queries that produce equivalent plans after
 optimization will have the same hash, regardless of superficial SQL differences
 like whitespace, alias names, or predicate order.
@@ -156,11 +233,15 @@ like whitespace, alias names, or predicate order.
 Full cache key
 --------------
 
-The full cache key is: ``(canonical_plan_hash, canonicalization_strategy)``.
+The full cache key is:
+``(canonical_plan_hash, canonicalization_strategy, user_identity_hash)``.
 
 Input table statistics are **not** part of the cache key. Instead, they are
 stored as metadata in the cache entry and used for **validation** at lookup time
 (see `Invalidation`_).
+
+Including the user identity hash ensures cache entries respect access control
+(see `Security Considerations`_).
 
 
 Cache Storage
@@ -169,58 +250,14 @@ Cache Storage
 What gets stored
 ----------------
 
-When spooling is enabled, the ``SpoolingOutputBuffer`` already writes
-``SerializedPage`` objects to ``TempStorage`` during query execution. These are
-fully encoded result pages ready to be served to clients. The query results
-cache reuses these exact files — no additional serialization is needed.
+Query result pages are written to ``TempStorage`` as ``SerializedPage`` objects
+using ``PagesSerdeUtil.writePages()``. This is the same serialization format
+used by the fragment result cache, the spill subsystem, and shuffle exchanges.
 
-The retention problem
----------------------
-
-Currently, ``SpoolingOutputBuffer.acknowledge()`` deletes spooled files as the
-client reads them. By the time a query completes and results are consumed, the
-spooled data is gone.
-
-Solution: retainHandles flag
-----------------------------
-
-Add a ``retainHandlesForCache`` flag to ``SpoolingOutputBuffer``. When set:
-
-- ``HandleInfo.removeFile()`` becomes a no-op (files are not deleted on
-  acknowledge).
-- ``getRetainedHandles()`` exposes the list of ``TempStorageHandle`` objects
-  after query completion.
-
-This is the simplest approach: no double-write, no extra I/O. The exact same
-files written during normal execution become the cache storage.
-
-.. code-block:: java
-
-    public class SpoolingOutputBuffer implements OutputBuffer {
-
-        // NEW: when true, don't delete files on acknowledge
-        private final AtomicBoolean retainHandlesForCache = new AtomicBoolean(false);
-
-        // NEW: export handles for caching after query completes
-        public synchronized List<RetainedHandleInfo> getRetainedHandles() {
-            return handleInfoQueue.stream()
-                .map(h -> new RetainedHandleInfo(h.getHandleFuture(), h.getBytes(), h.getPageCount()))
-                .collect(toImmutableList());
-        }
-
-        private class HandleInfo {
-            public void removeFile() {
-                if (retainHandlesForCache.get()) {
-                    return; // keep files for cache
-                }
-                // ... existing deletion logic
-            }
-        }
-    }
-
-When the flag is set, file cleanup responsibility transfers to the
-``QueryResultsCacheManager``, which deletes the files when the cache entry
-expires or is explicitly invalidated.
+The ``QueryResultsCacheWriter`` writes pages to ``TempStorage`` directly,
+decoupled from the output buffer. This is the same pattern as
+``FileFragmentResultCacheManager``, which writes ``List<Page>`` to disk files
+independently of the operator pipeline.
 
 
 Cache Metadata Store (SPI)
@@ -242,17 +279,17 @@ QueryResultsCacheProvider
          * Look up cached results by canonical plan hash.
          * Returns empty if no entry exists or the entry is expired.
          */
-        Optional<QueryResultsCacheEntry> getCachedResult(String planHash);
+        Optional<QueryResultsCacheEntry> getCachedResult(String cacheKey);
 
         /**
          * Store a cache entry after successful query completion.
          */
-        void putCachedResult(String planHash, QueryResultsCacheEntry entry);
+        void putCachedResult(String cacheKey, QueryResultsCacheEntry entry);
 
         /**
          * Explicitly invalidate a cache entry (e.g., due to data change).
          */
-        void invalidate(String planHash);
+        void invalidate(String cacheKey);
 
         /**
          * Remove expired entries and clean up associated storage.
@@ -277,6 +314,7 @@ QueryResultsCacheEntry
         private final List<PlanStatistics> inputTableStatistics; // For invalidation
         private final long totalRows;
         private final long totalBytes;
+        private final Optional<byte[]> encryptionKey;     // DEK for encrypted entries
     }
 
 Default implementation
@@ -306,197 +344,123 @@ without modifying Presto core.
 Read Path
 =========
 
-QueryResultsCacheOptimizer
---------------------------
+Cache check in SqlQueryExecution.start()
+-----------------------------------------
 
-A new ``PlanOptimizer`` that intercepts the plan **after all other
-optimizations** but **before AddExchanges**. If the cache has a valid entry,
-the plan is rewritten to skip execution entirely.
+The cache check happens **after optimization** (we need the optimized plan
+to compute the canonical hash) but **before scheduling**. On a cache hit,
+scheduling and execution are skipped entirely.
 
 .. code-block:: java
 
-    public class QueryResultsCacheOptimizer implements PlanOptimizer {
-        @Override
-        public PlanOptimizerResult optimize(
-                PlanNode plan,
-                Session session,
-                TypeProvider types,
-                VariableAllocator variableAllocator,
-                PlanNodeIdAllocator idAllocator,
-                WarningCollector warningCollector) {
-
-            if (!isQueryResultsCacheEnabled(session)) {
-                return PlanOptimizerResult.optimizerResult(plan, false);
-            }
-            if (!(plan instanceof OutputNode)) {
-                return PlanOptimizerResult.optimizerResult(plan, false);
+    // In SqlQueryExecution.start()
+    @Override
+    public void start() {
+        try {
+            if (!stateMachine.transitionToPlanning()) {
+                return;
             }
 
-            OutputNode outputNode = (OutputNode) plan;
+            PlanRoot plan = createLogicalPlanAndOptimize();
 
-            // 1. Reject non-deterministic plans
-            if (containsNonDeterministicFunctions(outputNode)) {
-                return PlanOptimizerResult.optimizerResult(plan, false);
+            // NEW: Check the query results cache
+            if (isQueryResultsCacheEnabled(getSession())) {
+                Optional<String> cacheKey = computeCacheKey(plan);
+                if (cacheKey.isPresent()) {
+                    Optional<QueryResultsCacheEntry> cached =
+                        cacheManager.getCachedResult(cacheKey.get());
+                    if (cached.isPresent() && isValid(getSession(), plan, cached.get())) {
+                        serveCachedResult(plan, cached.get());
+                        return;
+                    }
+                    // Cache miss: register for population on completion
+                    cacheManager.registerForPopulation(
+                        getSession().getQueryId(), cacheKey.get(), plan);
+                }
             }
 
-            // 2. Compute canonical plan hash
-            PlanCanonicalizationStrategy strategy = getCacheStrategy(session);
-            Optional<String> planHash = planCanonicalInfoProvider.hash(
-                session, outputNode.getSource(), strategy, false);
-            if (!planHash.isPresent()) {
-                return PlanOptimizerResult.optimizerResult(plan, false);
-            }
-
-            // 3. Check cache
-            Optional<QueryResultsCacheEntry> entry =
-                cacheManager.getCachedResult(planHash.get());
-            if (!entry.isPresent()) {
-                // Register this query for cache population on completion
-                cacheManager.registerForCaching(session.getQueryId(), planHash.get());
-                return PlanOptimizerResult.optimizerResult(plan, false);
-            }
-
-            // 4. Validate entry
-            if (!validateCacheEntry(session, outputNode, entry.get())) {
-                return PlanOptimizerResult.optimizerResult(plan, false);
-            }
-
-            // 5. Replace source with CachedResultNode
-            CachedResultNode cachedNode = new CachedResultNode(
-                outputNode.getSourceLocation(),
-                idAllocator.getNextId(),
-                outputNode.getOutputVariables(),
-                entry.get().getSerializedHandles(),
-                entry.get().getTempStorageName());
-
-            OutputNode newOutput = new OutputNode(
-                outputNode.getSourceLocation(),
-                outputNode.getId(),
-                outputNode.getStatsEquivalentPlanNode(),
-                cachedNode,
-                outputNode.getColumnNames(),
-                outputNode.getOutputVariables());
-
-            return PlanOptimizerResult.optimizerResult(newOutput, true);
+            // Normal path: schedule and execute
+            metadata.beginQuery(getSession(), plan.getConnectors());
+            createQueryScheduler(plan);
+            // ... rest of existing start() logic
         }
     }
+
+Serving cached results
+~~~~~~~~~~~~~~~~~~~~~~
+
+On a cache hit, the coordinator must feed pages to the client without
+creating a scheduler. The flow mirrors what ``createQueryScheduler()`` does
+to set up the client output path, but reads pages from ``TempStorage``
+instead of from a distributed execution:
+
+.. code-block:: java
+
+    private void serveCachedResult(PlanRoot plan, QueryResultsCacheEntry entry) {
+        SubPlan outputStagePlan = plan.getRoot();
+        OutputNode outputNode = (OutputNode) outputStagePlan.getFragment().getRoot();
+
+        // 1. Set output column metadata (same as normal path, line 669)
+        stateMachine.setColumns(
+            outputNode.getColumnNames(),
+            outputStagePlan.getFragment().getTypes());
+
+        // 2. Create a local output buffer to feed pages to the client
+        //    The Query object's ExchangeClient will read from this buffer
+        //    via the standard result-fetching protocol
+        OutputBuffers outputBuffers = createInitialEmptyOutputBuffers(SINGLE_DISTRIBUTION)
+            .withBuffer(OUTPUT_BUFFER_ID, BROADCAST_PARTITION_ID)
+            .withNoMoreBufferIds();
+
+        // 3. Read pages from TempStorage and enqueue into the buffer
+        executor.submit(() -> {
+            try {
+                TempStorage storage = tempStorageManager.getTempStorage(
+                    entry.getTempStorageName());
+                PagesSerde serde = createPagesSerde(entry);
+
+                for (byte[] handleBytes : entry.getSerializedHandles()) {
+                    TempStorageHandle handle = storage.deserialize(handleBytes);
+                    try (SliceInput input = new InputStreamSliceInput(
+                            storage.open(tempDataOperationContext, handle))) {
+                        Iterator<SerializedPage> pages = readSerializedPages(input);
+                        while (pages.hasNext()) {
+                            outputBuffer.enqueue(Lifespan.taskWide(),
+                                ImmutableList.of(pages.next()));
+                        }
+                    }
+                }
+                outputBuffer.setNoMorePages();
+                stateMachine.transitionToFinishing();
+            }
+            catch (Exception e) {
+                // Cache read failure: fall back to normal execution
+                // or fail the query, depending on configuration
+                fail(e);
+            }
+        });
+    }
+
+This approach reuses the existing ``OutputBuffer`` → ``ExchangeClient`` →
+``Query`` → HTTP response pipeline that the client already expects. The client
+sees no difference between a cache hit and a normal execution.
 
 Validation checks
 ~~~~~~~~~~~~~~~~~
 
-Before serving a cached result, the optimizer validates:
+Before serving a cached result, ``isValid()`` checks:
 
 1. **Schema match**: The cached entry's column names and type signatures must
-   match the current OutputNode's output variables.
+   match the current ``OutputNode``'s output variables. This guards against
+   schema evolution (e.g., a column was added to a table).
 2. **Expiration**: ``System.currentTimeMillis() < entry.expirationTimeMillis``.
 3. **Input table statistics**: Current input table stats (obtained via
    ``CachingPlanCanonicalInfoProvider.getInputTableStatistics()``) must be
    "similar" to the stats recorded in the cache entry — using the same
    threshold-based comparison as HBO (default 10%).
 4. **Non-determinism**: Plans containing functions like ``rand()``, ``now()``,
-   ``uuid()`` are never served from cache.
-
-Position in optimizer chain
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-In ``PlanOptimizers.java``, the ``QueryResultsCacheOptimizer`` is registered
-**after** the second ``HistoricalStatisticsEquivalentPlanMarkingOptimizer``
-and **before** ``AddExchanges``::
-
-    // After ReorderJoins and second HBO marking pass:
-    builder.add(new StatsRecordingPlanOptimizer(optimizerStats,
-        new HistoricalStatisticsEquivalentPlanMarkingOptimizer(statsCalculator)));
-
-    // NEW: Query results cache check
-    builder.add(new QueryResultsCacheOptimizer(cacheManager, planCanonicalInfoProvider));
-
-    // Then existing exchange planning:
-    builder.add(new ReplicateSemiJoinInDelete());
-    builder.add(new IterativeOptimizer(..., DetermineJoinDistributionType, ...));
-
-If the cache hits, the resulting plan has a single leaf ``CachedResultNode`` —
-no exchanges are needed. ``AddExchanges`` will handle the trivial single-fragment
-plan correctly.
-
-
-CachedResultNode
-----------------
-
-A new leaf ``PlanNode`` representing pre-computed results stored in
-``TempStorage``.
-
-.. code-block:: java
-
-    // presto-spi
-    @Immutable
-    public class CachedResultNode extends PlanNode {
-        private final List<VariableReferenceExpression> outputVariables;
-        private final List<byte[]> serializedHandles;  // Serialized TempStorageHandles
-        private final String tempStorageName;
-
-        @Override
-        public List<PlanNode> getSources() {
-            return emptyList();  // Leaf node — no children
-        }
-
-        @Override
-        public <R, C> R accept(PlanVisitor<R, C> visitor, C context) {
-            return visitor.visitCachedResult(this, context);
-        }
-
-        @Override
-        public PlanNode replaceChildren(List<PlanNode> newChildren) {
-            checkArgument(newChildren.isEmpty(), "newChildren is not empty");
-            return this;
-        }
-
-        @Override
-        public PlanNode assignStatsEquivalentPlanNode(
-                Optional<PlanNode> statsEquivalentPlanNode) {
-            return new CachedResultNode(
-                getSourceLocation(), getId(), statsEquivalentPlanNode,
-                outputVariables, serializedHandles, tempStorageName);
-        }
-    }
-
-Since this is a leaf node with no children, the plan fragmenter places it in
-a single fragment running on the coordinator. No distributed execution needed.
-
-Add ``visitCachedResult`` to ``PlanVisitor`` (with default falling through to
-``visitPlan``).
-
-
-CachedResultOperator
---------------------
-
-In ``LocalExecutionPlanner``, add handling for ``CachedResultNode``:
-
-.. code-block:: java
-
-    @Override
-    public PhysicalOperation visitCachedResult(
-            CachedResultNode node, LocalExecutionPlanContext context) {
-        OperatorFactory factory = new CachedResultOperatorFactory(
-            context.getNextOperatorId(),
-            node.getId(),
-            tempStorageManager.getTempStorage(node.getTempStorageName()),
-            node.getSerializedHandles(),
-            tempDataOperationContext);
-        return new PhysicalOperation(factory, makeLayout(node), context,
-            UNGROUPED_EXECUTION);
-    }
-
-The operator:
-
-1. Deserializes ``TempStorageHandle`` references via
-   ``TempStorage.deserialize()``.
-2. Opens each handle via ``TempStorage.open()`` — returns an ``InputStream``.
-3. Reads ``SerializedPage`` objects using existing
-   ``PagesSerdeUtil.readSerializedPages()``.
-4. Outputs pages to the pipeline.
-
-This is essentially the same read logic already in
-``SpoolingOutputBuffer.getPagesFromStorage()``, extracted into an operator.
+   ``uuid()`` are rejected during ``computeCacheKey()`` (the hash is not
+   computed, so the cache is never consulted).
 
 
 Write Path
@@ -505,13 +469,19 @@ Write Path
 QueryResultsCacheWriter
 -----------------------
 
-A new component that captures query results on completion and stores them in
-the cache. It hooks into the query lifecycle the same way
-``HistoryBasedPlanStatisticsTracker`` does.
+A new component that captures query results on completion and writes them to
+``TempStorage`` for future reuse. It hooks into the query lifecycle the same
+way ``HistoryBasedPlanStatisticsTracker`` does: via
+``addFinalQueryInfoListener``.
+
+The write path follows the same pattern as ``FileFragmentResultCacheManager``:
+pages are serialized via ``PagesSerdeUtil.writePages()`` to a storage sink,
+independent of the output buffer.
 
 .. code-block:: java
 
     public class QueryResultsCacheWriter {
+
         public void onQueryCompletion(QueryExecution queryExecution) {
             queryExecution.addFinalQueryInfoListener(this::cacheResults);
         }
@@ -521,48 +491,99 @@ the cache. It hooks into the query lifecycle the same way
 
             // 1. Check prerequisites
             if (!isQueryResultsCacheEnabled(session)) return;
-            if (queryInfo.getFailureInfo() != null) return;  // Only cache successful queries
+            if (queryInfo.getFailureInfo() != null) return;
             if (!queryInfo.getQueryType().equals(Optional.of(QueryType.SELECT))) return;
-            if (!isSpoolingOutputBufferEnabled(session)) return;
 
-            // 2. Check if this query was registered for caching during optimization
-            Optional<String> planHash = cacheManager.getRegisteredHash(queryInfo.getQueryId());
-            if (!planHash.isPresent()) return;
+            // 2. Was this query registered for caching during start()?
+            Optional<CachePopulationContext> ctx =
+                cacheManager.getPopulationContext(queryInfo.getQueryId());
+            if (!ctx.isPresent()) return;
 
             // 3. Check result size limit
             long resultBytes = queryInfo.getQueryStats().getOutputDataSize().toBytes();
             if (resultBytes > getQueryResultsCacheMaxResultSize(session)) return;
 
-            // 4. Collect TempStorageHandles from the spooling output buffer
-            //    (accessed via the output stage's root task)
-            List<TempStorageHandle> handles = getRetainedHandles(queryInfo);
-            if (handles.isEmpty()) return;
+            // 4. Collect input table statistics for future validation
+            List<PlanStatistics> inputStats = ctx.get().getInputTableStatistics();
 
-            // 5. Serialize handles
-            List<byte[]> serializedHandles = handles.stream()
-                .map(h -> tempStorage.serializeHandle(h))
-                .collect(toImmutableList());
-
-            // 6. Collect input table statistics for future validation
-            List<PlanStatistics> inputStats = planCanonicalInfoProvider
-                .getInputTableStatistics(session, plan.getRoot(), strategy, true)
-                .orElse(ImmutableList.of());
-
-            // 7. Build and store cache entry
+            // 5. Build and store cache entry
             QueryResultsCacheEntry entry = new QueryResultsCacheEntry(
-                serializedHandles,
+                ctx.get().getSerializedHandles(),
                 tempStorageName,
-                columnNames,
-                columnTypeSignatures,
+                ctx.get().getColumnNames(),
+                ctx.get().getColumnTypeSignatures(),
                 System.currentTimeMillis(),
                 System.currentTimeMillis() + cacheTtlMillis,
                 inputStats,
-                totalRows,
-                resultBytes);
+                queryInfo.getQueryStats().getOutputPositions(),
+                resultBytes,
+                ctx.get().getEncryptionKey());
 
-            cacheProvider.putCachedResult(planHash.get(), entry);
+            cacheProvider.putCachedResult(ctx.get().getCacheKey(), entry);
         }
     }
+
+How pages are captured for the cache
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The write path must capture output pages without interfering with normal
+execution. There are two approaches, depending on whether spooling is enabled:
+
+**When spooling is enabled** (recommended):
+
+The ``SpoolingOutputBuffer`` already writes ``SerializedPage`` objects to
+``TempStorage``. We add a ``retainHandlesForCache`` flag so that files are not
+deleted when the client acknowledges them. After query completion, the
+``QueryResultsCacheWriter`` collects the ``TempStorageHandle`` references and
+stores them in the cache entry. This is zero-copy — no additional I/O.
+
+.. code-block:: java
+
+    public class SpoolingOutputBuffer implements OutputBuffer {
+
+        private final AtomicBoolean retainHandlesForCache = new AtomicBoolean(false);
+
+        public synchronized List<TempStorageHandle> getRetainedHandles() { ... }
+
+        private class HandleInfo {
+            public void removeFile() {
+                if (retainHandlesForCache.get()) {
+                    return; // keep files for cache
+                }
+                // ... existing deletion logic
+            }
+        }
+    }
+
+**When spooling is NOT enabled** (general case):
+
+Register a page listener on the coordinator's ``ExchangeClient`` that
+accumulates pages as they flow from the output stage to the client. After the
+query completes, write the accumulated pages to ``TempStorage`` using
+``PagesSerdeUtil.writePages()`` — the same approach FRC uses in
+``FileFragmentResultCacheManager.cachePages()``.
+
+.. code-block:: java
+
+    // FRC-style page capture and write
+    private void writePagesToCacheStorage(
+            List<SerializedPage> pages,
+            TempStorage storage,
+            Optional<SpillCipher> cipher) {
+        TempDataSink sink = storage.create(tempDataOperationContext);
+        PagesSerde serde = pagesSerdeFactory.createPagesSerdeForSpill(cipher);
+        List<DataOutput> outputs = pages.stream()
+            .map(page -> new PageDataOutput(
+                cipher.isPresent() ? serde.serialize(page) : page))
+            .collect(toImmutableList());
+        sink.write(outputs);
+        TempStorageHandle handle = sink.commit();
+        // Store handle in cache entry
+    }
+
+The spooling path is preferred because it avoids buffering all result pages
+in memory on the coordinator. The non-spooling path is a fallback for
+deployments that don't use spooling.
 
 Integration in SqlQueryManager
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -571,26 +592,11 @@ In ``SqlQueryManager.createQuery()``, alongside the existing HBO tracking:
 
 .. code-block:: java
 
-    // Existing:
+    // Existing (line 324):
     historyBasedPlanStatisticsTracker.updateStatistics(queryExecution);
 
     // NEW:
     queryResultsCacheWriter.onQueryCompletion(queryExecution);
-
-Getting handles from the buffer
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The coordinator's output stage root task owns the ``SpoolingOutputBuffer``.
-The access path:
-
-1. At planning time, if caching is enabled for this query, set
-   ``retainHandlesForCache = true`` on the ``SpoolingOutputBuffer`` once it is
-   created. This is done via a callback on the output stage's task creation.
-2. At query completion, the ``QueryResultsCacheWriter`` accesses the retained
-   handles through the ``QueryInfo``'s output stage, which references the
-   ``SqlTask`` and its ``OutputBuffer``.
-3. Each ``TempStorageHandle`` is serialized via
-   ``TempStorage.serializeHandle()`` for durable storage in the cache entry.
 
 
 Invalidation
@@ -610,9 +616,9 @@ At cache write time, the ``QueryResultsCacheWriter`` stores the
 ``List<PlanStatistics>`` for all input tables — the same per-table aggregate
 ``(rowCount, outputSize)`` stats that HBO uses.
 
-At cache read time, the ``QueryResultsCacheOptimizer`` recomputes the current
-input table statistics and compares them against the cached stats using the
-same threshold as HBO:
+At cache read time, the cache check in ``SqlQueryExecution.start()`` recomputes
+the current input table statistics and compares them against the cached stats
+using the same threshold as HBO:
 
 .. code-block:: java
 
@@ -667,182 +673,12 @@ This is analogous to ``FileFragmentResultCacheManager``'s
 ``CacheRemovalListener``, which deletes files on eviction.
 
 
-Configuration
-=============
-
-Server-level properties
------------------------
-
-=================================================  =========  =============================================
-Property                                           Default    Description
-=================================================  =========  =============================================
-``query-results-cache.enabled``                    ``false``  Master switch
-``query-results-cache.ttl``                        ``1h``     Default cache entry TTL
-``query-results-cache.max-result-size``            ``100MB``  Max result size eligible for caching
-``query-results-cache.temp-storage``               ``local``  TempStorage name for cached results
-``query-results-cache.canonicalization-strategy``   ``CONNECTOR``  HBO strategy for hashing
-``query-results-cache.input-stats-threshold``      ``0.1``    Threshold for input stats comparison
-``query-results-cache.max-cache-entries``           ``1000``   Max entries in the cache
-``query-results-cache.cleanup-interval``           ``5m``     How often to clean up expired entries
-``query-results-cache.encryption-enabled``         ``true``   Encrypt cached result pages (AES-256-CTR)
-=================================================  =========  =============================================
-
-Session properties
-------------------
-
-=============================================  ==================================================
-Property                                       Description
-=============================================  ==================================================
-``query_results_cache_enabled``                Per-session enable/disable
-``query_results_cache_ttl``                    Per-session TTL override
-``query_results_cache_bypass``                 Skip cache read (still populates on completion)
-``query_results_cache_invalidate``             Skip cache read AND overwrite existing entry
-``query_results_cache_canonicalization_strategy``  Per-session strategy override
-=============================================  ==================================================
-
-
-Comparison with Fragment Result Cache
-=====================================
-
-Presto already has a **fragment result cache**
-(``FileFragmentResultCacheManager``) that caches the output of individual plan
-fragments (typically table scans) keyed by ``(serializedPlan, splitIdentifier)``.
-
-=========================  ===========================  ===============================
-Aspect                     Fragment Result Cache        Query Results Cache
-=========================  ===========================  ===============================
-**Granularity**            Per-fragment, per-split      Entire query result
-**Cache key**              ``(plan JSON, split ID)``    ``(canonical plan hash)``
-**What's cached**          ``List<Page>`` on local disk ``SerializedPage`` in TempStorage
-**Where it runs**          Worker nodes                 Coordinator
-**Bypass?**                Skips a single scan          Skips the entire query
-**Hit rate**               High for repeated scans      High for repeated queries
-**Invalidation**           TTL + LRU eviction           TTL + input stats comparison
-=========================  ===========================  ===============================
-
-The two caches are **complementary**:
-
-- Fragment result cache helps when a query shares scan fragments with previous
-  queries but differs in its overall plan.
-- Query results cache helps when the entire query is repeated.
-
-Both can be enabled simultaneously.
-
-
-Implementation Plan
-===================
-
-New files
----------
-
-===========================  ==============================================================
-Module                       File
-===========================  ==============================================================
-``presto-spi``               ``spi/QueryResultsCacheProvider.java`` — SPI interface
-``presto-spi``               ``spi/QueryResultsCacheEntry.java`` — Cache entry data class
-``presto-spi``               ``spi/plan/CachedResultNode.java`` — New PlanNode
-``presto-main-base``         ``execution/QueryResultsCacheManager.java`` — Central manager
-``presto-main-base``         ``execution/QueryResultsCacheWriter.java`` — Write path
-``presto-main-base``         ``execution/QueryResultsCacheConfig.java`` — Airlift config
-``presto-main-base``         ``sql/planner/optimizations/QueryResultsCacheOptimizer.java``
-``presto-main-base``         ``operator/CachedResultOperator.java`` — Operator + factory
-``presto-main-base``         ``testing/InMemoryQueryResultsCacheProvider.java``
-===========================  ==============================================================
-
-Modified files
---------------
-
-========================================================  ==========================================
-File                                                      Change
-========================================================  ==========================================
-``PlanVisitor.java``                                      Add ``visitCachedResult()``
-``SpoolingOutputBuffer.java``                             Add ``retainHandlesForCache`` flag,
-                                                          ``getRetainedHandles()``, and
-                                                          ``Optional<SpillCipher>`` for encryption
-``SystemSessionProperties.java``                          Add cache session properties
-``FeaturesConfig.java`` (or new config)                   Add cache config properties
-``PlanOptimizers.java``                                   Register ``QueryResultsCacheOptimizer``
-``LocalExecutionPlanner.java``                            Handle ``CachedResultNode``
-``ServerMainModule.java``                                 Wire Guice bindings
-``SqlQueryManager.java``                                  Hook ``QueryResultsCacheWriter``
-``Plugin.java``                                           Add ``getQueryResultsCacheProviders()``
-``PluginManager.java``                                    Register cache provider plugins
-========================================================  ==========================================
-
-Implementation phases
----------------------
-
-1. **Phase 1 — SPI + metadata store**: ``QueryResultsCacheProvider``,
-   ``QueryResultsCacheEntry``, ``InMemoryQueryResultsCacheProvider``,
-   ``QueryResultsCacheConfig``.
-
-2. **Phase 2 — Write path**: ``SpoolingOutputBuffer`` changes (retainHandles),
-   ``QueryResultsCacheWriter``, integration in ``SqlQueryManager``.
-
-3. **Phase 3 — Read path**: ``CachedResultNode``, ``PlanVisitor`` update,
-   ``QueryResultsCacheOptimizer``, ``CachedResultOperator``,
-   ``LocalExecutionPlanner`` update, ``PlanOptimizers`` registration.
-
-4. **Phase 4 — Invalidation + cleanup**: Background cleanup thread, input stats
-   validation, session properties for bypass/invalidate.
-
-5. **Phase 5 — Testing**: Unit tests for each component. Integration test:
-   run query, verify cache population, run same query, verify cache hit.
-
-
-Security Considerations
-=======================
-
-Cache entries must respect access control. Two approaches:
-
-1. **User-scoped cache keys**: Include the session identity (user + groups) in
-   the cache key. Cache entries are only served to the same user. Simple but
-   low hit rate in multi-user environments.
-
-2. **Access-check on read**: Cache entries are shared across users, but before
-   serving a cached result, the optimizer verifies that the requesting user has
-   SELECT access on all tables referenced in the original plan. This preserves
-   row-level security (if any) only if row filters are identical across users.
-
-**Recommended for v1**: User-scoped cache keys (option 1). It is safe by
-default and easy to implement — just include a hash of the user identity in
-the cache key. Option 2 can be added later as an optimization for workloads
-where cross-user sharing is desired.
-
-Non-deterministic functions
----------------------------
-
-Queries containing non-deterministic functions (``rand()``, ``now()``,
-``uuid()``, ``current_timestamp``) must never be cached. The
-``QueryResultsCacheOptimizer`` checks for these by traversing the plan and
-examining each ``CallExpression`` against a list of known non-deterministic
-functions.
-
-
 Encryption
 ==========
 
 Cached result files live in ``TempStorage`` for extended periods (hours, unlike
 spill files which are ephemeral). They must be protected against unauthorized
 access at the storage layer.
-
-Current state: spooling has no encryption
------------------------------------------
-
-Today, the ``SpoolingOutputBuffer`` writes raw ``SerializedPage`` bytes to
-``TempStorage`` with **no encryption**. The existing encryption infrastructure
-— ``AesSpillCipher`` (AES-256-CTR) and ``PagesSerde`` with ``SpillCipher``
-support — is wired only for spill-to-disk (hash joins, sorts exceeding memory),
-not for spooling output buffers.
-
-=======================  ==============================  ============================
-Aspect                   Spill (joins/sorts)             Spooling Output Buffer
-=======================  ==============================  ============================
-Encryption               AES-256-CTR via ``SpillCipher`` None
-Config                   ``spill-encryption-enabled``    No equivalent
-Key lifetime             Per-spiller, destroyed on close N/A
-Pages written by         ``PagesSerde`` with cipher      ``PageDataOutput`` — raw
-=======================  ==============================  ============================
 
 Existing encryption primitives
 ------------------------------
@@ -868,7 +704,7 @@ Presto already has a complete page-level encryption pipeline:
    Bit-flag enum with ``COMPRESSED`` (bit 1), ``ENCRYPTED`` (bit 2),
    ``CHECKSUMMED`` (bit 3).
 
-The data flow for encrypted spill is::
+The data flow for encrypted pages is::
 
     Write: Page → serialize → compress → encrypt → set ENCRYPTED marker → write
     Read:  read → check ENCRYPTED marker → decrypt → decompress → Page
@@ -901,70 +737,47 @@ path and reads cached results without going through Presto.
 Combined with encryption, knowing the path is insufficient — the data is
 ciphertext without the key.
 
-Encryption design
------------------
+Encryption in the write path
+-----------------------------
 
-Wire ``SpillCipher`` into the spooling + cache path
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: java
-
-    public class SpoolingOutputBuffer implements OutputBuffer {
-
-        // NEW: optional cipher for encrypting spooled pages
-        private final Optional<SpillCipher> spillCipher;
-
-        private synchronized void flush() {
-            // Instead of raw PageDataOutput, use cipher-aware serialization
-            PagesSerde serde = pagesSerdeFactory.createPagesSerdeForSpill(spillCipher);
-            List<DataOutput> dataOutputs = pages.stream()
-                .map(page -> new PageDataOutput(serde.serialize(page)))
-                .collect(toImmutableList());
-
-            ListenableFuture<TempStorageHandle> handleFuture = executor.submit(() -> {
-                TempDataSink dataSink = tempStorage.create(tempDataOperationContext);
-                dataSink.write(dataOutputs);
-                return dataSink.commit();
-            });
-            // ... rest of existing flush logic
-        }
-    }
-
-This also fixes the pre-existing gap where spooled output data is unencrypted,
-independent of the cache feature.
-
-Store the DEK in the cache entry
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When writing pages to the cache, the ``QueryResultsCacheWriter`` creates an
+``AesSpillCipher`` and uses a cipher-aware ``PagesSerde`` for serialization:
 
 .. code-block:: java
 
-    public class QueryResultsCacheEntry {
-        // ... existing fields ...
-        private final Optional<byte[]> encryptionKey;  // 256-bit AES DEK
-    }
+    // In QueryResultsCacheWriter
+    SpillCipher cipher = new AesSpillCipher();
+    PagesSerde serde = pagesSerdeFactory.createPagesSerdeForSpill(Optional.of(cipher));
 
-The ``QueryResultsCacheWriter`` extracts the key from the ``SpillCipher``
-before it is destroyed:
+    // Write encrypted pages to TempStorage
+    TempDataSink sink = tempStorage.create(context);
+    List<DataOutput> outputs = pages.stream()
+        .map(page -> new PageDataOutput(serde.serialize(page)))
+        .collect(toImmutableList());
+    sink.write(outputs);
+    TempStorageHandle handle = sink.commit();
+
+    // Extract key for storage in cache entry
+    byte[] keyBytes = cipher.getKey();
+    // ... store in QueryResultsCacheEntry.encryptionKey
+
+When spooling with ``retainHandlesForCache``, the cipher must be passed to the
+``SpoolingOutputBuffer`` so pages are encrypted during flush.
+
+Encryption in the read path
+----------------------------
+
+On a cache hit, ``serveCachedResult()`` reconstructs the cipher from the stored
+key and uses it for decryption:
 
 .. code-block:: java
 
-    // In QueryResultsCacheWriter.cacheResults():
-    Optional<byte[]> encryptionKey = Optional.empty();
-    if (spillCipher.isPresent()) {
-        encryptionKey = Optional.of(spillCipher.get().getKey());
-        // Do NOT destroy the cipher yet — the key is transferred to the cache entry
-    }
-
-The ``CachedResultOperator`` reconstructs the cipher from the stored key for
-decryption:
-
-.. code-block:: java
-
-    // In CachedResultOperator:
+    // In SqlQueryExecution.serveCachedResult()
     SpillCipher cipher = new AesSpillCipher(entry.getEncryptionKey().get());
     PagesSerde serde = pagesSerdeFactory.createPagesSerdeForSpill(Optional.of(cipher));
 
-    try (SliceInput input = ...) {
+    try (SliceInput input = new InputStreamSliceInput(
+            tempStorage.open(context, handle))) {
         Iterator<SerializedPage> pages = readSerializedPages(input);
         // Pages are decrypted during deserialization via the serde
     }
@@ -1024,14 +837,13 @@ depth. Option B (KMS) as a future enhancement.
 Key lifecycle
 ~~~~~~~~~~~~~
 
-1. **Generation**: When a query is registered for caching, a new
-   ``AesSpillCipher`` is created with a fresh 256-bit key. The cipher is
-   passed to the ``SpoolingOutputBuffer`` for encrypting pages during flush.
+1. **Generation**: When the ``QueryResultsCacheWriter`` writes results, a new
+   ``AesSpillCipher`` is created with a fresh 256-bit key.
 
-2. **Persistence**: After the query completes, the key bytes are extracted
-   from the cipher and stored in the ``QueryResultsCacheEntry``.
+2. **Persistence**: After pages are written, the key bytes are extracted
+   and stored in the ``QueryResultsCacheEntry``.
 
-3. **Read**: On cache hit, the ``CachedResultOperator`` reconstructs an
+3. **Read**: On cache hit, ``serveCachedResult()`` reconstructs an
    ``AesSpillCipher`` from the stored key, uses it for decryption, then
    calls ``cipher.destroy()`` to nullify the key in memory.
 
@@ -1039,37 +851,134 @@ Key lifecycle
    (including the key) is removed from the metadata store. The associated
    ``TempStorage`` files (which are ciphertext) are deleted.
 
+
 Configuration
-~~~~~~~~~~~~~
+=============
 
-====================================================  =========  =====================================
-Property                                              Default    Description
-====================================================  =========  =====================================
-``query-results-cache.encryption-enabled``            ``true``   Encrypt cached result pages
-====================================================  =========  =====================================
+Server-level properties
+-----------------------
 
-Default is **on**. Unlike spill encryption (which trades CPU for security on
-ephemeral data), cached data lives for hours and the performance cost of
-AES-256-CTR is negligible relative to I/O.
+=================================================  =========  =============================================
+Property                                           Default    Description
+=================================================  =========  =============================================
+``query-results-cache.enabled``                    ``false``  Master switch
+``query-results-cache.ttl``                        ``1h``     Default cache entry TTL
+``query-results-cache.max-result-size``            ``100MB``  Max result size eligible for caching
+``query-results-cache.temp-storage``               ``local``  TempStorage name for cached results
+``query-results-cache.canonicalization-strategy``   ``CONNECTOR``  HBO strategy for hashing
+``query-results-cache.input-stats-threshold``      ``0.1``    Threshold for input stats comparison
+``query-results-cache.max-cache-entries``           ``1000``   Max entries in the cache
+``query-results-cache.cleanup-interval``           ``5m``     How often to clean up expired entries
+``query-results-cache.encryption-enabled``         ``true``   Encrypt cached result pages (AES-256-CTR)
+=================================================  =========  =============================================
 
-Security summary
-~~~~~~~~~~~~~~~~
+Session properties
+------------------
 
-=========================  ================================================  =============
-Layer                      Protection                                        Status
-=========================  ================================================  =============
-Page-level encryption      AES-256-CTR via existing ``SpillCipher``/          Wire into
-                           ``PagesSerde``                                     spooling path
-Key storage                DEK stored in ``QueryResultsCacheEntry``           New field
-Key management             In-process generation, metadata store storage      v1
-                           KMS envelope encryption                            Future (v2)
-Storage-layer encryption   S3-SSE or encrypted disk                           Orthogonal
-Handle guessability        UUID-based filenames                               Already exists
-Access control             User-scoped cache keys                             Already in
-                                                                              design
-Key lifecycle              ``cipher.destroy()`` nullifies in-memory key       Follow spill
-                                                                              pattern
-=========================  ================================================  =============
+=============================================  ==================================================
+Property                                       Description
+=============================================  ==================================================
+``query_results_cache_enabled``                Per-session enable/disable
+``query_results_cache_ttl``                    Per-session TTL override
+``query_results_cache_bypass``                 Skip cache read (still populates on completion)
+``query_results_cache_invalidate``             Skip cache read AND overwrite existing entry
+``query_results_cache_canonicalization_strategy``  Per-session strategy override
+=============================================  ==================================================
+
+
+Security Considerations
+=======================
+
+Cache entries must respect access control. Two approaches:
+
+1. **User-scoped cache keys**: Include the session identity (user + groups) in
+   the cache key. Cache entries are only served to the same user. Simple but
+   low hit rate in multi-user environments.
+
+2. **Access-check on read**: Cache entries are shared across users, but before
+   serving a cached result, verify that the requesting user has SELECT access
+   on all tables referenced in the original plan. This preserves row-level
+   security only if row filters are identical across users.
+
+**Recommended for v1**: User-scoped cache keys (option 1). It is safe by
+default and easy to implement — include a hash of the user identity in the
+cache key. Option 2 can be added later as an optimization for workloads
+where cross-user sharing is desired.
+
+Non-deterministic functions
+---------------------------
+
+Queries containing non-deterministic functions (``rand()``, ``now()``,
+``uuid()``, ``current_timestamp``) must never be cached. The cache key
+computation step in ``SqlQueryExecution.start()`` checks for these by
+traversing the plan and examining each ``CallExpression`` against a list of
+known non-deterministic functions. If any are found, the hash is not computed
+and the cache is not consulted.
+
+
+Implementation Plan
+===================
+
+New files
+---------
+
+===========================  ==============================================================
+Module                       File
+===========================  ==============================================================
+``presto-spi``               ``spi/QueryResultsCacheProvider.java`` — SPI interface
+``presto-spi``               ``spi/QueryResultsCacheEntry.java`` — Cache entry data class
+``presto-main-base``         ``execution/QueryResultsCacheManager.java`` — Central manager
+``presto-main-base``         ``execution/QueryResultsCacheWriter.java`` — Write path
+``presto-main-base``         ``execution/QueryResultsCacheConfig.java`` — Airlift config
+``presto-main-base``         ``testing/InMemoryQueryResultsCacheProvider.java``
+===========================  ==============================================================
+
+Modified files
+--------------
+
+========================================================  ==========================================
+File                                                      Change
+========================================================  ==========================================
+``SqlQueryExecution.java``                                Cache check in ``start()``, cache-hit
+                                                          serving via ``serveCachedResult()``
+``SpoolingOutputBuffer.java``                             Add ``retainHandlesForCache`` flag and
+                                                          ``getRetainedHandles()`` (spooling write
+                                                          path only)
+``SystemSessionProperties.java``                          Add cache session properties
+``FeaturesConfig.java`` (or new config)                   Add cache config properties
+``ServerMainModule.java``                                 Wire Guice bindings
+``SqlQueryManager.java``                                  Hook ``QueryResultsCacheWriter``
+``Plugin.java``                                           Add ``getQueryResultsCacheProviders()``
+``PluginManager.java``                                    Register cache provider plugins
+========================================================  ==========================================
+
+Note the absence of plan-level changes: no new ``PlanNode``, no
+``PlanVisitor`` change, no ``LocalExecutionPlanner`` change, no
+``PlanOptimizers`` registration.
+
+Implementation phases
+---------------------
+
+1. **Phase 1 — SPI + metadata store**: ``QueryResultsCacheProvider``,
+   ``QueryResultsCacheEntry``, ``InMemoryQueryResultsCacheProvider``,
+   ``QueryResultsCacheConfig``.
+
+2. **Phase 2 — Write path**: ``QueryResultsCacheWriter``, page capture via
+   ``SpoolingOutputBuffer`` handle retention (or ``ExchangeClient`` listener),
+   integration in ``SqlQueryManager``.
+
+3. **Phase 3 — Read path**: Cache check in ``SqlQueryExecution.start()``,
+   ``serveCachedResult()`` with ``TempStorage`` read and output buffer feed.
+
+4. **Phase 4 — Encryption**: Wire ``AesSpillCipher`` into write and read paths,
+   store DEK in cache entry.
+
+5. **Phase 5 — Invalidation + cleanup**: Background cleanup thread, input stats
+   validation, session properties for bypass/invalidate.
+
+6. **Phase 6 — Testing**: Unit tests for each component. Integration test:
+   run query, verify cache population, run same query, verify cache hit with
+   no scheduler creation.
 
 
 .. _`Future Work`:
