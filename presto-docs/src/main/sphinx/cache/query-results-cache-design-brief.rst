@@ -42,7 +42,7 @@ SHA-256 of the canonicalized query plan, computed via HBO's ``CanonicalPlanGener
 
 Canonicalization normalizes variable names to positional (``_col_0``, ...), sorts predicates/join criteria, strips source locations, and delegates to ``ConnectorTableLayoutHandle.getIdentifier()`` for connector-specific normalization. Serialized to JSON with deterministic key ordering, then hashed.
 
-**Full key**: ``(canonical_plan_hash, canonicalization_strategy, user_identity_hash)``
+**Full key**: ``(canonical_plan_hash, canonicalization_strategy)``
 
 Uses ``CONNECTOR`` strategy (error level 1) by default — supports all node types, preserves filter constants, connector-aware table normalization. Configurable per-session.
 
@@ -162,8 +162,7 @@ Property                                          Default        Description
 Security
 --------
 
-- **User-scoped cache keys** (v1): user identity hash included in cache key. Entries only served to the same user.
-- **Access-check on read** (future): share entries across users with SELECT permission validation.
+- **Shared cache entries**: Cache entries are shared across users. Access control is enforced during the analysis phase (before the cache is consulted), so unauthorized users cannot reach the cache lookup.
 - **Non-deterministic functions**: rejected at cache key computation — cache never consulted.
 
 
