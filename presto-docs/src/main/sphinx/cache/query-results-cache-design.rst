@@ -527,63 +527,55 @@ How pages are captured for the cache
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The write path must capture output pages without interfering with normal
-execution. There are two approaches, depending on whether spooling is enabled:
+execution or increasing time-to-first-byte. The design uses a **tee-write**
+approach at the coordinator's ``ExchangeClient``.
 
-**When spooling is enabled** (recommended):
-
-The ``SpoolingOutputBuffer`` already writes ``SerializedPage`` objects to
-``TempStorage``. We add a ``retainHandlesForCache`` flag so that files are not
-deleted when the client acknowledges them. After query completion, the
-``QueryResultsCacheWriter`` collects the ``TempStorageHandle`` references and
-stores them in the cache entry. This is zero-copy — no additional I/O.
+As pages arrive at the ``ExchangeClient`` during normal execution, a
+cache-aware listener asynchronously writes each batch to ``TempStorage`` in the
+background. The client receives pages with normal latency — cache writes are
+completely off the critical path.
 
 .. code-block:: java
 
-    public class SpoolingOutputBuffer implements OutputBuffer {
+    // In ExchangeClient or a cache-aware wrapper
+    private boolean addPages(List<SerializedPage> pages) {
+        // Normal path — deliver to client immediately
+        buffer.addAll(pages);
 
-        private final AtomicBoolean retainHandlesForCache = new AtomicBoolean(false);
-
-        public synchronized List<TempStorageHandle> getRetainedHandles() { ... }
-
-        private class HandleInfo {
-            public void removeFile() {
-                if (retainHandlesForCache.get()) {
-                    return; // keep files for cache
-                }
-                // ... existing deletion logic
+        // Cache tee — async write to TempStorage
+        if (cachePopulationContext != null) {
+            long newBytes = cachePopulationContext.addBytes(getPagesSize(pages));
+            if (newBytes > maxResultSize) {
+                cachePopulationContext.abandon();  // too large, stop writing
+            }
+            else {
+                cachePopulationContext.writeAsync(pages);  // non-blocking
             }
         }
+
+        return true;
     }
 
-**When spooling is NOT enabled** (general case):
+Key properties of the tee-write approach:
 
-Register a page listener on the coordinator's ``ExchangeClient`` that
-accumulates pages as they flow from the output stage to the client. After the
-query completes, write the accumulated pages to ``TempStorage`` using
-``PagesSerdeUtil.writePages()`` — the same approach FRC uses in
-``FileFragmentResultCacheManager.cachePages()``.
+- **No TTFB impact**: Pages are delivered to the client immediately. Cache
+  writes happen asynchronously in the background.
+- **Incremental size tracking**: A running byte counter checks against
+  ``max-result-size`` on each batch. If the result exceeds the limit, the
+  tee-write is abandoned early and partial files are cleaned up — we never
+  write more data than necessary.
+- **No full-result memory buffering**: Pages are written to ``TempStorage``
+  incrementally as they arrive, not accumulated in memory.
+- **Independent of spooling**: Operates at the ``ExchangeClient`` level,
+  not the ``OutputBuffer`` level. Works identically whether or not spooling
+  is enabled.
+- **Failure handling**: If the query fails or is cancelled, partial cache
+  writes are discarded.
 
-.. code-block:: java
-
-    // FRC-style page capture and write
-    private void writePagesToCacheStorage(
-            List<SerializedPage> pages,
-            TempStorage storage,
-            Optional<SpillCipher> cipher) {
-        TempDataSink sink = storage.create(tempDataOperationContext);
-        PagesSerde serde = pagesSerdeFactory.createPagesSerdeForSpill(cipher);
-        List<DataOutput> outputs = pages.stream()
-            .map(page -> new PageDataOutput(
-                cipher.isPresent() ? serde.serialize(page) : page))
-            .collect(toImmutableList());
-        sink.write(outputs);
-        TempStorageHandle handle = sink.commit();
-        // Store handle in cache entry
-    }
-
-The spooling path is preferred because it avoids buffering all result pages
-in memory on the coordinator. The non-spooling path is a fallback for
-deployments that don't use spooling.
+On successful query completion, the ``QueryResultsCacheWriter`` collects the
+accumulated ``TempStorageHandle`` references and stores them in the cache entry.
+The pattern is similar to ``FileFragmentResultCacheManager.cachePages()``, but
+incremental rather than post-completion.
 
 Integration in SqlQueryManager
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -761,8 +753,8 @@ When writing pages to the cache, the ``QueryResultsCacheWriter`` creates an
     byte[] keyBytes = cipher.getKey();
     // ... store in QueryResultsCacheEntry.encryptionKey
 
-When spooling with ``retainHandlesForCache``, the cipher must be passed to the
-``SpoolingOutputBuffer`` so pages are encrypted during flush.
+The tee-write listener in ``ExchangeClient`` uses the same cipher when writing
+pages to ``TempStorage``, so pages are encrypted as they are captured.
 
 Encryption in the read path
 ----------------------------
@@ -941,9 +933,8 @@ File                                                      Change
 ========================================================  ==========================================
 ``SqlQueryExecution.java``                                Cache check in ``start()``, cache-hit
                                                           serving via ``serveCachedResult()``
-``SpoolingOutputBuffer.java``                             Add ``retainHandlesForCache`` flag and
-                                                          ``getRetainedHandles()`` (spooling write
-                                                          path only)
+``ExchangeClient.java``                                   Add tee-write listener for cache page
+                                                          capture during normal execution
 ``SystemSessionProperties.java``                          Add cache session properties
 ``FeaturesConfig.java`` (or new config)                   Add cache config properties
 ``ServerMainModule.java``                                 Wire Guice bindings
@@ -963,9 +954,8 @@ Implementation phases
    ``QueryResultsCacheEntry``, ``InMemoryQueryResultsCacheProvider``,
    ``QueryResultsCacheConfig``.
 
-2. **Phase 2 — Write path**: ``QueryResultsCacheWriter``, page capture via
-   ``SpoolingOutputBuffer`` handle retention (or ``ExchangeClient`` listener),
-   integration in ``SqlQueryManager``.
+2. **Phase 2 — Write path**: ``QueryResultsCacheWriter``, tee-write page
+   capture via ``ExchangeClient`` listener, integration in ``SqlQueryManager``.
 
 3. **Phase 3 — Read path**: Cache check in ``SqlQueryExecution.start()``,
    ``serveCachedResult()`` with ``TempStorage`` read and output buffer feed.

@@ -110,16 +110,15 @@ Write Path
 
 ``QueryResultsCacheWriter`` hooks into query lifecycle via ``addFinalQueryInfoListener`` (same pattern as ``HistoryBasedPlanStatisticsTracker``).
 
-On successful SELECT completion:
+**Page capture** — tee-write at the ``ExchangeClient``:
 
-1. Check result size ≤ ``max-result-size``.
-2. Collect ``TempStorageHandle`` references + input table stats.
-3. Build ``QueryResultsCacheEntry``, serialize metadata + page files to TempStorage under the key-derived path.
+As pages arrive at the coordinator's ``ExchangeClient`` during normal execution, a cache-aware listener asynchronously writes each batch to ``TempStorage`` in the background. The client receives pages with normal latency — cache writes are off the critical path.
 
-**Page capture** — two modes:
+- A running byte counter tracks total result size. If it exceeds ``max-result-size``, the tee-write is abandoned and partial files are cleaned up.
+- On successful SELECT completion, the ``QueryResultsCacheWriter`` collects the accumulated ``TempStorageHandle`` references + input table stats, builds a ``QueryResultsCacheEntry``, and stores metadata in the cache provider.
+- If the query fails or is cancelled, partial cache writes are discarded.
 
-- **Spooling enabled** (preferred): ``SpoolingOutputBuffer`` already writes pages to ``TempStorage``. Add ``retainHandlesForCache`` flag to prevent deletion on client ack. Zero-copy — no additional I/O.
-- **Spooling disabled** (fallback): Listener on coordinator's ``ExchangeClient`` accumulates pages, writes to ``TempStorage`` via ``PagesSerdeUtil.writePages()`` after completion (same pattern as ``FileFragmentResultCacheManager.cachePages()``).
+This approach is independent of whether spooling is enabled — it operates at the ``ExchangeClient`` level, not the ``OutputBuffer`` level. No TTFB impact. Same pattern as ``FileFragmentResultCacheManager.cachePages()``, but incremental rather than post-completion.
 
 Integration point: ``SqlQueryManager.createQuery()``, alongside existing HBO tracking.
 
@@ -181,7 +180,7 @@ Implementation Plan
 - ``presto-spi``: ``QueryResultsCacheEntry.java``
 - ``presto-main-base``: ``QueryResultsCacheManager.java``, ``QueryResultsCacheWriter.java``, ``QueryResultsCacheConfig.java``
 
-**Modified files:** ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``SpoolingOutputBuffer.java`` (handle retention), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
+**Modified files:** ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``ExchangeClient.java`` (tee-write listener for cache page capture), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
 
 No plan-level changes: no new ``PlanNode``, no ``PlanVisitor`` change, no ``LocalExecutionPlanner`` change, no ``PlanOptimizers`` registration.
 
