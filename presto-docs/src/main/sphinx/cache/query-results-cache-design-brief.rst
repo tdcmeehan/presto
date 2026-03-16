@@ -23,11 +23,11 @@ Goals
 ~~~~~
 
 - Eliminate redundant execution of identical SELECTs.
-- Pluggable metadata store (in-memory, Redis, etc.) and result storage (TempStorage SPI).
+- Single storage layer via TempStorage SPI for both metadata and result pages.
 - Input-table-aware invalidation via HBO statistics comparison.
 - No plan-level changes.
 
-Non-goals (v1): partial reuse / predicate stitching, DML caching, cross-coordinator sharing, non-deterministic function caching.
+Non-goals (v1): partial reuse / predicate stitching, DML caching, non-deterministic function caching.
 
 Why not FRC for this?
 ~~~~~~~~~~~~~~~~~~~~~
@@ -52,25 +52,31 @@ Input table statistics are stored in the cache entry for validation, not in the 
 SPI
 ---
 
-``QueryResultsCacheProvider`` (presto-spi):
+**TempStorage addition** — add ``exists()`` to the ``TempStorage`` SPI:
 
 .. code-block:: java
 
-    public interface QueryResultsCacheProvider {
-        String getName();
-        Optional<QueryResultsCacheEntry> getCachedResult(String cacheKey);
-        void putCachedResult(String cacheKey, QueryResultsCacheEntry entry);
-        void invalidate(String cacheKey);
-        List<QueryResultsCacheEntry> removeExpiredEntries();
+    public interface TempStorage {
+        // ... existing methods ...
+        boolean exists(TempDataOperationContext context, TempStorageHandle handle) throws IOException;
     }
 
-``QueryResultsCacheEntry`` (presto-spi):
+Enables cheap cache-miss checks (local ``Files.exists()``, S3 ``HeadObject``) without opening the full stream. Useful beyond the cache for any TempStorage consumer that needs to verify liveness of spooled data.
+
+**Storage layout** — metadata and pages stored together in TempStorage under a key-derived path:
+
+::
+
+    cache/<plan_hash>_<strategy>/metadata.json
+    cache/<plan_hash>_<strategy>/page_0
+    cache/<plan_hash>_<strategy>/page_1
+    ...
+
+``QueryResultsCacheEntry`` (presto-spi) — data class for the metadata file:
 
 .. code-block:: java
 
     public class QueryResultsCacheEntry {
-        List<byte[]> serializedHandles;          // TempStorage handles
-        String tempStorageName;
         List<String> columnNames;
         List<String> columnTypeSignatures;
         long creationTimeMillis;
@@ -78,10 +84,11 @@ SPI
         List<PlanStatistics> inputTableStatistics;
         long totalRows;
         long totalBytes;
+        int pageCount;
         Optional<byte[]> encryptionKey;          // DEK
     }
 
-Default implementation: ``InMemoryQueryResultsCacheProvider`` — Guava ``Cache`` with LRU + TTL. Plugin registration follows the ``HistoryBasedPlanStatisticsProvider`` pattern.
+No separate ``QueryResultsCacheProvider`` interface. ``QueryResultsCacheManager`` reads/writes directly via TempStorage. Cache existence is checked via ``TempStorage.exists()`` on the metadata handle. Cross-coordinator sharing comes for free when using shared TempStorage (e.g., S3).
 
 
 Read Path
@@ -90,8 +97,8 @@ Read Path
 In ``SqlQueryExecution.start()``, after ``createLogicalPlanAndOptimize()``:
 
 1. Compute canonical plan hash.
-2. Look up ``QueryResultsCacheProvider.getCachedResult(key)``.
-3. Validate: schema match (column names + types vs current ``OutputNode``), expiration check, input table stats comparison (HBO threshold, default 10%).
+2. Check ``TempStorage.exists()`` on the metadata handle for the key.
+3. On exists: read and deserialize ``QueryResultsCacheEntry`` from metadata file. Validate: schema match (column names + types vs current ``OutputNode``), expiration check, input table stats comparison (HBO threshold, default 10%).
 4. On hit: ``serveCachedResult()`` — read ``SerializedPage`` objects from ``TempStorage``, enqueue into ``OutputBuffer``, transition to finishing. Client sees no difference from normal execution.
 5. On miss: register query ID + cache key for population on completion, proceed with normal scheduling.
 
@@ -107,7 +114,7 @@ On successful SELECT completion:
 
 1. Check result size ≤ ``max-result-size``.
 2. Collect ``TempStorageHandle`` references + input table stats.
-3. Build ``QueryResultsCacheEntry``, store via ``putCachedResult()``.
+3. Build ``QueryResultsCacheEntry``, serialize metadata + page files to TempStorage under the key-derived path.
 
 **Page capture** — two modes:
 
@@ -123,7 +130,7 @@ Invalidation
 - **TTL**: Default 1 hour, configurable per-session. Checked on read.
 - **Data-change detection**: Input table stats (``rowCount``, ``outputSize``) compared against cached stats using HBO's threshold (default 10%). Both metrics must be similar for all input tables. Whole-table granularity (not per-partition).
 - **Manual bypass**: ``query_results_cache_bypass = true`` — skip read, still populate. ``query_results_cache_invalidate = true`` — skip read, overwrite entry.
-- **Storage cleanup**: Background thread calls ``removeExpiredEntries()``, deletes associated ``TempStorage`` files.
+- **Storage cleanup**: Background thread scans cache directory in TempStorage, reads metadata to check expiration, deletes expired entries (metadata + pages).
 
 
 Encryption
@@ -134,7 +141,7 @@ Pages encrypted via existing ``AesSpillCipher`` / ``PagesSerde`` pipeline (AES-2
 - **Write**: Create ``AesSpillCipher``, serialize pages with cipher-aware ``PagesSerde``, store DEK in ``QueryResultsCacheEntry.encryptionKey``.
 - **Read**: Reconstruct cipher from stored DEK, decrypt during deserialization, ``cipher.destroy()`` after.
 
-v1 key management: DEK stored in cache metadata (Option A). Acceptable — attacker with metadata store access already sees query text/schemas; encryption protects against storage-only attacks (S3 bucket misconfiguration). Envelope encryption with KMS (Option B) deferred to v2. Storage-layer encryption (SSE-S3/SSE-KMS) recommended as complementary layer.
+v1 key management: DEK stored in the metadata file alongside page references (Option A). Acceptable — attacker with storage access already sees query text/schemas; encryption protects against partial storage-only attacks (e.g., page files exposed without metadata). Envelope encryption with KMS (Option B) deferred to v2. Storage-layer encryption (SSE-S3/SSE-KMS) recommended as complementary layer.
 
 
 Configuration
@@ -171,19 +178,19 @@ Implementation Plan
 
 **New files:**
 
-- ``presto-spi``: ``QueryResultsCacheProvider.java``, ``QueryResultsCacheEntry.java``
-- ``presto-main-base``: ``QueryResultsCacheManager.java``, ``QueryResultsCacheWriter.java``, ``QueryResultsCacheConfig.java``, ``InMemoryQueryResultsCacheProvider.java``
+- ``presto-spi``: ``QueryResultsCacheEntry.java``
+- ``presto-main-base``: ``QueryResultsCacheManager.java``, ``QueryResultsCacheWriter.java``, ``QueryResultsCacheConfig.java``
 
-**Modified files:** ``SqlQueryExecution.java`` (read path), ``SpoolingOutputBuffer.java`` (handle retention), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``, ``Plugin.java``, ``PluginManager.java``.
+**Modified files:** ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``SpoolingOutputBuffer.java`` (handle retention), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
 
 No plan-level changes: no new ``PlanNode``, no ``PlanVisitor`` change, no ``LocalExecutionPlanner`` change, no ``PlanOptimizers`` registration.
 
-**Phases:** (1) SPI + metadata store → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) Testing.
+**Phases:** (1) TempStorage SPI addition (``exists()``) + cache entry data class → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) Testing.
 
 
 Future Work
 ------------
 
 - **Predicate stitching**: Partial cache reuse for partition-decomposable queries when only some partitions change. Requires per-partition stats.
-- **Cross-coordinator sharing**: Redis-based ``QueryResultsCacheProvider``.
+- **Cross-coordinator sharing**: Already supported when using shared TempStorage (e.g., S3). May benefit from a distributed lock or leader election for cache population to avoid redundant writes.
 - **Adaptive caching**: Track hit rates per query pattern, skip caching for one-off queries.
