@@ -137,10 +137,7 @@ Integration point: `SqlQueryManager.createQuery()`, alongside existing HBO track
 - **TTL**: Default 1 hour, configurable per-session. Each `QueryResultsCacheEntry` stores `expirationTimeMillis`, checked on read before serving.
 - **Data-change detection**: Input table stats (`rowCount`, `outputSize`) compared against cached stats. Both metrics must match exactly for all input tables — any change (even a single new row) invalidates the entry, since any data change could alter query results. Whole-table granularity (not per-partition).
 - **Manual bypass**: `query_results_cache_bypass = true` — skip read, still populate. `query_results_cache_invalidate = true` — skip read, overwrite entry.
-- **Storage cleanup**: `QueryResultsCacheManager` checks `TempStorage.getStorageCapabilities()`:
-
-  - **No `AUTO_EXPIRATION`** (e.g., local filesystem): Runs a background cleanup thread that scans the cache directory, reads metadata, checks expiration, and deletes expired entries. When total cache size exceeds a configurable limit, evicts oldest entries (by `creationTimeMillis`) until under the limit. Cleanup interval and size limit are configured on the TempStorage backend itself (see local TempStorage config below).
-  - **Has `AUTO_EXPIRATION`** (e.g., S3): No cleanup thread. Cache writes pass `expireAfter` via `TempDataOperationContext`; the backend sets native expiration (e.g., S3 object expiration header). The backend adds its own configurable buffer to the requested `expireAfter` duration to prevent object deletion while a cache-hit read is in flight. The read-path `expirationTimeMillis` check is the source of truth for staleness; the backend expiration is garbage collection only.
+- **Storage cleanup**: Cache writes pass `expireAfter` via `TempDataOperationContext`. S3 sets native object expiration (with a configurable buffer to prevent deletion during in-flight reads). The read-path `expirationTimeMillis` check in the metadata is the source of truth for staleness; backend expiration is garbage collection only.
 
   Read-path correctness does not depend on the cleanup strategy. The `pageCount` field in `QueryResultsCacheEntry` defines the expected number of pages. The reader reads exactly `pageCount` pages by handle; if any page is missing, `TempStorage.open()` throws and the query fails. Results are never silently truncated.
 
@@ -174,20 +171,6 @@ v1 key management: DEK stored in the metadata file alongside page references. En
 
 - **Shared cache entries**: Cache entries are shared across users. Access control is enforced during the analysis phase (before the cache is consulted), so unauthorized users cannot reach the cache lookup.
 - **Non-deterministic functions**: Detected during cache key computation; cache is not consulted.
-
-
-## Local TempStorage Config
-
-Capacity and cleanup settings live on the local TempStorage backend, not on the cache itself. Configured in `etc/temp-storage/local.properties`:
-
-```properties
-temp-storage-factory.name=local
-temp-storage.path=/tmp/presto/temp_storage
-temp-storage.max-cache-size=10GB        # evict oldest entries when exceeded
-temp-storage.cleanup-interval=5m        # background scan frequency
-```
-
-These are ignored by backends that support `AUTO_EXPIRATION` (e.g., S3), which handle cleanup natively.
 
 
 ## S3 TempStorage
