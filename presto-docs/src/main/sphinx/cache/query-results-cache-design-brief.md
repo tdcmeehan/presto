@@ -108,7 +108,7 @@ In `SqlQueryExecution.start()`, after `createLogicalPlanAndOptimize()`:
 
 1. Compute canonical plan hash.
 2. Check `TempStorage.exists()` on the metadata handle for the key.
-3. On exists: read and deserialize `QueryResultsCacheEntry` from metadata file. Validate: schema match (column names + types vs current `OutputNode`), expiration check, input table stats comparison (HBO threshold, default 10%).
+3. On exists: read and deserialize `QueryResultsCacheEntry` from metadata file. Validate: schema match (column names + types vs current `OutputNode`), expiration check, input table stats comparison (exact match required).
 4. On hit: `serveCachedResult()` — read `SerializedPage` objects from `TempStorage`, enqueue into `OutputBuffer`, transition to finishing. Client sees no difference from normal execution.
 5. On miss: register query ID + cache key for population on completion, proceed with normal scheduling.
 
@@ -135,7 +135,7 @@ Integration point: `SqlQueryManager.createQuery()`, alongside existing HBO track
 ## Invalidation
 
 - **TTL**: Default 1 hour, configurable per-session. Each `QueryResultsCacheEntry` stores `expirationTimeMillis`, checked on read before serving.
-- **Data-change detection**: Input table stats (`rowCount`, `outputSize`) compared against cached stats using HBO's threshold (default 10%). Both metrics must be similar for all input tables. Whole-table granularity (not per-partition).
+- **Data-change detection**: Input table stats (`rowCount`, `outputSize`) compared against cached stats. Both metrics must match exactly for all input tables — any change (even a single new row) invalidates the entry, since any data change could alter query results. Whole-table granularity (not per-partition).
 - **Manual bypass**: `query_results_cache_bypass = true` — skip read, still populate. `query_results_cache_invalidate = true` — skip read, overwrite entry.
 - **Storage cleanup**: `QueryResultsCacheManager` checks `TempStorage.getStorageCapabilities()`:
 
@@ -165,7 +165,6 @@ v1 key management: DEK stored in the metadata file alongside page references. En
 | `query-results-cache.ttl` | `1h` | Default TTL |
 | `query-results-cache.max-result-size` | `100MB` | Max cacheable result size |
 | `query-results-cache.temp-storage` | `local` | TempStorage backend name |
-| `query-results-cache.input-stats-threshold` | `0.1` | Stats comparison threshold |
 | `query-results-cache.max-cache-entries` | `1000` | Max entries |
 | `query-results-cache.cleanup-interval` | `5m` | Cleanup interval (no `AUTO_EXPIRATION`) |
 | `query-results-cache.expiration-buffer` | `1h` | Extra time before backend deletes objects |
