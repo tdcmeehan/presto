@@ -58,10 +58,13 @@ Each connector's `ConnectorTableLayoutHandle.getIdentifier()` must produce a sta
 public interface TempStorage {
     // ... existing methods ...
     boolean exists(TempDataOperationContext context, TempStorageHandle handle) throws IOException;
+    boolean createIfNotExists(TempDataOperationContext context, TempStorageHandle handle, byte[] data) throws IOException;
 }
 ```
 
 `exists()` checks handle liveness without opening the full stream (local `Files.exists()`, S3 `HeadObject`).
+
+`createIfNotExists()` atomically creates an object only if it does not already exist. Returns `true` if the object was created, `false` if it already existed. S3 implementation uses `PutObject` with `If-None-Match: *` header — S3 returns `412 Precondition Failed` if the key exists, which the implementation catches and returns `false`. Used for cache write deduplication (see below).
 
 **StorageCapabilities addition** — add `AUTO_EXPIRATION` to the existing `StorageCapabilities` enum:
 
@@ -132,6 +135,38 @@ Operates at the `ExchangeClient` level, independent of whether spooling is enabl
 Integration point: `SqlQueryManager.createQuery()`, alongside existing HBO tracking.
 
 
+## Write Deduplication (S3)
+
+When multiple coordinators experience a cache miss for the same plan hash simultaneously, only one should execute and populate the cache — others should wait for the result. This avoids redundant execution across coordinators.
+
+Uses [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) (`If-None-Match: *` on `PutObject`) to implement lock-free writer election. No external coordination service required.
+
+**Protocol**:
+
+1. On cache miss, before scheduling, the coordinator calls `TempStorage.createIfNotExists()` on a lock object at `cache/<plan_hash>/lock`. The lock body contains `{"coordinatorId": "...", "creationTimeMillis": ...}`.
+2. **Wins** (`createIfNotExists` returns `true`): This coordinator is the writer. Proceeds with normal scheduling, execution, and cache population. On completion (or failure), deletes the lock object.
+3. **Loses** (`createIfNotExists` returns `false`): Another coordinator is already executing this query. The coordinator polls `TempStorage.exists()` on `cache/<plan_hash>/metadata.json` at a configurable interval (default 1s). When metadata appears, serves from cache. If polling exceeds a configurable timeout (default: equal to the query's execution time limit), falls through to normal execution.
+4. **Crashed writer**: The lock object includes `creationTimeMillis`. A coordinator that loses the election checks the lock's age. If the lock is older than a configurable staleness threshold (default 10 minutes), it ignores the lock and falls through to normal execution, competing for a new lock via `createIfNotExists` after deleting the stale lock. S3 `Expires` header is also set on lock objects as a backstop for garbage collection.
+
+**Fallback**: If `createIfNotExists` throws (e.g., non-S3 backend that doesn't support conditional writes), the coordinator falls through to normal execution and cache population. Duplicate writes to the same cache key are idempotent — the last writer wins, which is safe since results for the same plan hash are identical.
+
+**Why lock-free**: S3's `If-None-Match` provides mutual exclusion at the storage layer — no need for ZooKeeper, DynamoDB, or any external lock manager. The lock is just an S3 object with a short TTL.
+
+```
+Coordinator A (cache miss)          Coordinator B (cache miss)
+  │                                   │
+  ├─ createIfNotExists(lock) → true   ├─ createIfNotExists(lock) → false
+  │  (I'm the writer)                 │  (someone else is writing)
+  │                                   │
+  ├─ Schedule + Execute               ├─ Poll for metadata.json
+  │                                   │     ↓
+  ├─ Write pages + metadata           ├─ metadata appears → serve from cache
+  │                                   │
+  ├─ Delete lock                      │
+  ▼                                   ▼
+```
+
+
 ## Invalidation
 
 - **TTL**: Default 1 hour, configurable per-session. Each `QueryResultsCacheEntry` stores `expirationTimeMillis`, checked on read before serving.
@@ -163,6 +198,9 @@ v1 key management: DEK stored in the metadata file alongside page references. En
 | `query-results-cache.max-result-size` | `100MB` | Max cacheable result size |
 | `query-results-cache.temp-storage` | `local` | TempStorage backend name |
 | `query-results-cache.encryption-enabled` | `true` | Encrypt cached pages |
+| `query-results-cache.write-dedup-enabled` | `true` | Enable write deduplication via conditional writes (S3 only) |
+| `query-results-cache.write-dedup-poll-interval` | `1s` | How often waiting coordinators poll for metadata |
+| `query-results-cache.write-dedup-lock-staleness-threshold` | `10m` | Age after which a lock is considered stale |
 
 **Session properties:** `query_results_cache_enabled`, `query_results_cache_ttl`, `query_results_cache_bypass`, `query_results_cache_invalidate`.
 
@@ -195,6 +233,7 @@ A new `TempStorage` implementation backed by S3, enabling cross-coordinator cach
 | `open()` | `GetObject` | Returns the response `InputStream`. |
 | `remove()` | `DeleteObject` | Best-effort; S3 deletes are eventually consistent but idempotent. |
 | `exists()` | `HeadObject` | Returns `true` on 200, `false` on 404. |
+| `createIfNotExists()` | `PutObject` with `If-None-Match: *` | Returns `true` on success, `false` on `412 Precondition Failed`. Used for cache write deduplication. |
 
 **Key layout**: Objects are stored under a configurable prefix:
 
@@ -230,7 +269,7 @@ Authentication uses the default AWS credential chain (environment variables, ins
 - `presto-main-base`: `QueryResultsCacheManager.java`, `QueryResultsCacheWriter.java`, `QueryResultsCacheConfig.java`
 - `presto-temp-storage-s3`: `S3TempStorage.java`, `S3TempStorageFactory.java`, `S3TempStorageHandle.java`, `S3TempDataSink.java`, `S3TempStorageConfig.java`
 
-**Modified files:** `PlanCanonicalizationStrategy.java` (add `RESULT_CACHE`), `IcebergTableLayoutHandle.java` (implement `getIdentifier()`), `StorageCapabilities.java` (add `AUTO_EXPIRATION`), `TempDataOperationContext.java` (add `expireAfter`), `TempStorage.java` (add `exists()`), `LocalTempStorage.java` (implement `exists()`), `SqlQueryExecution.java` (read path), `ExchangeClient.java` (tee-write listener for cache page capture), `SystemSessionProperties.java`, `ServerMainModule.java`, `SqlQueryManager.java`.
+**Modified files:** `PlanCanonicalizationStrategy.java` (add `RESULT_CACHE`), `IcebergTableLayoutHandle.java` (implement `getIdentifier()`), `StorageCapabilities.java` (add `AUTO_EXPIRATION`), `TempDataOperationContext.java` (add `expireAfter`), `TempStorage.java` (add `exists()`, `createIfNotExists()`), `LocalTempStorage.java` (implement `exists()`, stub `createIfNotExists()`), `SqlQueryExecution.java` (read path + write dedup), `ExchangeClient.java` (tee-write listener for cache page capture), `SystemSessionProperties.java`, `ServerMainModule.java`, `SqlQueryManager.java`.
 
 **Phases:** (1) TempStorage SPI addition (`exists()`) + cache entry data class → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) S3 TempStorage plugin → (7) Testing.
 
@@ -238,5 +277,5 @@ Authentication uses the default AWS credential chain (environment variables, ins
 ## Future Work
 
 - **Predicate stitching**: Partial cache reuse for partition-decomposable queries when only some partitions change. Requires per-partition stats.
-- **Cross-coordinator sharing**: Already supported when using shared TempStorage (e.g., S3). May benefit from a distributed lock or leader election for cache population to avoid redundant writes.
+- **Cross-coordinator sharing**: Already supported when using shared TempStorage (e.g., S3). Write deduplication via S3 conditional writes prevents redundant execution across coordinators.
 - **Adaptive caching**: Track hit rates per query pattern, skip caching for one-off queries.
