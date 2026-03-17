@@ -33,13 +33,25 @@ Cache Key
 
 SHA-256 of the canonicalized query plan, computed via HBO's ``CanonicalPlanGenerator``.
 
-Canonicalization normalizes variable names to positional (``_col_0``, ...), sorts predicates/join criteria, strips source locations, and delegates to ``ConnectorTableLayoutHandle.getIdentifier()`` for connector-specific normalization. Serialized to JSON with deterministic key ordering, then hashed.
+Uses a new ``RESULT_CACHE`` canonicalization strategy. Like ``CONNECTOR``, it supports all plan node types and delegates to ``ConnectorTableLayoutHandle.getIdentifier()`` for connector-specific normalization. Unlike ``CONNECTOR`` and the other HBO strategies, it preserves all constants — filter predicates, projection constants, and scan predicates are never stripped. Two queries with different predicate values produce different cache keys.
 
-**Full key**: ``(canonical_plan_hash, canonicalization_strategy)``
+Canonicalization normalizes variable names to positional (``_col_0``, ...), sorts predicates/join criteria, and strips source locations. Serialized to JSON with deterministic key ordering, then hashed.
 
-Uses ``CONNECTOR`` strategy (error level 1) by default — supports all node types, preserves filter constants, connector-aware table normalization. Configurable per-session.
+**Full key**: ``(canonical_plan_hash)``
 
-Input table statistics are stored in the cache entry for validation, not in the key.
+The strategy is fixed — not configurable per-session. Input table statistics are stored in the cache entry for validation, not in the key.
+
+Connector requirements
+~~~~~~~~~~~~~~~~~~~~~~
+
+Each connector's ``ConnectorTableLayoutHandle.getIdentifier()`` must produce a stable identifier that:
+
+- **Strips version metadata** (e.g., Iceberg ``snapshotId``) so that the same table at different snapshots shares cache keys. Invalidation is handled by input table stats comparison, not by the key. (See `prestodb/presto#26897 <https://github.com/prestodb/presto/issues/26897>`_.)
+- **Includes the catalog name** so that identically-named tables in different catalogs pointing to different data produce distinct cache keys. Users querying the same data through different catalog names pointing to the same underlying storage share cache entries.
+
+**Iceberg**: Currently does not implement ``getIdentifier()``, falling through to the default (``this``), which includes the ``snapshotId``. The result cache requires Iceberg to implement ``getIdentifier()`` with: ``(catalogName, schemaName, tableName)`` — stripping ``snapshotId`` and ``snapshotSpecified``.
+
+**Hive**: Already implements ``getIdentifier()``. The existing implementation strips partition key constants (for HBO). The ``RESULT_CACHE`` strategy preserves all constants at the canonicalization level, so the Hive ``getIdentifier()`` does not need modification — it returns ``(schemaTableName, domainPredicate, remainingPredicate, constraint, bucketFilter)`` with constant preservation governed by the strategy.
 
 
 SPI
@@ -60,9 +72,9 @@ Checks handle liveness without opening the full stream (local ``Files.exists()``
 
 ::
 
-    cache/<plan_hash>_<strategy>/metadata.json
-    cache/<plan_hash>_<strategy>/page_0
-    cache/<plan_hash>_<strategy>/page_1
+    cache/<plan_hash>/metadata.json
+    cache/<plan_hash>/page_0
+    cache/<plan_hash>/page_1
     ...
 
 ``QueryResultsCacheEntry`` (presto-spi) — data class for the metadata file:
@@ -151,14 +163,13 @@ Property                                          Default        Description
 ``query-results-cache.ttl``                       ``1h``         Default TTL
 ``query-results-cache.max-result-size``            ``100MB``      Max cacheable result size
 ``query-results-cache.temp-storage``               ``local``      TempStorage backend name
-``query-results-cache.canonicalization-strategy``  ``CONNECTOR``  HBO strategy
 ``query-results-cache.input-stats-threshold``      ``0.1``        Stats comparison threshold
 ``query-results-cache.max-cache-entries``           ``1000``       Max entries
 ``query-results-cache.cleanup-interval``           ``5m``         Expired entry cleanup (local only)
 ``query-results-cache.encryption-enabled``         ``true``       Encrypt cached pages
 ================================================  =============  ==========================================
 
-**Session properties:** ``query_results_cache_enabled``, ``query_results_cache_ttl``, ``query_results_cache_bypass``, ``query_results_cache_invalidate``, ``query_results_cache_canonicalization_strategy``.
+**Session properties:** ``query_results_cache_enabled``, ``query_results_cache_ttl``, ``query_results_cache_bypass``, ``query_results_cache_invalidate``.
 
 
 Security
@@ -176,7 +187,7 @@ Implementation Plan
 - ``presto-spi``: ``QueryResultsCacheEntry.java``
 - ``presto-main-base``: ``QueryResultsCacheManager.java``, ``QueryResultsCacheWriter.java``, ``QueryResultsCacheConfig.java``
 
-**Modified files:** ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``ExchangeClient.java`` (tee-write listener for cache page capture), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
+**Modified files:** ``PlanCanonicalizationStrategy.java`` (add ``RESULT_CACHE``), ``IcebergTableLayoutHandle.java`` (implement ``getIdentifier()``), ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``ExchangeClient.java`` (tee-write listener for cache page capture), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
 
 **Phases:** (1) TempStorage SPI addition (``exists()``) + cache entry data class → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) Testing.
 

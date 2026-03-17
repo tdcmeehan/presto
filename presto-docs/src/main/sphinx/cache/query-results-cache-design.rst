@@ -143,7 +143,7 @@ Aspect                     Fragment Result Cache        Query Results Cache
 =========================  ===========================  ===============================
 **Level**                  Per-fragment, per-split      Entire query result
 **Intercept point**        ``Driver`` (worker)          ``SqlQueryExecution`` (coord.)
-**Cache key**              ``(plan hash, split ID)``    ``(canonical plan hash, user)``
+**Cache key**              ``(plan hash, split ID)``    ``(canonical plan hash)``
 **Plan changes**           None                         None
 **New operators**          None                         None
 **What's cached**          ``List<Page>`` on local disk ``SerializedPage`` in TempStorage
@@ -172,10 +172,7 @@ traverses the plan tree and produces a ``CanonicalPlan`` by:
 2. Sorting join criteria, filter predicates, and IN-lists.
 3. Removing source location metadata.
 4. Calling ``ConnectorTableLayoutHandle.getIdentifier()`` for
-   connector-specific normalization (e.g., the Hive connector removes
-   partition-column constants so that ``ds='2024-01-01'`` and
-   ``ds='2024-01-02'`` produce different identifiers only when the partition
-   column value is semantically significant).
+   connector-specific normalization.
 
 The canonical plan is serialized to JSON (with deterministic key ordering via
 Jackson's ``ORDER_MAP_ENTRIES_BY_KEYS`` and ``SORT_PROPERTIES_ALPHABETICALLY``)
@@ -187,39 +184,57 @@ and then hashed:
     String canonicalPlanString = canonicalPlan.toString(objectMapper);
     String hash = sha256().hashString(canonicalPlanString, UTF_8).toString();
 
-Strategy choice
----------------
+RESULT_CACHE strategy
+---------------------
 
-HBO defines four canonicalization strategies with increasing coverage
-(decreasing accuracy):
+The existing HBO canonicalization strategies (``DEFAULT``, ``CONNECTOR``,
+``IGNORE_SAFE_CONSTANTS``, ``IGNORE_SCAN_CONSTANTS``) are designed for
+statistics matching, where stripping constants increases hit rates at acceptable
+accuracy loss. For result caching, stripping any constant produces incorrect
+results — ``WHERE ds = '2024-01-01'`` and ``WHERE ds = '2024-01-02'`` return
+different data.
 
-==============================  ===========  =======================================
-Strategy                        Error Level  Behavior
-==============================  ===========  =======================================
-``DEFAULT``                     0            Minimal. Only basic nodes (scan, filter,
-                                             project, agg, unnest).
-``CONNECTOR``                   1            Extends DEFAULT. Supports all node types.
-                                             Connector-specific table normalization.
-``IGNORE_SAFE_CONSTANTS``       2            Extends CONNECTOR. Removes constants
-                                             from ProjectNode.
-``IGNORE_SCAN_CONSTANTS``       3            Extends IGNORE_SAFE_CONSTANTS. Also
-                                             removes non-partition-column predicates.
-==============================  ===========  =======================================
+A new ``RESULT_CACHE`` strategy is added to ``PlanCanonicalizationStrategy``:
 
-The query results cache uses **``CONNECTOR``** (error level 1) by default. This
-is the right balance:
+- Supports all plan node types (like ``CONNECTOR`` and above).
+- Preserves all constants — filter predicates, projection constants, and scan
+  predicates are never stripped.
+- Delegates to ``ConnectorTableLayoutHandle.getIdentifier()`` for
+  connector-specific normalization.
 
-- Two queries with different partition predicates produce different hashes
-  (correct — they scan different data).
-- Two queries that differ only in irrelevant metadata (source locations,
-  variable names) produce the same hash.
-- All plan node types are supported (unlike ``DEFAULT``).
-- Constants in filter predicates are preserved (unlike ``IGNORE_SAFE_CONSTANTS``
-  and ``IGNORE_SCAN_CONSTANTS``), so ``WHERE id > 1`` and ``WHERE id > 1000``
-  are correctly treated as different queries.
+This strategy is hardcoded for the query results cache — not configurable
+per-session.
 
-The strategy is configurable via the ``query_results_cache_canonicalization_strategy``
-session property.
+Connector ``getIdentifier()`` requirements
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each connector's ``ConnectorTableLayoutHandle.getIdentifier()`` implementation
+must produce a stable identifier suitable for result caching:
+
+1. **Strip version metadata.** Connectors like Iceberg embed mutable version
+   identifiers (e.g., ``snapshotId``) in the table handle. These change on every
+   mutation or compaction, which would invalidate the cache on every write even
+   when the queried data hasn't changed. The ``getIdentifier()`` implementation
+   must strip these. Invalidation of stale entries is handled by input table
+   statistics comparison, not by the cache key.
+   (See `prestodb/presto#26897 <https://github.com/prestodb/presto/issues/26897>`_.)
+
+2. **Include the catalog name.** The identifier must include the catalog name so
+   that identically-named tables in different catalogs produce distinct cache
+   keys. Conversely, users querying the same data through different catalog
+   aliases pointing to the same underlying storage share cache entries.
+
+**Iceberg**: Currently does not override ``getIdentifier()`` — falls through to
+the default (``this``), which includes the ``snapshotId`` via
+``IcebergTableHandle``. The result cache requires Iceberg to implement
+``getIdentifier()`` returning ``(catalogName, schemaName, tableName)`` —
+stripping ``snapshotId`` and ``snapshotSpecified``.
+
+**Hive**: Already implements ``getIdentifier()`` returning
+``(schemaTableName, domainPredicate, remainingPredicate, constraint,
+bucketFilter)``. The ``RESULT_CACHE`` strategy preserves all constants at the
+canonicalization level, so no changes are needed to the Hive implementation.
+The catalog name should be added to the returned map.
 
 What gets hashed
 ----------------
@@ -234,14 +249,17 @@ Full cache key
 --------------
 
 The full cache key is:
-``(canonical_plan_hash, canonicalization_strategy, user_identity_hash)``.
+``(canonical_plan_hash)``.
+
+The canonicalization strategy is always ``RESULT_CACHE`` and does not vary, so
+it is not part of the key.
 
 Input table statistics are **not** part of the cache key. Instead, they are
 stored as metadata in the cache entry and used for **validation** at lookup time
 (see `Invalidation`_).
 
-Including the user identity hash ensures cache entries respect access control
-(see `Security Considerations`_).
+Access control is enforced during the analysis phase before the cache is
+consulted (see `Security Considerations`_).
 
 
 Cache Storage
@@ -871,7 +889,6 @@ Property                                           Default    Description
 ``query-results-cache.ttl``                        ``1h``     Default cache entry TTL
 ``query-results-cache.max-result-size``            ``100MB``  Max result size eligible for caching
 ``query-results-cache.temp-storage``               ``local``  TempStorage name for cached results
-``query-results-cache.canonicalization-strategy``   ``CONNECTOR``  HBO strategy for hashing
 ``query-results-cache.input-stats-threshold``      ``0.1``    Threshold for input stats comparison
 ``query-results-cache.max-cache-entries``           ``1000``   Max entries in the cache
 ``query-results-cache.cleanup-interval``           ``5m``     Expired entry cleanup interval (local TempStorage only)
@@ -888,7 +905,6 @@ Property                                       Description
 ``query_results_cache_ttl``                    Per-session TTL override
 ``query_results_cache_bypass``                 Skip cache read (still populates on completion)
 ``query_results_cache_invalidate``             Skip cache read AND overwrite existing entry
-``query_results_cache_canonicalization_strategy``  Per-session strategy override
 =============================================  ==================================================
 
 
@@ -945,6 +961,11 @@ Modified files
 ========================================================  ==========================================
 File                                                      Change
 ========================================================  ==========================================
+``PlanCanonicalizationStrategy.java``                     Add ``RESULT_CACHE`` enum value
+``IcebergTableLayoutHandle.java``                         Implement ``getIdentifier()`` —
+                                                          ``(catalogName, schemaName, tableName)``,
+                                                          stripping ``snapshotId``
+``HiveTableLayoutHandle.java``                            Add catalog name to ``getIdentifier()``
 ``SqlQueryExecution.java``                                Cache check in ``start()``, cache-hit
                                                           serving via ``serveCachedResult()``
 ``ExchangeClient.java``                                   Add tee-write listener for cache page
