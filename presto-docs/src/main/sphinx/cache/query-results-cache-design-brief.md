@@ -139,7 +139,7 @@ Integration point: `SqlQueryManager.createQuery()`, alongside existing HBO track
 - **Manual bypass**: `query_results_cache_bypass = true` — skip read, still populate. `query_results_cache_invalidate = true` — skip read, overwrite entry.
 - **Storage cleanup**: `QueryResultsCacheManager` checks `TempStorage.getStorageCapabilities()`:
 
-  - **No `AUTO_EXPIRATION`** (e.g., local filesystem): Runs a background cleanup thread (configurable via `cleanup-interval`, default 5m) that scans the cache directory, reads metadata, checks expiration, and deletes expired entries.
+  - **No `AUTO_EXPIRATION`** (e.g., local filesystem): Runs a background cleanup thread (configurable via `cleanup-interval`, default 5m) that scans the cache directory, reads metadata, checks expiration, and deletes expired entries. When total cache size exceeds `max-cache-size`, evicts oldest entries (by `creationTimeMillis`) until under the limit.
   - **Has `AUTO_EXPIRATION`** (e.g., S3): No cleanup thread. Cache writes pass `expireAfter` via `TempDataOperationContext`; the backend sets native expiration (e.g., S3 object expiration header). The backend adds its own configurable buffer to the requested `expireAfter` duration to prevent object deletion while a cache-hit read is in flight. The read-path `expirationTimeMillis` check is the source of truth for staleness; the backend expiration is garbage collection only.
 
   Read-path correctness does not depend on the cleanup strategy. The `pageCount` field in `QueryResultsCacheEntry` defines the expected number of pages. The reader reads exactly `pageCount` pages by handle; if any page is missing, `TempStorage.open()` throws and the query fails. Results are never silently truncated.
@@ -165,7 +165,7 @@ v1 key management: DEK stored in the metadata file alongside page references. En
 | `query-results-cache.ttl` | `1h` | Default TTL |
 | `query-results-cache.max-result-size` | `100MB` | Max cacheable result size |
 | `query-results-cache.temp-storage` | `local` | TempStorage backend name |
-| `query-results-cache.max-cache-entries` | `1000` | Max entries |
+| `query-results-cache.max-cache-size` | `10GB` | Max total cache size (local only; ignored for S3) |
 | `query-results-cache.cleanup-interval` | `5m` | Cleanup interval (no `AUTO_EXPIRATION`) |
 | `query-results-cache.encryption-enabled` | `true` | Encrypt cached pages |
 
