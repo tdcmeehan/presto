@@ -39,7 +39,7 @@ Canonicalization normalizes variable names to positional (``_col_0``, ...), sort
 
 **Full key**: ``(canonical_plan_hash)``
 
-The strategy is fixed — not configurable per-session. Input table statistics are stored in the cache entry for validation, not in the key.
+Input table statistics are stored in the cache entry for validation, not in the key.
 
 Connector requirements
 ~~~~~~~~~~~~~~~~~~~~~~
