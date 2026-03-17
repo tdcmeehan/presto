@@ -653,16 +653,30 @@ Storage cleanup
 ---------------
 
 When a cache entry expires or is invalidated, the associated ``TempStorage``
-files must be deleted. The ``QueryResultsCacheManager`` runs a periodic
-background task that:
+files must be deleted. The cleanup strategy depends on the TempStorage backend:
 
-1. Calls ``QueryResultsCacheProvider.removeExpiredEntries()`` to collect expired
-   entries.
-2. For each expired entry, deserializes the ``TempStorageHandle`` objects and
-   calls ``TempStorage.remove()`` for each.
+**Local filesystem**: ``QueryResultsCacheManager`` runs a periodic background
+task (configurable via ``query-results-cache.cleanup-interval``, default 5m)
+that:
+
+1. Scans the cache directory for entry prefixes.
+2. Reads each ``metadata.json`` and checks ``expirationTimeMillis``.
+3. For expired entries, calls ``TempStorage.remove()`` for each page handle and
+   the metadata handle.
 
 This is analogous to ``FileFragmentResultCacheManager``'s
 ``CacheRemovalListener``, which deletes files on eviction.
+
+**S3**: Delegates expiration to `S3 object lifecycle policies
+<https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html>`_.
+At cache write time, the entry is stored with a lifecycle-compatible expiration
+(e.g., via object tagging with the configured TTL, matched by a lifecycle rule
+on the ``cache/`` prefix). S3 handles deletion automatically. No background
+cleanup thread is needed for S3-backed deployments.
+
+The read-path TTL check (``expirationTimeMillis`` in ``QueryResultsCacheEntry``)
+remains active for both backends, ensuring stale entries are never served even
+if storage-level cleanup has not yet run.
 
 
 Encryption
@@ -860,7 +874,7 @@ Property                                           Default    Description
 ``query-results-cache.canonicalization-strategy``   ``CONNECTOR``  HBO strategy for hashing
 ``query-results-cache.input-stats-threshold``      ``0.1``    Threshold for input stats comparison
 ``query-results-cache.max-cache-entries``           ``1000``   Max entries in the cache
-``query-results-cache.cleanup-interval``           ``5m``     How often to clean up expired entries
+``query-results-cache.cleanup-interval``           ``5m``     Expired entry cleanup interval (local TempStorage only)
 ``query-results-cache.encryption-enabled``         ``true``   Encrypt cached result pages (AES-256-CTR)
 =================================================  =========  =============================================
 

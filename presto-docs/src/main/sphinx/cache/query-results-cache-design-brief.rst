@@ -119,10 +119,13 @@ Integration point: ``SqlQueryManager.createQuery()``, alongside existing HBO tra
 Invalidation
 ------------
 
-- **TTL**: Default 1 hour, configurable per-session. Checked on read.
+- **TTL**: Default 1 hour, configurable per-session. Each ``QueryResultsCacheEntry`` stores ``expirationTimeMillis``, checked on read before serving.
 - **Data-change detection**: Input table stats (``rowCount``, ``outputSize``) compared against cached stats using HBO's threshold (default 10%). Both metrics must be similar for all input tables. Whole-table granularity (not per-partition).
 - **Manual bypass**: ``query_results_cache_bypass = true`` — skip read, still populate. ``query_results_cache_invalidate = true`` — skip read, overwrite entry.
-- **Storage cleanup**: Background thread scans cache directory in TempStorage, reads metadata to check expiration, deletes expired entries (metadata + pages).
+- **Storage cleanup**: Strategy depends on the TempStorage backend:
+
+  - **Local filesystem**: ``QueryResultsCacheManager`` runs a background cleanup thread (configurable via ``cleanup-interval``, default 5m) that scans the cache directory, reads metadata, checks expiration, and deletes expired entries.
+  - **S3**: Delegates expiration to S3 object lifecycle policies. The cache write sets an expiration tag or prefix-based lifecycle rule matching the configured TTL. No background thread needed — S3 handles deletion.
 
 
 Encryption
@@ -151,7 +154,7 @@ Property                                          Default        Description
 ``query-results-cache.canonicalization-strategy``  ``CONNECTOR``  HBO strategy
 ``query-results-cache.input-stats-threshold``      ``0.1``        Stats comparison threshold
 ``query-results-cache.max-cache-entries``           ``1000``       Max entries
-``query-results-cache.cleanup-interval``           ``5m``         Expired entry cleanup interval
+``query-results-cache.cleanup-interval``           ``5m``         Expired entry cleanup (local only)
 ``query-results-cache.encryption-enabled``         ``true``       Encrypt cached pages
 ================================================  =============  ==========================================
 
