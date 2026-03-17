@@ -9,9 +9,9 @@ Caches completed SELECT query results so semantically equivalent future queries 
 - **HBO canonicalization** — deterministic plan hash as cache key.
 - **TempStorage** — pluggable storage (local disk, S3) for serialized result pages.
 
-Intercepts at ``SqlQueryExecution.start()`` after optimization, before scheduling. On cache hit, no scheduler, no fragments, no operators — pages are read from ``TempStorage`` and fed directly to the client via the existing ``OutputBuffer`` → ``ExchangeClient`` → HTTP response pipeline.
+Intercepts at ``SqlQueryExecution.start()`` after optimization, before scheduling. On cache hit, pages are read from ``TempStorage`` and fed directly to the client via the existing ``OutputBuffer`` → ``ExchangeClient`` → HTTP response pipeline, bypassing scheduling and execution.
 
-No plan modifications. No new ``PlanNode``, ``Operator``, or optimizer. Same principle as the Fragment Result Cache (intercept at boundary, leave plan alone), applied at whole-query level on the coordinator instead of per-split on workers.
+Follows the same pattern as the Fragment Result Cache — intercept at the execution boundary — applied at whole-query level on the coordinator instead of per-split on workers.
 
 ::
 
@@ -25,14 +25,7 @@ Goals
 - Eliminate redundant execution of identical SELECTs.
 - Single storage layer via TempStorage SPI for both metadata and result pages.
 - Input-table-aware invalidation via HBO statistics comparison.
-- No plan-level changes.
-
 Non-goals (v1): partial reuse / predicate stitching, DML caching, non-deterministic function caching.
-
-Why not FRC for this?
-~~~~~~~~~~~~~~~~~~~~~
-
-FRC caches per-split results on worker-local disk. The value depends on the same split hitting the same worker, with the cache hit served from local I/O. With S3-backed storage, FRC would replace one S3 read (source table) with another (cache), at per-split granularity (millions of PUTs/GETs per query), with no locality benefit. The query results cache operates at whole-query granularity on the coordinator — one cache entry per query, amortizing the storage cost.
 
 
 Cache Key
@@ -61,7 +54,7 @@ SPI
         boolean exists(TempDataOperationContext context, TempStorageHandle handle) throws IOException;
     }
 
-Enables cheap cache-miss checks (local ``Files.exists()``, S3 ``HeadObject``) without opening the full stream. Useful beyond the cache for any TempStorage consumer that needs to verify liveness of spooled data.
+Checks handle liveness without opening the full stream (local ``Files.exists()``, S3 ``HeadObject``).
 
 **Storage layout** — metadata and pages stored together in TempStorage under a key-derived path:
 
@@ -88,7 +81,7 @@ Enables cheap cache-miss checks (local ``Files.exists()``, S3 ``HeadObject``) wi
         Optional<byte[]> encryptionKey;          // DEK
     }
 
-No separate ``QueryResultsCacheProvider`` interface. ``QueryResultsCacheManager`` reads/writes directly via TempStorage. Cache existence is checked via ``TempStorage.exists()`` on the metadata handle. Cross-coordinator sharing comes for free when using shared TempStorage (e.g., S3).
+``QueryResultsCacheManager`` reads/writes directly via TempStorage. Cache existence is checked via ``TempStorage.exists()`` on the metadata handle. Cross-coordinator sharing is supported when using shared TempStorage (e.g., S3).
 
 
 Read Path
@@ -118,7 +111,7 @@ As pages arrive at the coordinator's ``ExchangeClient`` during normal execution,
 - On successful SELECT completion, the ``QueryResultsCacheWriter`` collects the accumulated ``TempStorageHandle`` references + input table stats, builds a ``QueryResultsCacheEntry``, and stores metadata in the cache provider.
 - If the query fails or is cancelled, partial cache writes are discarded.
 
-This approach is independent of whether spooling is enabled — it operates at the ``ExchangeClient`` level, not the ``OutputBuffer`` level. No TTFB impact. Same pattern as ``FileFragmentResultCacheManager.cachePages()``, but incremental rather than post-completion.
+Operates at the ``ExchangeClient`` level, independent of whether spooling is enabled. Same pattern as ``FileFragmentResultCacheManager.cachePages()``, but incremental rather than post-completion.
 
 Integration point: ``SqlQueryManager.createQuery()``, alongside existing HBO tracking.
 
@@ -140,7 +133,7 @@ Pages encrypted via existing ``AesSpillCipher`` / ``PagesSerde`` pipeline (AES-2
 - **Write**: Create ``AesSpillCipher``, serialize pages with cipher-aware ``PagesSerde``, store DEK in ``QueryResultsCacheEntry.encryptionKey``.
 - **Read**: Reconstruct cipher from stored DEK, decrypt during deserialization, ``cipher.destroy()`` after.
 
-v1 key management: DEK stored in the metadata file alongside page references (Option A). Acceptable — attacker with storage access already sees query text/schemas; encryption protects against partial storage-only attacks (e.g., page files exposed without metadata). Envelope encryption with KMS (Option B) deferred to v2. Storage-layer encryption (SSE-S3/SSE-KMS) recommended as complementary layer.
+v1 key management: DEK stored in the metadata file alongside page references. Envelope encryption with KMS deferred to v2. Storage-layer encryption (SSE-S3/SSE-KMS) can be used as a complementary layer.
 
 
 Configuration
@@ -169,7 +162,7 @@ Security
 --------
 
 - **Shared cache entries**: Cache entries are shared across users. Access control is enforced during the analysis phase (before the cache is consulted), so unauthorized users cannot reach the cache lookup.
-- **Non-deterministic functions**: rejected at cache key computation — cache never consulted.
+- **Non-deterministic functions**: Detected during cache key computation; cache is not consulted.
 
 
 Implementation Plan
@@ -181,8 +174,6 @@ Implementation Plan
 - ``presto-main-base``: ``QueryResultsCacheManager.java``, ``QueryResultsCacheWriter.java``, ``QueryResultsCacheConfig.java``
 
 **Modified files:** ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``ExchangeClient.java`` (tee-write listener for cache page capture), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
-
-No plan-level changes: no new ``PlanNode``, no ``PlanVisitor`` change, no ``LocalExecutionPlanner`` change, no ``PlanOptimizers`` registration.
 
 **Phases:** (1) TempStorage SPI addition (``exists()``) + cache entry data class → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) Testing.
 
