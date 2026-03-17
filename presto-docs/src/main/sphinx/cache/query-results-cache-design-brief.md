@@ -150,8 +150,6 @@ Uses [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/usergui
 
 **Fallback**: If `createIfNotExists` throws (e.g., non-S3 backend that doesn't support conditional writes), the coordinator falls through to normal execution and cache population. Duplicate writes to the same cache key are idempotent — the last writer wins, which is safe since results for the same plan hash are identical.
 
-**Why lock-free**: S3's `If-None-Match` provides mutual exclusion at the storage layer — no need for ZooKeeper, DynamoDB, or any external lock manager. The lock is just an S3 object with a short TTL.
-
 ```
 Coordinator A (cache miss)          Coordinator B (cache miss)
   │                                   │
