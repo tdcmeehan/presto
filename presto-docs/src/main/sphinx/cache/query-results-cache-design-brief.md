@@ -178,16 +178,66 @@ v1 key management: DEK stored in the metadata file alongside page references. En
 - **Non-deterministic functions**: Detected during cache key computation; cache is not consulted.
 
 
+## S3 TempStorage
+
+A new `TempStorage` implementation backed by S3, enabling cross-coordinator cache sharing and native object expiration.
+
+**Module**: New Maven module `presto-temp-storage-s3`, following the plugin pattern. Ships as a plugin; loaded via `etc/temp-storage/s3.properties`.
+
+### Implementation
+
+`S3TempStorage` implements `TempStorage`. `S3TempStorageFactory` implements `TempStorageFactory` with `getName()` returning `"s3"`.
+
+**Capabilities**: `REMOTELY_ACCESSIBLE`, `AUTO_EXPIRATION`.
+
+**Handle**: `S3TempStorageHandle` wraps an S3 key (string). `serializeHandle()` / `deserialize()` encode/decode the key as UTF-8 bytes. `getPathAsString()` returns the full `s3://bucket/key` URI.
+
+**Operations**:
+
+| Method | S3 API | Notes |
+|---|---|---|
+| `create()` | — | Returns an `S3TempDataSink` that buffers writes and uploads on `commit()` via `PutObject`. If `expireAfter` is set in the context, sets the `Expires` header on the object. |
+| `open()` | `GetObject` | Returns the response `InputStream`. |
+| `remove()` | `DeleteObject` | Best-effort; S3 deletes are eventually consistent but idempotent. |
+| `exists()` | `HeadObject` | Returns `true` on 200, `false` on 404. |
+
+**Key layout**: Objects are stored under a configurable prefix:
+
+```
+<key-prefix>/cache/<plan_hash>/metadata.json
+<key-prefix>/cache/<plan_hash>/page_0
+...
+```
+
+**Expiration buffer**: When `expireAfter` is provided via `TempDataOperationContext`, the factory adds a configurable buffer (default 1 hour, via `s3.expiration-buffer`) before setting the S3 `Expires` header. This prevents S3 lifecycle rules from deleting objects while a cache-hit read is in flight.
+
+### Configuration
+
+Properties file: `etc/temp-storage/s3.properties`
+
+```properties
+temp-storage-factory.name=s3
+s3.bucket=my-presto-temp-storage
+s3.key-prefix=presto/temp
+s3.region=us-east-1
+s3.endpoint=                          # optional, for S3-compatible stores
+s3.expiration-buffer=1h               # buffer added to expireAfter before setting Expires header
+```
+
+Authentication uses the default AWS credential chain (environment variables, instance profile, etc.), consistent with existing Presto S3 integrations (e.g., `PrestoS3FileSystem`).
+
+
 ## Implementation Plan
 
 **New files:**
 
 - `presto-spi`: `QueryResultsCacheEntry.java`
 - `presto-main-base`: `QueryResultsCacheManager.java`, `QueryResultsCacheWriter.java`, `QueryResultsCacheConfig.java`
+- `presto-temp-storage-s3`: `S3TempStorage.java`, `S3TempStorageFactory.java`, `S3TempStorageHandle.java`, `S3TempDataSink.java`, `S3TempStorageConfig.java`
 
 **Modified files:** `PlanCanonicalizationStrategy.java` (add `RESULT_CACHE`), `IcebergTableLayoutHandle.java` (implement `getIdentifier()`), `StorageCapabilities.java` (add `AUTO_EXPIRATION`), `TempDataOperationContext.java` (add `expireAfter`), `TempStorage.java` (add `exists()`), `LocalTempStorage.java` (implement `exists()`), `SqlQueryExecution.java` (read path), `ExchangeClient.java` (tee-write listener for cache page capture), `SystemSessionProperties.java`, `ServerMainModule.java`, `SqlQueryManager.java`.
 
-**Phases:** (1) TempStorage SPI addition (`exists()`) + cache entry data class → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) Testing.
+**Phases:** (1) TempStorage SPI addition (`exists()`) + cache entry data class → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) S3 TempStorage plugin → (7) Testing.
 
 
 ## Future Work
