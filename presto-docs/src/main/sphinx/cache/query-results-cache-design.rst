@@ -671,11 +671,12 @@ Storage cleanup
 ---------------
 
 When a cache entry expires or is invalidated, the associated ``TempStorage``
-files must be deleted. The cleanup strategy depends on the TempStorage backend:
+files must be deleted. ``QueryResultsCacheManager`` selects the cleanup strategy
+based on the ``TempStorage.getStorageCapabilities()`` result:
 
-**Local filesystem**: ``QueryResultsCacheManager`` runs a periodic background
-task (configurable via ``query-results-cache.cleanup-interval``, default 5m)
-that:
+**No** ``AUTO_EXPIRATION`` **(e.g., local filesystem)**: Runs a periodic
+background task (configurable via ``query-results-cache.cleanup-interval``,
+default 5m) that:
 
 1. Scans the cache directory for entry prefixes.
 2. Reads each ``metadata.json`` and checks ``expirationTimeMillis``.
@@ -685,16 +686,50 @@ that:
 This is analogous to ``FileFragmentResultCacheManager``'s
 ``CacheRemovalListener``, which deletes files on eviction.
 
-**S3**: Delegates expiration to `S3 object lifecycle policies
-<https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html>`_.
-At cache write time, the entry is stored with a lifecycle-compatible expiration
-(e.g., via object tagging with the configured TTL, matched by a lifecycle rule
-on the ``cache/`` prefix). S3 handles deletion automatically. No background
-cleanup thread is needed for S3-backed deployments.
+**Has** ``AUTO_EXPIRATION`` **(e.g., S3)**: No cleanup thread. Cache writes pass
+``expireAfter`` via ``TempDataOperationContext``; the S3 implementation uses
+this to set native object expiration (e.g., via the ``Expires`` header or object
+tagging matched by a `lifecycle rule
+<https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html>`_
+on the ``cache/`` prefix).
 
-The read-path TTL check (``expirationTimeMillis`` in ``QueryResultsCacheEntry``)
-remains active for both backends, ensuring stale entries are never served even
-if storage-level cleanup has not yet run.
+The backend expiration is set to **TTL + a buffer** (configurable via
+``query-results-cache.expiration-buffer``, default 1 hour). This prevents S3
+from deleting objects while a cache-hit read is still in flight. The read-path
+``expirationTimeMillis`` check is the source of truth for staleness; backend
+expiration is garbage collection only.
+
+**Read-path correctness**: The ``pageCount`` field in ``QueryResultsCacheEntry``
+defines the expected number of pages. The reader reads exactly ``pageCount``
+pages by constructing each handle (``page_0`` through ``page_{n-1}``). If any
+page is missing, ``TempStorage.open()`` throws ``IOException`` and the query
+fails. Results are never silently truncated.
+
+SPI additions for cleanup
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**StorageCapabilities** — add ``AUTO_EXPIRATION`` to the existing enum:
+
+.. code-block:: java
+
+    public enum StorageCapabilities {
+        REMOTELY_ACCESSIBLE,
+        AUTO_EXPIRATION,  // storage handles TTL-based expiration natively
+    }
+
+**TempDataOperationContext** — add an optional TTL hint:
+
+.. code-block:: java
+
+    public class TempDataOperationContext {
+        // ... existing fields ...
+        private final Optional<Duration> expireAfter;
+    }
+
+Backends that report ``AUTO_EXPIRATION`` use ``expireAfter`` to set native
+expiration on write. Backends without the capability ignore the field. The cache
+manager sets ``expireAfter`` to TTL + expiration buffer when writing cache
+entries.
 
 
 Encryption
@@ -891,7 +926,8 @@ Property                                           Default    Description
 ``query-results-cache.temp-storage``               ``local``  TempStorage name for cached results
 ``query-results-cache.input-stats-threshold``      ``0.1``    Threshold for input stats comparison
 ``query-results-cache.max-cache-entries``           ``1000``   Max entries in the cache
-``query-results-cache.cleanup-interval``           ``5m``     Expired entry cleanup interval (local TempStorage only)
+``query-results-cache.cleanup-interval``           ``5m``     Cleanup interval (no ``AUTO_EXPIRATION``)
+``query-results-cache.expiration-buffer``          ``1h``     Extra time before backend deletes objects
 ``query-results-cache.encryption-enabled``         ``true``   Encrypt cached result pages (AES-256-CTR)
 =================================================  =========  =============================================
 
@@ -966,6 +1002,8 @@ File                                                      Change
                                                           ``(catalogName, schemaName, tableName)``,
                                                           stripping ``snapshotId``
 ``HiveTableLayoutHandle.java``                            Add catalog name to ``getIdentifier()``
+``StorageCapabilities.java``                              Add ``AUTO_EXPIRATION``
+``TempDataOperationContext.java``                         Add ``Optional<Duration> expireAfter``
 ``SqlQueryExecution.java``                                Cache check in ``start()``, cache-hit
                                                           serving via ``serveCachedResult()``
 ``ExchangeClient.java``                                   Add tee-write listener for cache page

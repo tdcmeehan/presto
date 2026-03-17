@@ -57,7 +57,7 @@ Each connector's ``ConnectorTableLayoutHandle.getIdentifier()`` must produce a s
 SPI
 ---
 
-**TempStorage addition** — add ``exists()`` to the ``TempStorage`` SPI:
+**TempStorage additions**:
 
 .. code-block:: java
 
@@ -66,7 +66,18 @@ SPI
         boolean exists(TempDataOperationContext context, TempStorageHandle handle) throws IOException;
     }
 
-Checks handle liveness without opening the full stream (local ``Files.exists()``, S3 ``HeadObject``).
+``exists()`` checks handle liveness without opening the full stream (local ``Files.exists()``, S3 ``HeadObject``).
+
+**StorageCapabilities addition** — add ``AUTO_EXPIRATION`` to the existing ``StorageCapabilities`` enum:
+
+.. code-block:: java
+
+    public enum StorageCapabilities {
+        REMOTELY_ACCESSIBLE,
+        AUTO_EXPIRATION,  // storage handles TTL-based expiration natively
+    }
+
+**TempDataOperationContext addition** — add ``Optional<Duration> expireAfter`` to the existing context object passed to ``create()``. Backends that support ``AUTO_EXPIRATION`` use this to set native expiration (e.g., S3 object expiration header). Backends that do not support it ignore the field.
 
 **Storage layout** — metadata and pages stored together in TempStorage under a key-derived path:
 
@@ -134,10 +145,12 @@ Invalidation
 - **TTL**: Default 1 hour, configurable per-session. Each ``QueryResultsCacheEntry`` stores ``expirationTimeMillis``, checked on read before serving.
 - **Data-change detection**: Input table stats (``rowCount``, ``outputSize``) compared against cached stats using HBO's threshold (default 10%). Both metrics must be similar for all input tables. Whole-table granularity (not per-partition).
 - **Manual bypass**: ``query_results_cache_bypass = true`` — skip read, still populate. ``query_results_cache_invalidate = true`` — skip read, overwrite entry.
-- **Storage cleanup**: Strategy depends on the TempStorage backend:
+- **Storage cleanup**: ``QueryResultsCacheManager`` checks ``TempStorage.getStorageCapabilities()``:
 
-  - **Local filesystem**: ``QueryResultsCacheManager`` runs a background cleanup thread (configurable via ``cleanup-interval``, default 5m) that scans the cache directory, reads metadata, checks expiration, and deletes expired entries.
-  - **S3**: Delegates expiration to S3 object lifecycle policies. The cache write sets an expiration tag or prefix-based lifecycle rule matching the configured TTL. No background thread needed — S3 handles deletion.
+  - **No** ``AUTO_EXPIRATION`` (e.g., local filesystem): Runs a background cleanup thread (configurable via ``cleanup-interval``, default 5m) that scans the cache directory, reads metadata, checks expiration, and deletes expired entries.
+  - **Has** ``AUTO_EXPIRATION`` (e.g., S3): No cleanup thread. Cache writes pass ``expireAfter`` via ``TempDataOperationContext``; the backend sets native expiration (e.g., S3 object expiration header). The backend expiration is set to TTL + a buffer (default 1 hour) to prevent object deletion while a cache-hit read is in flight. The read-path ``expirationTimeMillis`` check is the source of truth for staleness; the backend expiration is garbage collection only.
+
+  Read-path correctness does not depend on the cleanup strategy. The ``pageCount`` field in ``QueryResultsCacheEntry`` defines the expected number of pages. The reader reads exactly ``pageCount`` pages by handle; if any page is missing, ``TempStorage.open()`` throws and the query fails. Results are never silently truncated.
 
 
 Encryption
@@ -165,7 +178,8 @@ Property                                          Default        Description
 ``query-results-cache.temp-storage``               ``local``      TempStorage backend name
 ``query-results-cache.input-stats-threshold``      ``0.1``        Stats comparison threshold
 ``query-results-cache.max-cache-entries``           ``1000``       Max entries
-``query-results-cache.cleanup-interval``           ``5m``         Expired entry cleanup (local only)
+``query-results-cache.cleanup-interval``           ``5m``         Cleanup interval (no ``AUTO_EXPIRATION``)
+``query-results-cache.expiration-buffer``          ``1h``         Extra time before backend deletes objects
 ``query-results-cache.encryption-enabled``         ``true``       Encrypt cached pages
 ================================================  =============  ==========================================
 
@@ -187,7 +201,7 @@ Implementation Plan
 - ``presto-spi``: ``QueryResultsCacheEntry.java``
 - ``presto-main-base``: ``QueryResultsCacheManager.java``, ``QueryResultsCacheWriter.java``, ``QueryResultsCacheConfig.java``
 
-**Modified files:** ``PlanCanonicalizationStrategy.java`` (add ``RESULT_CACHE``), ``IcebergTableLayoutHandle.java`` (implement ``getIdentifier()``), ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``ExchangeClient.java`` (tee-write listener for cache page capture), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
+**Modified files:** ``PlanCanonicalizationStrategy.java`` (add ``RESULT_CACHE``), ``IcebergTableLayoutHandle.java`` (implement ``getIdentifier()``), ``StorageCapabilities.java`` (add ``AUTO_EXPIRATION``), ``TempDataOperationContext.java`` (add ``expireAfter``), ``TempStorage.java`` (add ``exists()``), ``LocalTempStorage.java`` (implement ``exists()``), ``SqlQueryExecution.java`` (read path), ``ExchangeClient.java`` (tee-write listener for cache page capture), ``SystemSessionProperties.java``, ``ServerMainModule.java``, ``SqlQueryManager.java``.
 
 **Phases:** (1) TempStorage SPI addition (``exists()``) + cache entry data class → (2) Write path → (3) Read path → (4) Encryption → (5) Invalidation + cleanup → (6) Testing.
 
