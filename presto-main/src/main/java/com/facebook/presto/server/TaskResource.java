@@ -30,6 +30,7 @@ import com.facebook.presto.execution.buffer.OutputBuffers.OutputBufferId;
 import com.facebook.presto.metadata.SessionPropertyManager;
 import com.facebook.presto.server.remotetask.DynamicFilterResponse;
 import com.facebook.presto.sql.planner.PlanFragment;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.Futures;
@@ -331,20 +332,22 @@ public class TaskResource
         requireNonNull(taskId, "taskId is null");
 
         if (maxWait == null) {
-            Map<String, TupleDomain<String>> filters = taskManager.getDynamicFiltersSince(taskId, sinceVersion);
-            if (taskManager.isDynamicFilterOperatorCompleted(taskId)) {
-                asyncResponse.resume(DynamicFilterResponse.completed(filters, sinceVersion, taskManager.getRegisteredDynamicFilterIds(taskId)));
-            }
-            else {
-                asyncResponse.resume(DynamicFilterResponse.incomplete(filters, sinceVersion));
-            }
+            DynamicFilterResult result = new DynamicFilterResult(
+                    taskManager.getDynamicFiltersSince(taskId, sinceVersion),
+                    sinceVersion,
+                    taskManager.isDynamicFilterOperatorCompleted(taskId),
+                    taskManager.getRegisteredDynamicFilterIds(taskId),
+                    ImmutableSet.of());
+            asyncResponse.resume(result.isOperatorCompleted()
+                    ? DynamicFilterResponse.completed(result.getFilters(), result.getVersion(), result.getCompletedFilterIds(), result.getNotGeneratedFilterIds())
+                    : DynamicFilterResponse.incomplete(result.getFilters(), result.getVersion(), result.getCompletedFilterIds(), result.getNotGeneratedFilterIds()));
             return;
         }
 
         Duration waitTime = randomizeWaitTime(maxWait);
         ListenableFuture<DynamicFilterResult> futureResult = addTimeout(
                 taskManager.getDynamicFiltersWait(taskId, sinceVersion),
-                () -> new DynamicFilterResult(taskManager.getDynamicFiltersSince(taskId, sinceVersion), sinceVersion, taskManager.isDynamicFilterOperatorCompleted(taskId), taskManager.getRegisteredDynamicFilterIds(taskId)),
+                () -> new DynamicFilterResult(taskManager.getDynamicFiltersSince(taskId, sinceVersion), sinceVersion, taskManager.isDynamicFilterOperatorCompleted(taskId), taskManager.getRegisteredDynamicFilterIds(taskId), ImmutableSet.of()),
                 waitTime,
                 timeoutExecutor);
 
@@ -353,8 +356,8 @@ public class TaskResource
         ListenableFuture<DynamicFilterResponse> transformedFuture = Futures.transform(
                 futureResult,
                 result -> result.isOperatorCompleted()
-                        ? DynamicFilterResponse.completed(result.getFilters(), result.getVersion(), result.getCompletedFilterIds())
-                        : DynamicFilterResponse.incomplete(result.getFilters(), result.getVersion()),
+                        ? DynamicFilterResponse.completed(result.getFilters(), result.getVersion(), result.getCompletedFilterIds(), result.getNotGeneratedFilterIds())
+                        : DynamicFilterResponse.incomplete(result.getFilters(), result.getVersion(), result.getCompletedFilterIds(), result.getNotGeneratedFilterIds()),
                 directExecutor());
         addSuccessCallback(transformedFuture, futureResponse::set, directExecutor());
         addExceptionCallback(transformedFuture, exception -> futureResponse.set(

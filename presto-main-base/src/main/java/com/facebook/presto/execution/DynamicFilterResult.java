@@ -27,13 +27,20 @@ public class DynamicFilterResult
     private final long version;
     private final boolean operatorCompleted;
     private final Set<String> completedFilterIds;
+    private final Set<String> notGeneratedFilterIds;
 
-    public DynamicFilterResult(Map<String, TupleDomain<String>> filters, long version, boolean operatorCompleted, Set<String> completedFilterIds)
+    public DynamicFilterResult(Map<String, TupleDomain<String>> filters, long version, boolean operatorCompleted, Set<String> completedFilterIds, Set<String> notGeneratedFilterIds)
     {
         this.filters = requireNonNull(filters, "filters is null");
         this.version = version;
         this.operatorCompleted = operatorCompleted;
         this.completedFilterIds = ImmutableSet.copyOf(requireNonNull(completedFilterIds, "completedFilterIds is null"));
+        this.notGeneratedFilterIds = ImmutableSet.copyOf(requireNonNull(notGeneratedFilterIds, "notGeneratedFilterIds is null"));
+    }
+
+    public DynamicFilterResult(Map<String, TupleDomain<String>> filters, long version, boolean operatorCompleted, Set<String> completedFilterIds)
+    {
+        this(filters, version, operatorCompleted, completedFilterIds, ImmutableSet.of());
     }
 
     public Map<String, TupleDomain<String>> getFilters()
@@ -54,5 +61,10 @@ public class DynamicFilterResult
     public Set<String> getCompletedFilterIds()
     {
         return completedFilterIds;
+    }
+
+    public Set<String> getNotGeneratedFilterIds()
+    {
+        return notGeneratedFilterIds;
     }
 }

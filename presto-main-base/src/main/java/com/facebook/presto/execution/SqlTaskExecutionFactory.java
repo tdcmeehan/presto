@@ -91,7 +91,7 @@ public class SqlTaskExecutionFactory
             TableWriteInfo tableWriteInfo)
     {
         return create(session, queryContext, taskStateMachine, outputBuffer, taskExchangeClientManager,
-                fragment, sources, tableWriteInfo, Optional.empty(), Optional.empty(), Optional.empty());
+                fragment, sources, tableWriteInfo, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
     }
 
     public SqlTaskExecution create(
@@ -105,7 +105,8 @@ public class SqlTaskExecutionFactory
             TableWriteInfo tableWriteInfo,
             Optional<Consumer<TupleDomain<String>>> dynamicFilterConsumer,
             Optional<Consumer<Set<String>>> dynamicFilterIdRegistration,
-            Optional<Consumer<Set<String>>> dynamicFilterIdFlushedCallback)
+            Optional<Consumer<Set<String>>> dynamicFilterIdFlushedCallback,
+            Optional<Consumer<Set<String>>> dynamicFilterNotGeneratedCallback)
     {
         TaskContext taskContext = queryContext.addTaskContext(
                 taskStateMachine,
@@ -122,6 +123,7 @@ public class SqlTaskExecutionFactory
         dynamicFilterConsumer.ifPresent(taskContext::setDynamicFilterConsumer);
         dynamicFilterIdRegistration.ifPresent(taskContext::setDynamicFilterIdRegistration);
         dynamicFilterIdFlushedCallback.ifPresent(taskContext::setDynamicFilterIdFlushedCallback);
+        dynamicFilterNotGeneratedCallback.ifPresent(taskContext::setDynamicFilterNotGeneratedCallback);
 
         LocalExecutionPlan localExecutionPlan;
         try (SetThreadName ignored = new SetThreadName("Task-%s", taskStateMachine.getTaskId())) {

@@ -30,33 +30,51 @@ public class DynamicFilterResponse
     private final long version;
     private final boolean operatorCompleted;
     private final Set<String> completedFilterIds;
+    private final Set<String> notGeneratedFilterIds;
 
     @JsonCreator
     public DynamicFilterResponse(
             @JsonProperty("filters") Map<String, TupleDomain<String>> filters,
             @JsonProperty("version") long version,
             @JsonProperty("operatorCompleted") boolean operatorCompleted,
-            @JsonProperty("completedFilterIds") Set<String> completedFilterIds)
+            @JsonProperty("completedFilterIds") Set<String> completedFilterIds,
+            @JsonProperty("notGeneratedFilterIds") Set<String> notGeneratedFilterIds)
     {
         this.filters = ImmutableMap.copyOf(requireNonNull(filters, "filters is null"));
         this.version = version;
         this.operatorCompleted = operatorCompleted;
         this.completedFilterIds = completedFilterIds == null ? ImmutableSet.of() : ImmutableSet.copyOf(completedFilterIds);
+        this.notGeneratedFilterIds = notGeneratedFilterIds == null ? ImmutableSet.of() : ImmutableSet.copyOf(notGeneratedFilterIds);
+    }
+
+    public DynamicFilterResponse(Map<String, TupleDomain<String>> filters, long version, boolean operatorCompleted, Set<String> completedFilterIds)
+    {
+        this(filters, version, operatorCompleted, completedFilterIds, ImmutableSet.of());
     }
 
     public static DynamicFilterResponse incomplete(Map<String, TupleDomain<String>> filters, long version)
     {
-        return new DynamicFilterResponse(filters, version, false, ImmutableSet.of());
+        return new DynamicFilterResponse(filters, version, false, ImmutableSet.of(), ImmutableSet.of());
     }
 
     public static DynamicFilterResponse incomplete(Map<String, TupleDomain<String>> filters, long version, Set<String> completedFilterIds)
     {
-        return new DynamicFilterResponse(filters, version, false, completedFilterIds);
+        return new DynamicFilterResponse(filters, version, false, completedFilterIds, ImmutableSet.of());
+    }
+
+    public static DynamicFilterResponse incomplete(Map<String, TupleDomain<String>> filters, long version, Set<String> completedFilterIds, Set<String> notGeneratedFilterIds)
+    {
+        return new DynamicFilterResponse(filters, version, false, completedFilterIds, notGeneratedFilterIds);
     }
 
     public static DynamicFilterResponse completed(Map<String, TupleDomain<String>> filters, long version, Set<String> completedFilterIds)
     {
-        return new DynamicFilterResponse(filters, version, true, completedFilterIds);
+        return new DynamicFilterResponse(filters, version, true, completedFilterIds, ImmutableSet.of());
+    }
+
+    public static DynamicFilterResponse completed(Map<String, TupleDomain<String>> filters, long version, Set<String> completedFilterIds, Set<String> notGeneratedFilterIds)
+    {
+        return new DynamicFilterResponse(filters, version, true, completedFilterIds, notGeneratedFilterIds);
     }
 
     @JsonProperty
@@ -83,6 +101,12 @@ public class DynamicFilterResponse
         return completedFilterIds;
     }
 
+    @JsonProperty
+    public Set<String> getNotGeneratedFilterIds()
+    {
+        return notGeneratedFilterIds;
+    }
+
     @Override
     public String toString()
     {
@@ -91,6 +115,7 @@ public class DynamicFilterResponse
                 ", version=" + version +
                 ", operatorCompleted=" + operatorCompleted +
                 ", completedFilterIds=" + completedFilterIds +
+                ", notGeneratedFilterIds=" + notGeneratedFilterIds +
                 '}';
     }
 }

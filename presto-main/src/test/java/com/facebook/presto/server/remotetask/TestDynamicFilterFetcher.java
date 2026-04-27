@@ -395,6 +395,45 @@ public class TestDynamicFilterFetcher
         assertTrue(joinFilter.hasData(), "Filter should have data from the real partition");
     }
 
+    @Test(timeOut = 30000)
+    public void testNotGeneratedFilterStopsWaitingEarly()
+            throws Exception
+    {
+        String filterId = "f_not_generated";
+        QueryId queryId = new QueryId("test");
+
+        DynamicFilterService dynamicFilterService = new DynamicFilterService();
+        JoinDynamicFilter joinFilter = new JoinDynamicFilter(
+                filterId, "col1", new Duration(10, SECONDS), DEFAULT_MAX_SIZE_BYTES, new DynamicFilterStats(), new RuntimeStats(), false);
+        joinFilter.setExpectedPartitions(1);
+        dynamicFilterService.registerFilter(queryId, filterId, joinFilter);
+
+        DynamicFilterResponse response = DynamicFilterResponse.completed(
+                ImmutableMap.of(),
+                1L,
+                ImmutableSet.of(filterId),
+                ImmutableSet.of(filterId));
+
+        AtomicInteger fetchCount = new AtomicInteger();
+        TestingHttpClient httpClient = new TestingHttpClient(request -> {
+            if ("DELETE".equals(request.getMethod())) {
+                return new TestingResponse(OK, ImmutableListMultimap.of(), new byte[0]);
+            }
+            fetchCount.incrementAndGet();
+            return new TestingResponse(OK, contentType(JSON_UTF_8), codec.toJsonBytes(response));
+        });
+
+        fetcher = createFetcher(httpClient, new Duration(30, SECONDS), dynamicFilterService);
+        fetcher.start();
+
+        poll(() -> fetchCount.get() >= 1);
+        Thread.sleep(500);
+
+        assertTrue(joinFilter.isComplete(), "Filter should be completed after terminal no-op response");
+        assertFalse(joinFilter.hasData(), "Not-generated filter should not report concrete data");
+        assertTrue(joinFilter.getCurrentConstraintByColumnName().isAll(), "Not-generated filter should resolve to all()");
+    }
+
     /**
      * Verifies that a TupleDomain with a RANGE (min != max) round-trips
      * correctly through DynamicFilterResponse JSON serialization. This is the

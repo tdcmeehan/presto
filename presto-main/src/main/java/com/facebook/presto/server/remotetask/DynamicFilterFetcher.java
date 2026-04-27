@@ -229,6 +229,17 @@ public class DynamicFilterFetcher
             sendDeleteRequest(responseVersion);
         }
 
+        for (String filterId : response.getNotGeneratedFilterIds()) {
+            if (!deliveredFilterIds.contains(filterId)) {
+                if (extendedMetrics) {
+                    emitExtendedMetric(format("%s[%s][%s]", DYNAMIC_FILTER_COMPLETED_ID_DELIVERED, filterId, taskSuffix), 1);
+                }
+                resolveFilter(filterId)
+                        .ifPresent(f -> f.markAsNotGenerated("worker reported terminal no-op dynamic filter"));
+                deliveredFilterIds.add(filterId);
+            }
+        }
+
         for (String filterId : response.getCompletedFilterIds()) {
             if (!deliveredFilterIds.contains(filterId)) {
                 if (extendedMetrics) {

@@ -1,4 +1,6 @@
 /*
+
+/*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -148,7 +150,7 @@ public class PrestoSparkTaskManager
     @Override
     public ListenableFuture<DynamicFilterResult> getDynamicFiltersWait(TaskId taskId, long sinceVersion)
     {
-        return immediateFuture(new DynamicFilterResult(ImmutableMap.of(), 0L, false, ImmutableSet.of()));
+        return immediateFuture(new DynamicFilterResult(ImmutableMap.of(), 0L, false, ImmutableSet.of(), ImmutableSet.of()));
     }
 
     @Override

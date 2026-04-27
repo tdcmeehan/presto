@@ -29,6 +29,7 @@ import jakarta.annotation.Nullable;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Consumer;
 
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_SOURCE_COLLECTION_TIME_NANOS;
@@ -93,6 +94,7 @@ public class DynamicFilterSourceOperator
         private final int operatorId;
         private final PlanNodeId planNodeId;
         private final Consumer<TupleDomain<String>> dynamicPredicateConsumer;
+        private final Consumer<Set<String>> dynamicFilterNotGeneratedConsumer;
         private final List<Channel> channels;
         private final int maxFilterPositionsCount;
         private final DataSize maxFilterSize;
@@ -107,15 +109,38 @@ public class DynamicFilterSourceOperator
                 int operatorId,
                 PlanNodeId planNodeId,
                 Consumer<TupleDomain<String>> dynamicPredicateConsumer,
+                Consumer<Set<String>> dynamicFilterNotGeneratedConsumer,
                 List<Channel> channels,
                 int maxFilterPositionsCount,
                 DataSize maxFilterSize,
                 int minMaxCollectionLimit,
                 boolean useNewNanDefinition)
         {
-            this(operatorId, planNodeId, dynamicPredicateConsumer, channels,
+            this(operatorId, planNodeId, dynamicPredicateConsumer, dynamicFilterNotGeneratedConsumer, channels,
                     maxFilterPositionsCount, maxFilterSize, minMaxCollectionLimit,
                     useNewNanDefinition, () -> {}, () -> {});
+        }
+
+        public DynamicFilterSourceOperatorFactory(
+                int operatorId,
+                PlanNodeId planNodeId,
+                Consumer<TupleDomain<String>> dynamicPredicateConsumer,
+                List<Channel> channels,
+                int maxFilterPositionsCount,
+                DataSize maxFilterSize,
+                int minMaxCollectionLimit,
+                boolean useNewNanDefinition)
+        {
+            this(
+                    operatorId,
+                    planNodeId,
+                    dynamicPredicateConsumer,
+                    filterIds -> {},
+                    channels,
+                    maxFilterPositionsCount,
+                    maxFilterSize,
+                    minMaxCollectionLimit,
+                    useNewNanDefinition);
         }
 
         public DynamicFilterSourceOperatorFactory(
@@ -130,9 +155,37 @@ public class DynamicFilterSourceOperator
                 Runnable onClose,
                 Runnable onCreateOperator)
         {
+            this(
+                    operatorId,
+                    planNodeId,
+                    dynamicPredicateConsumer,
+                    filterIds -> {},
+                    channels,
+                    maxFilterPositionsCount,
+                    maxFilterSize,
+                    minMaxCollectionLimit,
+                    useNewNanDefinition,
+                    onClose,
+                    onCreateOperator);
+        }
+
+        public DynamicFilterSourceOperatorFactory(
+                int operatorId,
+                PlanNodeId planNodeId,
+                Consumer<TupleDomain<String>> dynamicPredicateConsumer,
+                Consumer<Set<String>> dynamicFilterNotGeneratedConsumer,
+                List<Channel> channels,
+                int maxFilterPositionsCount,
+                DataSize maxFilterSize,
+                int minMaxCollectionLimit,
+                boolean useNewNanDefinition,
+                Runnable onClose,
+                Runnable onCreateOperator)
+        {
             this.operatorId = operatorId;
             this.planNodeId = requireNonNull(planNodeId, "planNodeId is null");
             this.dynamicPredicateConsumer = requireNonNull(dynamicPredicateConsumer, "dynamicPredicateConsumer is null");
+            this.dynamicFilterNotGeneratedConsumer = requireNonNull(dynamicFilterNotGeneratedConsumer, "dynamicFilterNotGeneratedConsumer is null");
             this.channels = requireNonNull(channels, "channels is null");
             verify(
                     channels.stream().map(channel -> channel.getFilterId()).collect(toSet()).size() == channels.size(),
@@ -156,6 +209,7 @@ public class DynamicFilterSourceOperator
             return new DynamicFilterSourceOperator(
                     driverContext.addOperatorContext(operatorId, planNodeId, DynamicFilterSourceOperator.class.getSimpleName()),
                     dynamicPredicateConsumer,
+                    dynamicFilterNotGeneratedConsumer,
                     channels,
                     planNodeId,
                     maxFilterPositionsCount,
@@ -181,6 +235,7 @@ public class DynamicFilterSourceOperator
 
     private final OperatorContext context;
     private final Consumer<TupleDomain<String>> dynamicPredicateConsumer;
+    private final Consumer<Set<String>> dynamicFilterNotGeneratedConsumer;
     private final int maxFilterPositionsCount;
     private final long maxFilterSizeInBytes;
     private final List<Channel> channels;
@@ -209,6 +264,7 @@ public class DynamicFilterSourceOperator
     private DynamicFilterSourceOperator(
             OperatorContext context,
             Consumer<TupleDomain<String>> dynamicPredicateConsumer,
+            Consumer<Set<String>> dynamicFilterNotGeneratedConsumer,
             List<Channel> channels,
             PlanNodeId planNodeId,
             int maxFilterPositionsCount,
@@ -221,6 +277,7 @@ public class DynamicFilterSourceOperator
         this.maxFilterSizeInBytes = maxFilterSize.toBytes();
 
         this.dynamicPredicateConsumer = requireNonNull(dynamicPredicateConsumer, "dynamicPredicateConsumer is null");
+        this.dynamicFilterNotGeneratedConsumer = requireNonNull(dynamicFilterNotGeneratedConsumer, "dynamicFilterNotGeneratedConsumer is null");
         this.channels = requireNonNull(channels, "channels is null");
 
         this.blockBuilders = new BlockBuilder[channels.size()];
@@ -316,6 +373,9 @@ public class DynamicFilterSourceOperator
         if (minMaxChannels.isEmpty()) {
             // allow all probe-side values to be read.
             dynamicPredicateConsumer.accept(TupleDomain.all());
+            dynamicFilterNotGeneratedConsumer.accept(channels.stream()
+                    .map(Channel::getFilterId)
+                    .collect(toSet()));
         }
         else {
             if (minMaxCollectionLimit < 0) {
@@ -339,6 +399,9 @@ public class DynamicFilterSourceOperator
     {
         // allow all probe-side values to be read.
         dynamicPredicateConsumer.accept(TupleDomain.all());
+        dynamicFilterNotGeneratedConsumer.accept(channels.stream()
+                .map(Channel::getFilterId)
+                .collect(toSet()));
         // Drop references to collected values.
         minValues = null;
         maxValues = null;

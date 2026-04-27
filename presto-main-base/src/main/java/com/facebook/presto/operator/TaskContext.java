@@ -37,6 +37,7 @@ import com.facebook.presto.spi.plan.PlanNodeId;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ListMultimap;
 import com.google.common.util.concurrent.AtomicDouble;
@@ -47,8 +48,11 @@ import com.google.errorprone.annotations.concurrent.GuardedBy;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
@@ -139,6 +143,10 @@ public class TaskContext
     private final AtomicReference<Consumer<TupleDomain<String>>> dynamicFilterConsumer = new AtomicReference<>();
     private final AtomicReference<Consumer<Set<String>>> dynamicFilterIdRegistration = new AtomicReference<>();
     private final AtomicReference<Consumer<Set<String>>> dynamicFilterIdFlushedCallback = new AtomicReference<>();
+    private final AtomicReference<Consumer<Set<String>>> dynamicFilterNotGeneratedCallback = new AtomicReference<>();
+
+    // Store distributed dynamic filters received from coordinator
+    private final ConcurrentMap<String, TupleDomain<String>> distributedDynamicFilters = new ConcurrentHashMap<>();
 
     public static TaskContext createTaskContext(
             QueryContext queryContext,
@@ -479,6 +487,28 @@ public class TaskContext
         if (callback != null) {
             callback.accept(filterIds);
         }
+    }
+
+    public void setDynamicFilterNotGeneratedCallback(Consumer<Set<String>> callback)
+    {
+        dynamicFilterNotGeneratedCallback.set(callback);
+    }
+
+    public void markFilterIdsNotGenerated(Set<String> filterIds)
+    {
+        Consumer<Set<String>> callback = dynamicFilterNotGeneratedCallback.get();
+        if (callback != null) {
+            callback.accept(filterIds);
+        }
+    }
+    public void addDistributedDynamicFilter(String filterId, TupleDomain<String> filter)
+    {
+        distributedDynamicFilters.put(filterId, filter);
+    }
+
+    public Map<String, TupleDomain<String>> getDistributedDynamicFilters()
+    {
+        return ImmutableMap.copyOf(distributedDynamicFilters);
     }
 
     public TaskStats getTaskStats()

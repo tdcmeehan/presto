@@ -33,6 +33,7 @@ import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 import java.util.Map;
+import java.util.Set;
 
 import static com.facebook.airlift.json.JsonBinder.jsonBinder;
 import static com.facebook.airlift.json.JsonCodecBinder.jsonCodecBinder;
@@ -206,5 +207,29 @@ public class TestDynamicFilterResponse
         assertTrue(varcharDomain.isSingleValue());
         assertEquals(bigintDomain.getSingleValue(), 123L);
         assertEquals(varcharDomain.getSingleValue(), utf8Slice("test_value"));
+    }
+
+    @Test
+    public void testCompletedResponseWithNotGeneratedFilterIds()
+    {
+        TupleDomain<String> filter = TupleDomain.withColumnDomains(
+                ImmutableMap.of("col1", Domain.singleValue(BIGINT, 42L)));
+        Set<String> completedFilterIds = Set.of("filter1", "filter2");
+        Set<String> notGeneratedFilterIds = Set.of("filter2");
+
+        DynamicFilterResponse original = DynamicFilterResponse.completed(
+                ImmutableMap.of("filter1", filter),
+                7L,
+                completedFilterIds,
+                notGeneratedFilterIds);
+
+        String json = codec.toJson(original);
+        DynamicFilterResponse deserialized = codec.fromJson(json);
+
+        assertEquals(deserialized.getFilters().size(), 1);
+        assertEquals(deserialized.getVersion(), 7L);
+        assertTrue(deserialized.isOperatorCompleted());
+        assertEquals(deserialized.getCompletedFilterIds(), completedFilterIds);
+        assertEquals(deserialized.getNotGeneratedFilterIds(), notGeneratedFilterIds);
     }
 }

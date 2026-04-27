@@ -1620,8 +1620,17 @@ public class LocalExecutionPlanner
                 TableScanNode tableScanNode = (TableScanNode) sourceNode;
                 LocalDynamicFiltersCollector collector = context.getDynamicFiltersCollector();
                 dynamicFilterSupplier = Optional.of(() -> {
-                    TupleDomain<VariableReferenceExpression> predicate = collector.getPredicate();
-                    return predicate.transform(tableScanNode.getAssignments()::get);
+                    // Get local dynamic filters (from same-task joins)
+                    TupleDomain<VariableReferenceExpression> localPredicate = collector.getPredicate();
+
+                    // Get distributed dynamic filters (from coordinator)
+                    TupleDomain<VariableReferenceExpression> distributedPredicate =
+                            getDistributedDynamicFilters(context.getTaskContext(), tableScanNode, dynamicFilters.get());
+
+                    // Merge both types of filters
+                    TupleDomain<VariableReferenceExpression> combined = localPredicate.intersect(distributedPredicate);
+
+                    return combined.transform(tableScanNode.getAssignments()::get);
                 });
             }
 
@@ -2731,11 +2740,13 @@ public class LocalExecutionPlanner
             };
 
             Runnable onCreateOperator = createdCount::incrementAndGet;
+            Consumer<Set<String>> dynamicFilterNotGeneratedConsumer = context.getTaskContext()::markFilterIdsNotGenerated;
 
             return Optional.of(new DynamicFilterSourceOperator.DynamicFilterSourceOperatorFactory(
                     context.getNextOperatorId(),
                     node.getId(),
                     perOperator,
+                    dynamicFilterNotGeneratedConsumer,
                     filterBuildChannels,
                     getDynamicFilteringMaxPerDriverRowCount(context.getSession()),
                     getDynamicFilteringMaxPerDriverSize(context.getSession()),
@@ -2765,6 +2776,46 @@ public class LocalExecutionPlanner
                         addSuccessCallback(filter.getResultFuture(), collector::intersect);
                         return filter;
                     });
+        }
+
+        private TupleDomain<VariableReferenceExpression> getDistributedDynamicFilters(
+                TaskContext taskContext,
+                TableScanNode tableScanNode,
+                List<DynamicFilterPlaceholder> dynamicFilterPlaceholders)
+        {
+            // Get distributed dynamic filters from TaskContext
+            Map<String, TupleDomain<String>> distributedFilters = taskContext.getDistributedDynamicFilters();
+
+            if (distributedFilters.isEmpty()) {
+                return TupleDomain.all();
+            }
+
+            // Build a map from filterId to VariableReferenceExpression for this table scan
+            Map<String, VariableReferenceExpression> filterIdToVariable = new HashMap<>();
+            for (DynamicFilterPlaceholder placeholder : dynamicFilterPlaceholders) {
+                if (placeholder.getInput() instanceof VariableReferenceExpression) {
+                    filterIdToVariable.put(placeholder.getId(), (VariableReferenceExpression) placeholder.getInput());
+                }
+            }
+
+            // Convert distributed filters to VariableReferenceExpression domain
+            Map<VariableReferenceExpression, Domain> domains = new HashMap<>();
+            for (Map.Entry<String, TupleDomain<String>> entry : distributedFilters.entrySet()) {
+                String filterId = entry.getKey();
+                VariableReferenceExpression variable = filterIdToVariable.get(filterId);
+
+                if (variable != null && entry.getValue().getDomains().isPresent()) {
+                    // The distributed filter has column name as key, extract the domain
+                    Map<String, Domain> filterDomains = entry.getValue().getDomains().get();
+                    if (!filterDomains.isEmpty()) {
+                        // Take the first domain (there should only be one per filterId)
+                        Domain domain = filterDomains.values().iterator().next();
+                        domains.put(variable, domain);
+                    }
+                }
+            }
+
+            return domains.isEmpty() ? TupleDomain.all() : TupleDomain.withColumnDomains(domains);
         }
 
         private JoinFilterFunctionFactory compileJoinFilterFunction(
