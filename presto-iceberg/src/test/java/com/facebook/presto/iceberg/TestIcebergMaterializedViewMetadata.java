@@ -769,7 +769,7 @@ public class TestIcebergMaterializedViewMetadata
         assertUpdate("INSERT INTO test_alter_mv_props_base VALUES (1, 100)", 1);
 
         assertUpdate("CREATE MATERIALIZED VIEW test_alter_mv_props_mv " +
-                "WITH (stale_read_behavior = 'FAIL', staleness_window = '1h', refresh_type = 'FULL') " +
+                "WITH (stale_read_behavior = 'FAIL', staleness_window = '1h', refresh_type = 'FULL', max_snapshots_per_refresh = 10) " +
                 "AS SELECT id, value FROM test_alter_mv_props_base");
 
         RESTCatalog catalog = new RESTCatalog();
@@ -782,7 +782,7 @@ public class TestIcebergMaterializedViewMetadata
             TableIdentifier viewId = TableIdentifier.of(Namespace.of("test_schema"), "test_alter_mv_props_mv");
 
             assertUpdate("ALTER MATERIALIZED VIEW test_alter_mv_props_mv " +
-                    "SET PROPERTIES (staleness_window = '5m', refresh_type = 'INCREMENTAL')");
+                    "SET PROPERTIES (staleness_window = '5m', refresh_type = 'INCREMENTAL', max_snapshots_per_refresh = 50)");
 
             Map<String, String> properties = catalog.loadView(viewId).properties();
             assertEquals(properties.get("presto.materialized_view.stale_read_behavior"), "FAIL",
@@ -791,6 +791,8 @@ public class TestIcebergMaterializedViewMetadata
                     "staleness_window should be updated");
             assertEquals(properties.get("presto.materialized_view.refresh_type"), "INCREMENTAL",
                     "refresh_type should be updated");
+            assertEquals(properties.get("presto.materialized_view.max_snapshots_per_refresh"), "50",
+                    "max_snapshots_per_refresh should be updated");
 
             // Updates can be applied incrementally; unspecified properties stay put.
             assertUpdate("ALTER MATERIALIZED VIEW test_alter_mv_props_mv " +
@@ -798,6 +800,7 @@ public class TestIcebergMaterializedViewMetadata
             properties = catalog.loadView(viewId).properties();
             assertEquals(properties.get("presto.materialized_view.stale_read_behavior"), "USE_VIEW_QUERY");
             assertEquals(properties.get("presto.materialized_view.refresh_type"), "INCREMENTAL");
+            assertEquals(properties.get("presto.materialized_view.max_snapshots_per_refresh"), "50");
         }
         finally {
             catalog.close();
