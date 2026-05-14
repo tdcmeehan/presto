@@ -3022,9 +3022,9 @@ by using :doc:`/sql/alter-materialized-view`; properties not specified in the
 
        ``max_snapshots_per_refresh``
      - Upper bound on snapshots consumed per base table per ``REFRESH MATERIALIZED
-       VIEW``. Defaults to the ``materialized_view_default_max_snapshots_per_refresh``
-       session property. Requires Iceberg V3 row lineage; V2 tables fall back to
-       unbounded refresh.
+       VIEW``. ``0`` means unbounded. Defaults to the
+       ``materialized_view_default_max_snapshots_per_refresh`` session property.
+       Requires Iceberg V3 row lineage; V2 tables fall back to unbounded refresh.
      - Yes
 
 The storage table inherits standard Iceberg table properties for partitioning, sorting, and file format.
@@ -3043,7 +3043,7 @@ See :doc:`/admin/materialized-views` for general information on refresh behavior
 .. _iceberg-incremental-refresh:
 
 Incremental Refresh
-^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~
 
 The Iceberg connector supports incremental refresh, which atomically replaces only stale
 partitions rather than recomputing the entire result set. See :ref:`admin/materialized-views:Incremental Refresh`
@@ -3066,7 +3066,7 @@ Requirements:
 .. _iceberg-bounded-refresh:
 
 Bounded Refresh
-^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~
 
 Bounded refresh caps how far each base table advances per ``REFRESH MATERIALIZED VIEW``,
 splitting catch-up into a series of smaller refreshes. Each refresh advances each base's
