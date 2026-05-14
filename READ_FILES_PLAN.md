@@ -195,29 +195,40 @@ Rules (start strict, document for change later):
 
 ### 4. Planner rewrite — PTF → TableScanNode
 
-This is the load-bearing piece on the Java side. Two possible approaches,
-depending on what Presto's PTF SPI already supports:
+**Resolved: use the existing `applyTableFunction` path.** Presto already has
+the full infrastructure wired through SPI, engine, and optimizer:
 
-**Option A — connector `applyTableFunction` (preferred if it exists).**
-The Hive connector's `ConnectorMetadata.applyTableFunction()` consumes the
-PTF and returns a `TableFunctionApplicationResult` containing a
-`ConnectorTableHandle` (a synthetic `HiveTableHandle`). The planner then
-materializes a regular `TableScanNode`. No new optimizer rule needed.
+- SPI: `ConnectorMetadata.applyTableFunction(session, handle)` at
+  `presto-spi/.../connector/ConnectorMetadata.java:1061`. Default returns
+  `Optional.empty()`; connectors override.
+- Result type: `TableFunctionApplicationResult<ConnectorTableHandle>` at
+  `presto-spi/.../connector/TableFunctionApplicationResult.java` — wraps
+  the synthetic table handle and its column handles.
+- Engine routing: `MetadataManager.applyTableFunction()` at
+  `presto-main-base/.../metadata/MetadataManager.java:1818`. Stats and
+  classloader-safe wrappers in place.
+- Optimizer rule: `TransformTableFunctionProcessorToTableScan` at
+  `presto-main-base/.../sql/planner/iterative/rule/TransformTableFunctionProcessorToTableScan.java`
+  matches `TableFunctionProcessorNode`, calls `applyTableFunction`, emits
+  a `TableScanNode` with column assignments wired up. **We do not write
+  this rule — it exists and is registered.**
 
-**Option B — optimizer rule.** Add a `RewriteTableFunctionToScan` rule
-under `presto-main-base/src/main/java/com/facebook/presto/sql/planner/iterative/rule/`
-that pattern-matches `TableFunctionNode(read_files, handle=ReadFilesHandle)`
-and emits a `TableScanNode` with:
+Implementation work: override `applyTableFunction` on the Hive connector's
+`ConnectorMetadata` to recognize `ReadFilesHandle` and return:
 
-- `HiveTableHandle` constructed with synthetic
-  `SchemaTableName("system", "read_files_<queryId>")`
+- `HiveTableHandle` with synthetic `SchemaTableName("system",
+  "read_files_<queryId>")`
 - `HiveColumnHandle` per inferred column (type, name, ordinal,
   `ColumnType.REGULAR`)
-- `tableLayoutHandle` carrying the file list
+- Layout info carrying the file list
 
-**Decision gate:** check whether `applyTableFunction` exists in
-`presto-spi/.../ConnectorMetadata.java`. If yes, Option A. If no, Option B —
-and consider adding `applyTableFunction` as a separate engine PR.
+**Caveat: first real adopter.** No connector currently overrides
+`applyTableFunction`. The existing `exclude_columns` PTF uses a different
+rewrite path (`RewriteExcludeColumnsFunctionToProjection` — projection,
+not scan). So while the infrastructure is well-typed and complete, it has
+not been exercised by a production PTF. Phase 0 should include a stub
+connector PTF that returns trivial scan output to validate the path before
+investing in `read_files` specifics.
 
 ### 5. Split generation
 
@@ -312,12 +323,12 @@ fixes are localized (relax an assumption in
 
 ### Phase 0 — Foundations (parallel, ~1 sprint)
 
-- Confirm `applyTableFunction` SPI exists; if not, scope adding it.
+- Validate the `applyTableFunction` rewrite path with a stub connector PTF
+  that returns a hand-built `HiveTableHandle` + columns over a known small
+  file. Confirm `TransformTableFunctionProcessorToTableScan` fires and CTAS
+  produces the expected table. This de-risks being the first real adopter.
 - Stand up the `FileSchemaExtractor` interface and Parquet implementation
   with unit tests against fixture files.
-- Verify polymorphic-PTF e2e with a trivial dummy PTF (no I/O) end-to-end
-  on a Java cluster, just to confirm the analyze→plan→scan→CTAS chain
-  works at all.
 
 ### Phase 1 — Java single-format MVP (~1 sprint)
 
@@ -351,38 +362,37 @@ fixes are localized (relax an assumption in
 
 ## Open questions
 
-1. **`applyTableFunction` SPI presence.** Determines Option A vs. B above.
-   Worth resolving before Phase 1.
-
-2. **Catalog binding.** `hive.system.read_files(...)` (per-catalog,
+1. **Catalog binding.** `hive.system.read_files(...)` (per-catalog,
    inherits config) vs. a global `system.read_files(...)`. Recommend
    per-catalog for v1 — it sidesteps the "where do credentials come from"
    question entirely. The same function can be registered under multiple
    catalogs.
 
-3. **Schema-merge strictness.** v1 plan is strict (fail on conflict). Some
+2. **Schema-merge strictness.** v1 plan is strict (fail on conflict). Some
    users will want permissive (fall back to VARCHAR, like Starburst).
    Decide whether to expose a `schema_merge_mode` argument in v1 or wait
    for demand.
 
-4. **Iceberg-typed output.** Snowflake's `KIND => 'ICEBERG'` is genuinely
+3. **Iceberg-typed output.** Snowflake's `KIND => 'ICEBERG'` is genuinely
    useful when the target is an Iceberg table. Adding a `target` argument
    (`'native' | 'iceberg'`) is small — the translation library
    (`ParquetSchemaUtil.convert`) exists. Could fit in v1 if scope allows.
 
-5. **Listing semantics.** Recursive by default, or require a glob pattern?
+4. **Listing semantics.** Recursive by default, or require a glob pattern?
    Snowflake uses pattern matching. Recommend recursive by default with an
    optional `pattern` argument (regex over relative path).
 
-6. **Concurrency cap on analyze.** Footer reads in `analyze()` are I/O
+5. **Concurrency cap on analyze.** Footer reads in `analyze()` are I/O
    bound. Use a small thread pool (configurable, default e.g. 16) inside
    the PTF rather than serial reads, but cap it so the coordinator isn't
    overwhelmed by concurrent `read_files` invocations.
 
 ## Risks
 
-- **`applyTableFunction` missing**: shifts effort from "implement a PTF" to
-  "extend the connector SPI." Adds ~1 sprint.
+- **First real adopter of `applyTableFunction`**: infrastructure is in
+  place but unexercised by production connectors; latent bugs in the
+  rewrite path or downstream optimizer interactions may surface. Mitigated
+  by the Phase 0 stub-PTF validation step.
 - **Velox schema-evolution gaps**: widening behavior may not match what the
   merger produces. Mitigation: align the merger's promotion rules to what
   Velox already supports, document the policy.
