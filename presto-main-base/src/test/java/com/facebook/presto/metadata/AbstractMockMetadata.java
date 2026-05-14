@@ -586,6 +586,12 @@ public abstract class AbstractMockMetadata
     }
 
     @Override
+    public void setMaterializedViewProperties(Session session, QualifiedObjectName viewName, Map<String, Object> properties)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public InsertTableHandle beginRefreshMaterializedView(Session session, TableHandle tableHandle)
     {
         throw new UnsupportedOperationException();
