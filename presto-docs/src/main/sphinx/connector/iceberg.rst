@@ -618,6 +618,30 @@ Session properties set behavior changes for queries executed within the given se
        table property. ``0`` means unbounded. Default: ``0``
      - Yes
      - Yes
+   * - .. _iceberg-sess-materialized-view-stitching-strategy:
+
+       ``materialized_view_stitching_strategy``
+     - Controls when query-time stitching applies to partially stale materialized views.
+       Only takes effect when ``materialized_view_stale_read_behavior`` is ``USE_STITCHING``.
+
+       - ``ALWAYS`` (default): stitch whenever possible.
+       - ``NEVER``: always use the full view query.
+       - ``AUTOMATIC``: the cost-based optimizer chooses between the stitched union and
+         the full view query; falls back to row-count comparison when stats are unknown.
+     - Yes
+     - Yes
+   * - .. _iceberg-sess-materialized-view-incremental-refresh-strategy:
+
+       ``materialized_view_incremental_refresh_strategy``
+     - Controls when incremental (delta) refresh applies to materialized views with
+       ``refresh_type = 'INCREMENTAL'``.
+
+       - ``ALWAYS`` (default): use delta refresh whenever it is buildable.
+       - ``NEVER``: always perform a full refresh.
+       - ``AUTOMATIC``: the cost-based optimizer chooses between delta and full refresh;
+         falls back to row-count comparison when stats are unknown.
+     - Yes
+     - Yes
    * - .. _iceberg-sess-max-partitions-per-writer:
 
        ``max_partitions_per_writer``
