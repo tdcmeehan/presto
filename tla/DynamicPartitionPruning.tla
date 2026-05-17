@@ -19,12 +19,22 @@ CONSTANTS
     Workers,            \* e.g. {w1, w2}
     Drivers,            \* e.g. {d1, d2} -- driver IDs within each task
     Values,             \* finite value domain, e.g. {1, 2, 3}
-    BuildData,          \* [Workers -> [Drivers -> SUBSET Values]] -- what each driver sees
     ExpectedPartitions  \* coordinator's gate: Cardinality(Workers) for PARTITIONED, 1 for BROADCAST
 
-ASSUME
-    /\ BuildData \in [Workers -> [Drivers -> SUBSET Values]]
-    /\ ExpectedPartitions \in 1..Cardinality(Workers)
+ASSUME ExpectedPartitions \in 1..Cardinality(Workers)
+
+\* What each driver sees on its build side. Defined here (rather than as a
+\* CONSTANT) because TLC .cfg files don't parse nested records reliably.
+\* Edit this to explore different distributions; the spec is otherwise generic
+\* in Workers/Drivers/Values. The default assumes Workers and Drivers from
+\* the .cfg are {w1, w2} and {d1, d2} respectively.
+BuildData == [w \in Workers |-> [d \in Drivers |->
+    IF w = "w1" /\ d = "d1" THEN {1}
+    ELSE IF w = "w1" /\ d = "d2" THEN {2}
+    ELSE IF w = "w2" /\ d = "d1" THEN {2}
+    ELSE IF w = "w2" /\ d = "d2" THEN {3}
+    ELSE {}
+]]
 
 VARIABLES
     driverState,        \* [Workers -> [Drivers -> {"running", "finalized"}]]
@@ -142,13 +152,59 @@ NoEarlyTaskFinalize ==
 TimeoutSafety ==
     filterState = "timedOut" => probeView /= "filter"
 
+StutterIfTerminal ==
+    filterState \in {"complete", "timedOut"} => filterState' = filterState
+
 MonotonicTerminal ==
-    [][filterState \in {"complete", "timedOut"} => filterState' = filterState]_vars
+    [][StutterIfTerminal]_vars
 
 (*--------------------------- Liveness ---------------------------*)
 
 \* Without timeouts firing, the filter eventually completes.
 EventuallyTerminates ==
     <>(filterState \in {"complete", "timedOut"})
+
+(*--------------------------- Next steps ---------------------------
+ *
+ * Run:
+ *     cd tla && java -cp ~/tla2tools.jar tlc2.TLC -workers auto DynamicPartitionPruning
+ *
+ * Things to try, in roughly increasing order of payoff:
+ *
+ * 1. Tweak BuildData (above) or grow Workers/Drivers in the .cfg to explore
+ *    different distributions. TLC re-exhausts quickly at this scale.
+ *
+ * 2. Confirm each invariant has teeth by deliberately breaking the
+ *    corresponding guard and watching TLC produce a counterexample:
+ *      - Remove `taskFinalized[w]` in CoordinatorMerge   -> NoEarlyMerge fires
+ *      - Remove the driver-finalized check in FinalizeTask -> NoEarlyTaskFinalize
+ *      - Lower `>= ExpectedPartitions` in CoordinatorComplete -> AllOrNothing
+ *      - Make TaskFilter return BuildData[w][d1] only (ignore d2) -> Soundness
+ *      - Let ProbeObserve return "filter" while timedOut -> TimeoutSafety
+ *    Revert after each, of course.
+ *
+ * 3. Add range mode: replace SUBSET Values with {min,max} pairs plus an
+ *    overflow flag; merge becomes min-of-mins / max-of-maxes. Catches the
+ *    same cross-driver bug class in the range path. Cheap to add.
+ *
+ * 4. Add scheduler / deadlock prevention: introduce taskScheduled[w] and a
+ *    probe `splitSourceBlocked` flag. Build drivers can't run until scheduled;
+ *    probe blocks on filterState = "collecting". Add a ForceScheduleBuild
+ *    action gated on the deadlock condition, and a liveness property that
+ *    the probe is never permanently blocked. This is where TLC tends to find
+ *    real bugs -- the interaction of "probe waits for filter" and "build
+ *    can't run until scheduled" is exactly the cycle the RFC calls out.
+ *
+ * 5. Add DELETE?through=N idempotency: model the fetcher as a sequence number
+ *    and a separate `acked` map. Add Lossy/Retry actions. Check that
+ *    double-delivery doesn't double-merge.
+ *
+ * 6. Add worker failure: let a task transition to `failed` mid-finalization
+ *    and assert the filter still reaches complete or timedOut (never wedged).
+ *
+ * Resist adding everything at once. State space grows fast; the diagnostic
+ * value of a counterexample drops sharply once the spec covers more than one
+ * subsystem. One module per concern, INSTANCE them together later if needed.
+ *)
 
 ================================================================================

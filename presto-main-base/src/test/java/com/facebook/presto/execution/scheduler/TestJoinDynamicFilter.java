@@ -33,6 +33,7 @@ import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_COLLEC
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_COORDINATOR_FALLBACK_TO_RANGE;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_DEFICIT_AT_TIMEOUT;  // DIAGNOSTIC(DPP-PARTITIONED-WAIT)
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_DOMAIN_RANGE_COUNT;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_EXTENSION_COUNT;  // DIAGNOSTIC(DPP-PARTITIONED-WAIT)
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PARTITIONS_AT_TIMEOUT;  // DIAGNOSTIC(DPP-PARTITIONED-WAIT)
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PARTITIONS_RECEIVED;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_SHORT_CIRCUITED;
@@ -1022,4 +1023,178 @@ public class TestJoinDynamicFilter
                 "TIME_SINCE_LAST_ARRIVAL_AT_TIMEOUT_NANOS[549] should NOT be present (no arrival to reference)");
     }
     // END DIAGNOSTIC(DPP-PARTITIONED-WAIT)
+
+    // BEGIN ADAPTIVE-WAIT TESTS
+    private static final Duration ADAPTIVE_CYCLE = new Duration(150, TimeUnit.MILLISECONDS);
+
+    /**
+     * Positive: contributions arrive across two cycles; the first cycle's tick sees
+     * progress (1 -> 2) and extends. The final contribution then resolves the filter
+     * via {@code addPartitionByFilterId} before the extension window expires.
+     */
+    @Test
+    public void testAdaptiveExtensionAllowsLateArrivalToResolve()
+            throws Exception
+    {
+        RuntimeStats runtimeStats = new RuntimeStats();
+        JoinDynamicFilter filter = new JoinDynamicFilter(
+                "549",
+                "col_a",
+                ADAPTIVE_CYCLE,
+                2,  // maxWaitExtensions
+                DEFAULT_MAX_SIZE_BYTES,
+                new DynamicFilterStats(),
+                runtimeStats,
+                true);
+        filter.setExpectedPartitions(3);
+
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 10L))));
+        filter.startTimeout();
+
+        // Within the first cycle (well before 150ms): add a second contribution so the
+        // first tick observes progress (size went 1 -> 2 vs. baseline of 1) and extends.
+        Thread.sleep(60);
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 20L))));
+
+        // Wait for the first tick to fire and consume one extension, then deliver the
+        // third contribution. tryCompleteResolution on this add will resolve the filter
+        // synchronously since the extension is still in flight.
+        Thread.sleep(150);
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 30L))));
+
+        assertTrue(filter.isComplete(), "Filter should resolve after late arrival within extension window");
+        assertFalse(runtimeStats.getMetrics().containsKey(format(DYNAMIC_FILTER_TIMED_OUT_TEMPLATE, "549")),
+                "Filter resolved before timeout; no timed-out metric expected");
+        assertTrue(runtimeStats.getMetrics().containsKey(DYNAMIC_FILTER_EXTENSION_COUNT),
+                "EXTENSION_COUNT should be recorded for at least one extension");
+        assertTrue(runtimeStats.getMetrics().get(DYNAMIC_FILTER_EXTENSION_COUNT).getSum() >= 1);
+    }
+
+    /**
+     * Negative: a contribution arrived before startTimeout, then no further progress.
+     * lastTickPartitionCount is baselined at startTimeout, so the first tick sees
+     * zero new progress and finalizes immediately without consuming any extension.
+     */
+    @Test
+    public void testNoProgressFinalizesAtFirstCycle()
+            throws Exception
+    {
+        RuntimeStats runtimeStats = new RuntimeStats();
+        JoinDynamicFilter filter = new JoinDynamicFilter(
+                "549",
+                "col_a",
+                ADAPTIVE_CYCLE,
+                3,  // maxWaitExtensions — should NOT be consumed when no progress
+                DEFAULT_MAX_SIZE_BYTES,
+                new DynamicFilterStats(),
+                runtimeStats,
+                true);
+        filter.setExpectedPartitions(3);
+
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 10L))));
+        filter.startTimeout();
+
+        // Wait one cycle plus a buffer; with the startTimeout baseline in place the
+        // first tick observes zero progress and finalizes — no extension consumed.
+        Thread.sleep(ADAPTIVE_CYCLE.toMillis() + 80);
+
+        assertFalse(filter.isComplete(), "Should not resolve without enough contributions");
+        assertEquals(filter.getCurrentConstraintByColumnName(), TupleDomain.all(),
+                "Partial data must not be exposed after timeout");
+        assertTrue(runtimeStats.getMetrics().containsKey(format(DYNAMIC_FILTER_TIMED_OUT_TEMPLATE, "549")),
+                "Filter must be marked timed out");
+        assertFalse(runtimeStats.getMetrics().containsKey(DYNAMIC_FILTER_EXTENSION_COUNT),
+                "No extension should be consumed when there is no new progress");
+    }
+
+    /**
+     * Cap: contributions trickle in every cycle but never reach the expected count.
+     * The filter must finalize after exactly (1 + maxWaitExtensions) cycles.
+     */
+    @Test
+    public void testExtensionsCappedByMaxWaitExtensions()
+            throws Exception
+    {
+        RuntimeStats runtimeStats = new RuntimeStats();
+        JoinDynamicFilter filter = new JoinDynamicFilter(
+                "549",
+                "col_a",
+                ADAPTIVE_CYCLE,
+                2,  // maxWaitExtensions
+                DEFAULT_MAX_SIZE_BYTES,
+                new DynamicFilterStats(),
+                runtimeStats,
+                true);
+        filter.setExpectedPartitions(100);
+        filter.startTimeout();
+
+        // Trickle one contribution per cycle for more cycles than the cap permits.
+        // After (1 + 2) = 3 cycles the filter must finalize even though contributions
+        // are still arriving.
+        for (int i = 0; i < 6; i++) {
+            Thread.sleep(ADAPTIVE_CYCLE.toMillis() - 30);
+            filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                    ImmutableMap.of("549", Domain.singleValue(INTEGER, (long) i))));
+        }
+        Thread.sleep(50);
+
+        assertFalse(filter.isComplete(), "Cap should fire before expectedPartitions reached");
+        assertEquals(filter.getCurrentConstraintByColumnName(), TupleDomain.all(),
+                "Partial data must not be exposed after capped timeout");
+        long extensions = runtimeStats.getMetrics().get(DYNAMIC_FILTER_EXTENSION_COUNT).getSum();
+        assertEquals(extensions, 2, "Extensions used must equal maxWaitExtensions cap");
+    }
+
+    /**
+     * Correctness: with adaptive extension enabled, the future is completed with
+     * all() on timeout and isComplete() / getCurrentConstraintByColumnName() preserve
+     * the 6c07185b guarantee (no partial constraint exposed).
+     */
+    @Test
+    public void testAdaptiveTimeoutPreservesAllOrNothingContract()
+            throws Exception
+    {
+        RuntimeStats runtimeStats = new RuntimeStats();
+        JoinDynamicFilter filter = new JoinDynamicFilter(
+                "549",
+                "col_a",
+                ADAPTIVE_CYCLE,
+                3,  // maxWaitExtensions
+                DEFAULT_MAX_SIZE_BYTES,
+                new DynamicFilterStats(),
+                runtimeStats,
+                false);  // extendedMetrics off — exercise the non-diagnostic path
+        filter.setExpectedPartitions(4);
+
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 10L))));
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 20L))));
+        filter.startTimeout();
+
+        // No further contributions. After capped finalize, partial union (10, 20)
+        // must NOT leak to callers; getCurrentConstraintByColumnName stays all().
+        Thread.sleep(ADAPTIVE_CYCLE.toMillis() * (1 + 3) + 80);
+
+        assertFalse(filter.isComplete(),
+                "Filter must remain incomplete after timeout despite partial contributions");
+        assertEquals(filter.getCurrentConstraintByColumnName(), TupleDomain.all(),
+                "Partial union (10, 20) must not be exposed to connector");
+        assertTrue(filter.isBlocked().isDone(),
+                "Future must be completed so the connector unblocks");
+
+        // Even a super-late arrival after the future completed must not flip fullyResolved.
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 30L))));
+        filter.addPartitionByFilterId(TupleDomain.withColumnDomains(
+                ImmutableMap.of("549", Domain.singleValue(INTEGER, 40L))));
+        assertFalse(filter.isComplete(),
+                "Late arrivals after timeout must not resolve the filter");
+        assertEquals(filter.getCurrentConstraintByColumnName(), TupleDomain.all());
+    }
+    // END ADAPTIVE-WAIT TESTS
 }

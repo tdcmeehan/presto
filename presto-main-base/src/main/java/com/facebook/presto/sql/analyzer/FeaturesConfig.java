@@ -181,6 +181,7 @@ public class FeaturesConfig
     private int dynamicFilteringRangeRowLimitPerDriver;
     private DistributedDynamicFilterStrategy distributedDynamicFilterStrategy = DistributedDynamicFilterStrategy.DISABLED;
     private Duration distributedDynamicFilterMaxWaitTime = new Duration(2, SECONDS);
+    private int distributedDynamicFilterMaxWaitExtensions = 2;
     private DataSize distributedDynamicFilterMaxSize = new DataSize(1, MEGABYTE);
 
     private double distributedDynamicFilterCardinalityRatioThreshold = 0.1;
@@ -1638,6 +1639,20 @@ public class FeaturesConfig
     public FeaturesConfig setDistributedDynamicFilterMaxWaitTime(Duration distributedDynamicFilterMaxWaitTime)
     {
         this.distributedDynamicFilterMaxWaitTime = distributedDynamicFilterMaxWaitTime;
+        return this;
+    }
+
+    @Min(0)
+    public int getDistributedDynamicFilterMaxWaitExtensions()
+    {
+        return distributedDynamicFilterMaxWaitExtensions;
+    }
+
+    @Config("distributed-dynamic-filter.max-wait-extensions")
+    @ConfigDescription("Maximum number of additional max-wait-time cycles to grant a partitioned dynamic filter when partition contributions are still arriving. Total wall = (1 + extensions) * max-wait-time. Set to 0 to disable adaptive extension.")
+    public FeaturesConfig setDistributedDynamicFilterMaxWaitExtensions(int distributedDynamicFilterMaxWaitExtensions)
+    {
+        this.distributedDynamicFilterMaxWaitExtensions = distributedDynamicFilterMaxWaitExtensions;
         return this;
     }
 

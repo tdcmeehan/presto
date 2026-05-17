@@ -590,6 +590,48 @@ concurrency.
 The corresponding configuration property is :ref:`admin/properties:\`\`optimizer.local-exchange-parent-preference-strategy\`\``.
 
 
+Dynamic Filter Properties
+-------------------------
+
+``distributed_dynamic_filter_max_wait_time``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``Duration``
+* **Default value:** ``2s``
+
+Per-cycle maximum time the coordinator waits for partition contributions to a
+distributed dynamic filter before checking whether progress is being made. If
+new contributions have arrived during the cycle and the extension budget is
+not exhausted (see ``distributed_dynamic_filter_max_wait_extensions``), the
+wait is extended by another cycle. If no new contributions have arrived, the
+filter is finalized — the future unblocks split scheduling and the filter is
+explicitly abandoned (no filter is pushed to the connector). Total maximum
+wall time is ``(1 + distributed_dynamic_filter_max_wait_extensions) *
+distributed_dynamic_filter_max_wait_time``.
+
+The corresponding configuration property is
+:ref:`admin/properties:\`\`distributed-dynamic-filter.max-wait-time\`\``.
+
+``distributed_dynamic_filter_max_wait_extensions``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``integer``
+* **Allowed values:** non-negative
+* **Default value:** ``2``
+
+Maximum number of additional ``distributed_dynamic_filter_max_wait_time``
+cycles to grant a partitioned dynamic filter when partition contributions are
+still arriving. Each extension is consumed only when at least one new
+contribution arrived during the prior cycle. Set to ``0`` to disable adaptive
+extension and finalize after a single cycle. Partial contributions are never
+exposed to the connector; on extension exhaustion the filter is explicitly
+abandoned (returns ``TupleDomain.all()`` so split pruning proceeds without a
+filter).
+
+The corresponding configuration property is
+:ref:`admin/properties:\`\`distributed-dynamic-filter.max-wait-extensions\`\``.
+
+
 JDBC Properties
 ---------------
 

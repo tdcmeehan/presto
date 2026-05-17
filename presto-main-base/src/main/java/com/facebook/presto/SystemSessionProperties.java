@@ -232,6 +232,7 @@ public final class SystemSessionProperties
     public static final String DYNAMIC_FILTERING_RANGE_ROW_LIMIT_PER_DRIVER = "dynamic_filtering_range_row_limit_per_driver";
     public static final String DISTRIBUTED_DYNAMIC_FILTER_STRATEGY = "distributed_dynamic_filter_strategy";
     public static final String DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME = "distributed_dynamic_filter_max_wait_time";
+    public static final String DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_EXTENSIONS = "distributed_dynamic_filter_max_wait_extensions";
     public static final String DISTRIBUTED_DYNAMIC_FILTER_MAX_SIZE = "distributed_dynamic_filter_max_size";
 
     public static final String DISTRIBUTED_DYNAMIC_FILTER_CARDINALITY_RATIO_THRESHOLD = "distributed_dynamic_filter_cardinality_ratio_threshold";
@@ -1298,13 +1299,18 @@ public final class SystemSessionProperties
                         DistributedDynamicFilterStrategy::name),
                 new PropertyMetadata<>(
                         DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME,
-                        "Maximum time to wait for distributed dynamic filter before proceeding with split scheduling",
+                        "Per-cycle maximum wait for a distributed dynamic filter before checking whether partition contributions are still arriving. Total wall = (1 + " + DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_EXTENSIONS + ") * this value.",
                         VARCHAR,
                         Duration.class,
                         featuresConfig.getDistributedDynamicFilterMaxWaitTime(),
                         false,
                         value -> Duration.valueOf((String) value),
                         Duration::toString),
+                integerProperty(
+                        DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_EXTENSIONS,
+                        "Maximum number of additional max-wait-time cycles to grant a partitioned dynamic filter when partition contributions are still arriving. Set to 0 to disable adaptive extension.",
+                        featuresConfig.getDistributedDynamicFilterMaxWaitExtensions(),
+                        false),
                 new PropertyMetadata<>(
                         DISTRIBUTED_DYNAMIC_FILTER_MAX_SIZE,
                         "Maximum size of coordinator-side merged dynamic filter before collapsing to min/max range",
@@ -3040,6 +3046,11 @@ public final class SystemSessionProperties
     public static Duration getDistributedDynamicFilterMaxWaitTime(Session session)
     {
         return session.getSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME, Duration.class);
+    }
+
+    public static int getDistributedDynamicFilterMaxWaitExtensions(Session session)
+    {
+        return session.getSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_EXTENSIONS, Integer.class);
     }
 
     public static DataSize getDistributedDynamicFilterMaxSize(Session session)

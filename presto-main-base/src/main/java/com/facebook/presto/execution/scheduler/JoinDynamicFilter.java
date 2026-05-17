@@ -31,6 +31,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
@@ -41,6 +43,7 @@ import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_COORDI
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_DEFICIT_AT_TIMEOUT;  // DIAGNOSTIC(DPP-PARTITIONED-WAIT)
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_DOMAIN_RANGE_COUNT;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_EXPECTED_PARTITIONS;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_EXTENSION_COUNT;  // DIAGNOSTIC(DPP-PARTITIONED-WAIT)
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PARTITIONS_AT_TIMEOUT;  // DIAGNOSTIC(DPP-PARTITIONED-WAIT)
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PARTITIONS_RECEIVED;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_SHORT_CIRCUITED;
@@ -67,9 +70,19 @@ import static java.util.Objects.requireNonNull;
 @ThreadSafe
 public class JoinDynamicFilter
 {
+    // Single-thread daemon scheduler shared across all JoinDynamicFilter instances.
+    // Ticks are short (O(1) work under a per-filter monitor); a single thread is sufficient
+    // because at most one tick per filter is pending at a time and ticks self-reschedule.
+    private static final ScheduledExecutorService TIMEOUT_SCHEDULER = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "join-dynamic-filter-timeout");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     private final String filterId;
     private final String columnName;
     private final Duration waitTimeout;
+    private final int maxWaitExtensions;
     private final long maxSizeInBytes;
     private final DynamicFilterStats stats;
     private final RuntimeStats runtimeStats;
@@ -100,7 +113,16 @@ public class JoinDynamicFilter
     private boolean collectionTimeRecorded;
     @GuardedBy("this")
     private long lastPartitionArrivalNanos;  // 0 = no arrivals yet // DIAGNOSTIC(DPP-PARTITIONED-WAIT)
+    @GuardedBy("this")
+    private int extensionsUsed;
+    @GuardedBy("this")
+    private int lastTickPartitionCount;
 
+    /**
+     * Back-compat for tests written before {@code maxWaitExtensions} was added.
+     * Defaults extensions to 0 (single-cycle wait, matching the pre-adaptive behavior).
+     * Production callers (see {@code SplitSourceFactory}) must use the full constructor.
+     */
     public JoinDynamicFilter(
             String filterId,
             String columnName,
@@ -110,9 +132,24 @@ public class JoinDynamicFilter
             RuntimeStats runtimeStats,
             boolean extendedMetrics)
     {
+        this(filterId, columnName, waitTimeout, 0, maxSizeInBytes, stats, runtimeStats, extendedMetrics);
+    }
+
+    public JoinDynamicFilter(
+            String filterId,
+            String columnName,
+            Duration waitTimeout,
+            int maxWaitExtensions,
+            long maxSizeInBytes,
+            DynamicFilterStats stats,
+            RuntimeStats runtimeStats,
+            boolean extendedMetrics)
+    {
         this.filterId = requireNonNull(filterId, "filterId is null");
         this.columnName = requireNonNull(columnName, "columnName is null");
         this.waitTimeout = requireNonNull(waitTimeout, "waitTimeout is null");
+        verify(maxWaitExtensions >= 0, "maxWaitExtensions must be non-negative");
+        this.maxWaitExtensions = maxWaitExtensions;
         this.maxSizeInBytes = maxSizeInBytes;
         this.expectedPartitions = Integer.MAX_VALUE;
         this.stats = requireNonNull(stats, "stats is null");
@@ -141,21 +178,66 @@ public class JoinDynamicFilter
     /**
      * Must be called when wired to a split source, not at registration time,
      * since the filter may be pre-registered well before the split source exists.
+     *
+     * <p>Schedules a progress-aware deadline. Every {@code waitTimeout} cycle the tick
+     * checks whether new partition contributions have arrived since the prior tick;
+     * if so and the extension budget is not exhausted, the deadline is extended by
+     * one more cycle. Otherwise the future is completed with {@link TupleDomain#all()}
+     * (no filter pushed). Total wall time is bounded by
+     * {@code (1 + maxWaitExtensions) * waitTimeout}.
      */
     public void startTimeout()
     {
         if (timeoutStarted.compareAndSet(false, true)) {
             long timeoutMs = waitTimeout.toMillis();
             if (timeoutMs > 0) {
-                constraintByFilterIdFuture.completeOnTimeout(TupleDomain.all(), timeoutMs, TimeUnit.MILLISECONDS);
-                if (extendedMetrics) {
-                    constraintByFilterIdFuture.whenComplete((result, throwable) -> {
-                        if (!fullyResolved) {
-                            onTimeout();
-                        }
-                    });
+                // Baseline the progress snapshot at startTimeout, so any contribution
+                // received BEFORE startTimeout does not get credited as new progress
+                // on the first tick.
+                synchronized (this) {
+                    lastTickPartitionCount = partitionsByFilterId.size();
                 }
+                scheduleTick(timeoutMs);
             }
+        }
+    }
+
+    private void scheduleTick(long timeoutMs)
+    {
+        TIMEOUT_SCHEDULER.schedule(this::onTick, timeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void onTick()
+    {
+        boolean reschedule;
+        synchronized (this) {
+            if (constraintByFilterIdFuture.isDone()) {
+                return;
+            }
+            int currentReceived = partitionsByFilterId.size();
+            boolean progress = currentReceived > lastTickPartitionCount;
+            lastTickPartitionCount = currentReceived;
+            if (progress && extensionsUsed < maxWaitExtensions) {
+                extensionsUsed++;
+                if (extendedMetrics) {
+                    runtimeStats.addMetricValue(DYNAMIC_FILTER_EXTENSION_COUNT, NONE, 1);
+                    if (!filterId.isEmpty()) {
+                        runtimeStats.addMetricValue(format("%s[%s]", DYNAMIC_FILTER_EXTENSION_COUNT, filterId), NONE, 1);
+                    }
+                }
+                reschedule = true;
+            }
+            else {
+                // Finalize inside the monitor so a concurrent addPartitionByFilterId either
+                // resolves the filter first (and this tick observes isDone) or sees the
+                // future already completed and bails — partial state is never exposed.
+                constraintByFilterIdFuture.complete(TupleDomain.all());
+                onTimeout();
+                reschedule = false;
+            }
+        }
+        if (reschedule) {
+            scheduleTick(waitTimeout.toMillis());
         }
     }
 

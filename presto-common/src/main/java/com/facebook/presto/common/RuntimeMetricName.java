@@ -120,6 +120,7 @@ public class RuntimeMetricName
     public static final String DYNAMIC_FILTER_PARTITIONS_AT_TIMEOUT = "dynamicFilterPartitionsAtTimeout";
     public static final String DYNAMIC_FILTER_DEFICIT_AT_TIMEOUT = "dynamicFilterDeficitAtTimeout";
     public static final String DYNAMIC_FILTER_TIME_SINCE_LAST_ARRIVAL_AT_TIMEOUT_NANOS = "dynamicFilterTimeSinceLastArrivalAtTimeoutNanos";
+    public static final String DYNAMIC_FILTER_EXTENSION_COUNT = "dynamicFilterExtensionCount";
     // END DIAGNOSTIC(DPP-PARTITIONED-WAIT)
     public static final String DYNAMIC_FILTER_PLAN_CREATED_FAVORABLE_RATIO = "dynamicFilterPlanCreatedFavorableRatio";
     public static final String DYNAMIC_FILTER_PLAN_SKIPPED_HIGH_CARDINALITY = "dynamicFilterPlanSkippedHighCardinality";

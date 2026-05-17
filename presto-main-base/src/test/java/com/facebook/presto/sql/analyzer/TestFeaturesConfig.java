@@ -128,6 +128,7 @@ public class TestFeaturesConfig
                 .setDynamicFilteringRangeRowLimitPerDriver(0)
                 .setDistributedDynamicFilterStrategy(FeaturesConfig.DistributedDynamicFilterStrategy.DISABLED)
                 .setDistributedDynamicFilterMaxWaitTime(new Duration(2, SECONDS))
+                .setDistributedDynamicFilterMaxWaitExtensions(2)
                 .setDistributedDynamicFilterMaxSize(new DataSize(1, MEGABYTE))
 
                 .setDistributedDynamicFilterCardinalityRatioThreshold(0.1)
@@ -317,6 +318,7 @@ public class TestFeaturesConfig
                 .put("dynamic-filtering-range-row-limit-per-driver", "1000")
                 .put("distributed-dynamic-filter.strategy", "ALWAYS")
                 .put("distributed-dynamic-filter.max-wait-time", "5s")
+                .put("distributed-dynamic-filter.max-wait-extensions", "5")
                 .put("distributed-dynamic-filter.max-size", "2MB")
 
                 .put("distributed-dynamic-filter.cardinality-ratio-threshold", "0.3")
@@ -556,6 +558,7 @@ public class TestFeaturesConfig
                 .setDynamicFilteringRangeRowLimitPerDriver(1000)
                 .setDistributedDynamicFilterStrategy(FeaturesConfig.DistributedDynamicFilterStrategy.ALWAYS)
                 .setDistributedDynamicFilterMaxWaitTime(new Duration(5, SECONDS))
+                .setDistributedDynamicFilterMaxWaitExtensions(5)
                 .setDistributedDynamicFilterMaxSize(new DataSize(2, MEGABYTE))
 
                 .setDistributedDynamicFilterCardinalityRatioThreshold(0.3)
