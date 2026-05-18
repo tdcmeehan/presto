@@ -828,6 +828,40 @@ public class TestIcebergMaterializedViewMetadata
     }
 
     @Test
+    public void testAlterMaterializedViewSetPropertiesRejectsUnknownProperty()
+    {
+        assertUpdate("CREATE TABLE test_alter_mv_unknown_base (id BIGINT)");
+        try {
+            assertUpdate("CREATE MATERIALIZED VIEW test_alter_mv_unknown_mv " +
+                    "AS SELECT id FROM test_alter_mv_unknown_base");
+            assertQueryFails(
+                    "ALTER MATERIALIZED VIEW test_alter_mv_unknown_mv SET PROPERTIES (nonexistent_property = 'foo')",
+                    ".*does not support materialized view property 'nonexistent_property'.*");
+        }
+        finally {
+            assertUpdate("DROP MATERIALIZED VIEW IF EXISTS test_alter_mv_unknown_mv");
+            assertUpdate("DROP TABLE test_alter_mv_unknown_base");
+        }
+    }
+
+    @Test
+    public void testAlterMaterializedViewSetPropertiesRejectsNullValue()
+    {
+        assertUpdate("CREATE TABLE test_alter_mv_null_base (id BIGINT)");
+        try {
+            assertUpdate("CREATE MATERIALIZED VIEW test_alter_mv_null_mv " +
+                    "AS SELECT id FROM test_alter_mv_null_base");
+            assertQueryFails(
+                    "ALTER MATERIALIZED VIEW test_alter_mv_null_mv SET PROPERTIES (staleness_window = NULL)",
+                    ".*Invalid null value for materialized view property.*");
+        }
+        finally {
+            assertUpdate("DROP MATERIALIZED VIEW IF EXISTS test_alter_mv_null_mv");
+            assertUpdate("DROP TABLE test_alter_mv_null_base");
+        }
+    }
+
+    @Test
     public void testAlterMaterializedViewSetPropertiesRejectsLegacy()
     {
         assertUpdate("CREATE TABLE test_alter_mv_legacy_base (id BIGINT)");

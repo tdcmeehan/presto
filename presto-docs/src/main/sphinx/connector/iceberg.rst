@@ -2864,35 +2864,52 @@ Property Name                                          Description              
                                                        view falls back to a full recompute.
 ====================================================== ============================================================= ========================
 
-Table Properties
-^^^^^^^^^^^^^^^^
+.. _iceberg-alter-materialized-view:
 
-The following table properties can be specified when creating a materialized view:
+Materialized View Properties
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-========================================================== ============================================================================
-Property Name                                              Description
-========================================================== ============================================================================
-``storage_schema``                                         Schema name for the storage table. Defaults to the materialized view's
-                                                           schema.
+The following table properties can be specified when creating a materialized view.
+Properties marked **Yes** in the *Alterable* column can be changed after creation
+by using :doc:`/sql/alter-materialized-view`; properties not specified in the
+``SET PROPERTIES`` clause keep their current value, and setting these properties to
+``NULL`` is not supported.
 
-``storage_table``                                          Custom name for the storage table. Defaults to the prefix plus the
-                                                           materialized view name.
+.. list-table::
+   :widths: 25 60 15
+   :header-rows: 1
 
-``stale_read_behavior``                                    Behavior when reading from a materialized view that is stale beyond the
-                                                           staleness window. Valid values: ``FAIL`` (throw an error),
-                                                           ``USE_VIEW_QUERY`` (query base tables instead).
-
-``staleness_window``                                       Duration window for staleness tolerance (e.g., ``1h``, ``30m``, ``0s``).
-                                                           Defaults to ``0s`` if only ``stale_read_behavior`` is set. When set to
-                                                           ``0s``, any staleness triggers the configured behavior.
-
-``refresh_type``                                           Refresh strategy for the materialized view. Valid values: ``FULL``
-                                                           (always recompute entire view), ``INCREMENTAL`` (recompute only stale
-                                                           partitions when possible, fall back to full otherwise). When not set,
-                                                           uses the ``materialized_view_default_refresh_type`` session property.
-========================================================== ============================================================================
+   * - Property Name
+     - Description
+     - Alterable
+   * - ``storage_schema``
+     - Schema name for the storage table. Defaults to the materialized view's schema.
+     - No
+   * - ``storage_table``
+     - Custom name for the storage table. Defaults to the prefix plus the materialized view name.
+     - No
+   * - ``stale_read_behavior``
+     - Behavior when reading from a materialized view that is stale beyond the staleness window.
+       Valid values: ``FAIL`` (throw an error), ``USE_VIEW_QUERY`` (query base tables instead).
+     - Yes
+   * - ``staleness_window``
+     - Duration window for staleness tolerance (e.g., ``1h``, ``30m``, ``0s``).
+       Defaults to ``0s`` if only ``stale_read_behavior`` is set.
+       When set to ``0s``, any staleness triggers the configured behavior.
+     - Yes
+   * - ``refresh_type``
+     - Refresh strategy for the materialized view. Valid values: ``FULL``
+       (always recompute entire view), ``INCREMENTAL`` (recompute only stale
+       partitions when possible, fall back to full otherwise). When not set,
+       uses the ``materialized_view_default_refresh_type`` session property.
+     - Yes
 
 The storage table inherits standard Iceberg table properties for partitioning, sorting, and file format.
+
+Example::
+
+    ALTER MATERIALIZED VIEW hourly_sales
+    SET PROPERTIES (staleness_window = '30m', refresh_type = 'INCREMENTAL');
 
 Freshness and Refresh
 ^^^^^^^^^^^^^^^^^^^^^
