@@ -827,31 +827,37 @@ public class IcebergHiveMetadata
             Map<String, String> properties)
     {
         MetastoreContext metastoreContext = getMetastoreContext(session);
-
-        Optional<Table> existingTable = getHiveTable(session, viewName);
-        if (!existingTable.isPresent() || !isIcebergMaterializedView(existingTable.get())) {
-            throw new PrestoException(NOT_FOUND, "Materialized view not found: " + viewName);
-        }
-
-        Table table = existingTable.get();
-
-        ImmutableMap.Builder<String, String> mergedProperties = ImmutableMap.builder();
-        mergedProperties.putAll(table.getParameters());
-        mergedProperties.putAll(properties);
-
-        Table updatedTable = Table.builder(table)
-                .setParameters(mergedProperties.buildKeepingLast())
-                .build();
-
-        PrincipalPrivileges privileges = buildInitialPrivilegeSet(table.getOwner());
-        metastore.replaceTable(
+        try (HiveMetastoreLock ignored = HiveMetastoreLock.acquire(
+                metastore,
                 metastoreContext,
+                hiveTableOperationsConfig.getLockingEnabled(),
                 viewName.getSchemaName(),
-                viewName.getTableName(),
-                updatedTable,
-                privileges);
+                viewName.getTableName())) {
+            Optional<Table> existingTable = getHiveTable(session, viewName);
+            if (!existingTable.isPresent() || !isIcebergMaterializedView(existingTable.get())) {
+                throw new PrestoException(NOT_FOUND, "Materialized view not found: " + viewName);
+            }
 
-        tableCache.invalidate(viewName);
+            Table table = existingTable.get();
+
+            ImmutableMap.Builder<String, String> mergedProperties = ImmutableMap.builder();
+            mergedProperties.putAll(table.getParameters());
+            mergedProperties.putAll(properties);
+
+            Table updatedTable = Table.builder(table)
+                    .setParameters(mergedProperties.buildKeepingLast())
+                    .build();
+
+            PrincipalPrivileges privileges = buildInitialPrivilegeSet(table.getOwner());
+            metastore.replaceTable(
+                    metastoreContext,
+                    viewName.getSchemaName(),
+                    viewName.getTableName(),
+                    updatedTable,
+                    privileges);
+
+            tableCache.invalidate(viewName);
+        }
     }
 
     private static boolean isIcebergMaterializedView(Table table)

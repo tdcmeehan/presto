@@ -31,9 +31,6 @@ import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableNotFoundException;
 import com.facebook.presto.spi.security.PrestoPrincipal;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.Sets;
@@ -64,9 +61,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_METASTORE_ERROR;
@@ -135,8 +130,6 @@ public class HiveTableOperations
     private boolean shouldRefresh = true;
     private int version = -1;
 
-    private static LoadingCache<String, ReentrantLock> commitLockCache;
-
     public HiveTableOperations(
             ExtendedHiveMetastore metastore,
             MetastoreContext metastoreContext,
@@ -197,25 +190,6 @@ public class HiveTableOperations
         this.owner = requireNonNull(owner, "owner is null");
         this.location = requireNonNull(location, "location is null");
         this.config = requireNonNull(config, "config is null");
-        //TODO: duration from config
-        initTableLevelLockCache(TimeUnit.MINUTES.toMillis(10));
-    }
-
-    private static synchronized void initTableLevelLockCache(long evictionTimeout)
-    {
-        if (commitLockCache == null) {
-            commitLockCache = CacheBuilder.newBuilder()
-                    .expireAfterAccess(evictionTimeout, TimeUnit.MILLISECONDS)
-                    .build(
-                            new CacheLoader<String, ReentrantLock>()
-                            {
-                                @Override
-                                public ReentrantLock load(String fullName)
-                                {
-                                    return new ReentrantLock();
-                                }
-                            });
-        }
     }
 
     @Override
@@ -273,19 +247,11 @@ public class HiveTableOperations
         String newMetadataLocation = writeNewMetadata(metadata, version + 1);
 
         Table table;
-        Optional<Long> lockId = Optional.empty();
         boolean useHMSLock = Optional.ofNullable(metadata.property(TableProperties.HIVE_LOCK_ENABLED, null))
                 .map(Boolean::parseBoolean)
                 .orElse(config.getLockingEnabled());
-        ReentrantLock tableLevelMutex = commitLockCache.getUnchecked(database + "." + tableName);
-        // getting a process-level lock per table to avoid concurrent commit attempts to the same table from the same
-        // JVM process, which would result in unnecessary and costly HMS lock acquisition requests
-        tableLevelMutex.lock();
-        try {
+        try (HiveMetastoreLock ignored = HiveMetastoreLock.acquire(metastore, metastoreContext, useHMSLock, database, tableName)) {
             try {
-                if (useHMSLock) {
-                    lockId = metastore.lock(metastoreContext, database, tableName);
-                }
                 if (base == null) {
                     String tableComment = metadata.properties().get(TABLE_COMMENT);
                     Map<String, String> parameters = new HashMap<>();
@@ -401,15 +367,6 @@ public class HiveTableOperations
         }
         finally {
             shouldRefresh = true;
-            try {
-                lockId.ifPresent(id -> metastore.unlock(metastoreContext, id));
-            }
-            catch (Exception e) {
-                log.error(e, "Failed to unlock: %s", lockId.orElse(null));
-            }
-            finally {
-                tableLevelMutex.unlock();
-            }
         }
     }
 
