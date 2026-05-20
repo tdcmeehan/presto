@@ -132,6 +132,9 @@ public class RuntimeMetricName
     public static final String DYNAMIC_FILTER_PUSH_TO_WORKER_LATENCY_MS = "dynamicFilterPushToWorkerLatencyMs";
     public static final String DYNAMIC_FILTER_PUSH_TO_WORKER_HTTP_STATUS = "dynamicFilterPushToWorkerHttpStatus";
     public static final String DYNAMIC_FILTER_PUSH_TO_WORKER_TASK_NOT_FOUND_COUNT = "dynamicFilterPushToWorkerTaskNotFoundCount";
+    public static final String DYNAMIC_FILTER_PUSH_TO_WORKER_THROTTLED_COUNT = "dynamicFilterPushToWorkerThrottledCount";
+    public static final String DYNAMIC_FILTER_PUSH_TO_WORKER_RETRIED_COUNT = "dynamicFilterPushToWorkerRetriedCount";
+    public static final String DYNAMIC_FILTER_PUSH_TO_WORKER_RETRY_GAVE_UP_COUNT = "dynamicFilterPushToWorkerRetryGaveUpCount";
     // Column selectivity check metrics (extended metrics only)
     public static final String DYNAMIC_FILTER_COLUMNS_SKIPPED = "dynamicFilterColumnsSkipped";
     public static final String DYNAMIC_FILTER_COLUMNS_RELEVANT = "dynamicFilterColumnsRelevant";

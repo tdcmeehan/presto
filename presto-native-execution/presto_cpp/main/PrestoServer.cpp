@@ -27,6 +27,7 @@
 #include "presto_cpp/main/TaskResource.h"
 #include "presto_cpp/main/common/ConfigReader.h"
 #include "presto_cpp/main/common/Counters.h"
+#include "presto_cpp/main/dpp/DppFilterCache.h"
 #include "presto_cpp/main/common/Utils.h"
 #include "presto_cpp/main/connectors/Registration.h"
 #include "presto_cpp/main/connectors/SystemConnector.h"
@@ -1116,6 +1117,13 @@ void PrestoServer::initializeVeloxMemory() {
   PRESTO_STARTUP_LOG(INFO) << "Memory manager has been setup: "
                            << velox::memory::memoryManager()->toString();
 
+  const auto dppFilterCacheMaxBytes = systemConfig->dppFilterCacheMaxBytes();
+  dpp::DppFilterCache::initialize(
+      static_cast<int64_t>(dppFilterCacheMaxBytes));
+  PRESTO_STARTUP_LOG(INFO)
+      << "DPP filter cache pool initialized with capacity "
+      << dppFilterCacheMaxBytes << " bytes";
+
   if (systemConfig->asyncDataCacheEnabled()) {
     std::unique_ptr<velox::cache::SsdCache> ssd = setupSsdCache();
     std::string cacheStr =
@@ -1671,6 +1679,14 @@ void PrestoServer::populateMemAndCPUInfo() {
   RECORD_METRIC_VALUE(
       kCounterMemoryManagerTotalBytes,
       velox::memory::memoryManager()->getTotalBytes());
+  if (auto* dppCache = dpp::DppFilterCache::getInstance()) {
+    RECORD_METRIC_VALUE(
+        kCounterDppFilterCacheCurrentBytes, dppCache->currentBytes());
+    RECORD_METRIC_VALUE(
+        kCounterDppFilterCacheMaxBytes, dppCache->maxCapacity());
+    RECORD_METRIC_VALUE(
+        kCounterDppFilterCachePushRejected, dppCache->pushRejectedCount());
+  }
   cpuMon_.update();
   checkOverload();
   **memoryInfo_.wlock() = std::move(memoryInfo);

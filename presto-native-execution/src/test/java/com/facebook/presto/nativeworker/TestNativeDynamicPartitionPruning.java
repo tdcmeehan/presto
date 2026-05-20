@@ -160,26 +160,42 @@ public class TestNativeDynamicPartitionPruning
         assertTrue(sumMetric(runtimeStats, DYNAMIC_FILTER_PUSH_TO_WORKER_COUNT) > 0);
         assertTrue(sumMetric(runtimeStats, DYNAMIC_FILTER_PUSH_TO_WORKER_TASK_COUNT) > 0);
         assertTrue(sumMetric(runtimeStats, "externalDynamicFiltersReceived") > 0);
+        assertTrue(hasMetric(runtimeStats, "dppFilterCacheBytes"));
 
-        // Verify dynamic filters actually pruned input rows
         long rawInputRows = sumMetric(runtimeStats, "rawInputRows");
         assertTrue(rawInputRows < 10000,
                 "Dynamic filter should have pruned some input rows, but read " + rawInputRows);
     }
 
+    // Regression guard for the findOrCreateTask race that produced
+    // "Leaf child memory pool task.<id> already exists in dppFilterCache".
     @Test
     public void testDynamicFilterPushConcurrent()
             throws Exception
     {
-        ExecutorService executor = Executors.newFixedThreadPool(4);
+        ExecutorService executor = Executors.newFixedThreadPool(16);
         List<Future<?>> futures = new ArrayList<>();
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 16; i++) {
             futures.add(executor.submit(() -> testDynamicFilterPushToWorker()));
         }
         for (Future<?> f : futures) {
-            f.get(60, TimeUnit.SECONDS);
+            f.get(120, TimeUnit.SECONDS);
         }
         executor.shutdown();
+    }
+
+    @Test
+    public void testDynamicFilterPushRapidFireSequential()
+    {
+        for (int i = 0; i < 20; i++) {
+            testDynamicFilterPushToWorker();
+        }
+    }
+
+    private static boolean hasMetric(RuntimeStats runtimeStats, String metricName)
+    {
+        return runtimeStats.getMetrics().keySet().stream()
+                .anyMatch(k -> k.equals(metricName) || k.endsWith(metricName));
     }
 
     private static long sumMetric(RuntimeStats runtimeStats, String metricName)

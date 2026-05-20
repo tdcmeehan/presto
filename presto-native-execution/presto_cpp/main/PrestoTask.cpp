@@ -15,10 +15,12 @@
 #include "presto_cpp/main/PrestoTask.h"
 #include <glog/logging.h>
 #include <sys/resource.h>
+#include <cstring>
 #include "presto_cpp/main/common/Configs.h"
 #include "presto_cpp/main/common/Exception.h"
 #include "presto_cpp/main/common/Utils.h"
 #include "presto_cpp/main/connectors/PrestoToVeloxConnectorUtils.h"
+#include "presto_cpp/main/dpp/DppFilterCache.h"
 #include "presto_cpp/main/types/PrestoToVeloxExpr.h"
 #include "presto_cpp/main/types/TypeParser.h"
 #include "velox/common/base/Exceptions.h"
@@ -516,6 +518,36 @@ PrestoTask::PrestoTask(
   info.taskId = taskId;
   info.nodeId = nodeId;
   createTimeMs = getCurrentTimeMs();
+
+  dppFilterCache_ = dpp::DppFilterCache::getInstance();
+  dppPool_ = dppFilterCache_->createTaskPool(taskId);
+}
+
+PrestoTask::~PrestoTask() {
+  if (dppFilterCache_ != nullptr) {
+    dppFilterCache_->forgetTask(this);
+  }
+  if (dppPool_ == nullptr) {
+    return;
+  }
+  {
+    auto locked = dynamicFilters_.wlock();
+    for (auto& [filterId, entry] : *locked) {
+      if (entry.buffer != nullptr) {
+        dppPool_->free(entry.buffer, entry.bufferSize);
+      }
+    }
+    locked->clear();
+  }
+  {
+    std::lock_guard<std::mutex> l(mutex);
+    for (auto& pf : pendingExternalFilters_) {
+      if (pf.buffer != nullptr) {
+        dppPool_->free(pf.buffer, pf.bufferSize);
+      }
+    }
+    pendingExternalFilters_.clear();
+  }
 }
 
 PrestoTaskState PrestoTask::taskState() const {
@@ -819,6 +851,18 @@ void PrestoTask::updateTimeInfoLocked(
       taskRuntimeStats["dppBridgeError:" + *err].addValue(1);
     }
   }
+
+  if (dppPool_ != nullptr) {
+    taskRuntimeStats["dppFilterCacheBytes"].addValue(dppPool_->reservedBytes());
+  }
+  const auto pushRejected = dppFilterCachePushRejected_.load();
+  if (pushRejected > 0) {
+    taskRuntimeStats["dppFilterCachePushRejected"].addValue(pushRejected);
+  }
+  const auto storeRejected = dppFilterCacheStoreRejected_.load();
+  if (storeRejected > 0) {
+    taskRuntimeStats["dppFilterCacheStoreRejected"].addValue(storeRejected);
+  }
 }
 
 void PrestoTask::updateMemoryInfoLocked(
@@ -1025,10 +1069,65 @@ void PrestoTask::storeDynamicFilters(
   {
     auto locked = dynamicFilters_.wlock();
     for (const auto& [filterId, domain] : filters) {
-      (*locked)[filterId] = VersionedFilter{domain, version};
+      const auto bytes = dpp::serializeTupleDomain(domain);
+      void* buffer = nullptr;
+      try {
+        buffer = dppPool_->allocate(bytes.size());
+      } catch (const std::exception& e) {
+        ++dppFilterCacheStoreRejected_;
+        LOG_EVERY_N(WARNING, 100)
+            << "DPP filter cache full; dropping build-side filter '"
+            << filterId << "' on task " << id.toString() << ": " << e.what();
+        continue;
+      }
+      std::memcpy(buffer, bytes.data(), bytes.size());
+
+      auto [it, inserted] = locked->emplace(filterId, VersionedFilter{});
+      if (!inserted) {
+        evictDynamicFilterEntryLocked(*locked, it);
+        std::tie(it, inserted) =
+            locked->emplace(filterId, VersionedFilter{});
+      }
+      it->second.buffer = buffer;
+      it->second.bufferSize = static_cast<int64_t>(bytes.size());
+      it->second.version = version;
+
+      dppFilterCache_->registerFilter(
+          this,
+          filterId,
+          static_cast<int64_t>(bytes.size()),
+          [this](const std::string& fid) {
+            return evictFilterFromCache(fid);
+          });
     }
   }
   wakeDynamicFilterWaiters(version);
+}
+
+void PrestoTask::evictDynamicFilterEntryLocked(
+    std::map<std::string, VersionedFilter>& filters,
+    std::map<std::string, VersionedFilter>::iterator it) {
+  if (it == filters.end()) {
+    return;
+  }
+  if (it->second.buffer != nullptr) {
+    dppPool_->free(it->second.buffer, it->second.bufferSize);
+  }
+  dppFilterCache_->forget(this, it->first);
+  filters.erase(it);
+}
+
+bool PrestoTask::evictFilterFromCache(const std::string& filterId) {
+  auto locked = dynamicFilters_.wlock();
+  auto it = locked->find(filterId);
+  if (it == locked->end()) {
+    return false;
+  }
+  if (it->second.buffer != nullptr) {
+    dppPool_->free(it->second.buffer, it->second.bufferSize);
+  }
+  locked->erase(it);
+  return true;
 }
 
 void PrestoTask::registerDynamicFilterIds(
@@ -1057,14 +1156,21 @@ void PrestoTask::wakeDynamicFilterWaiters(int64_t version) {
 PrestoTask::DynamicFilterSnapshot PrestoTask::snapshotDynamicFilters(
     int64_t sinceVersion) {
   DynamicFilterSnapshot snapshot;
+  std::vector<std::string> touched;
   // Read filters BEFORE completion flag (matches Java ordering).
   {
     auto locked = dynamicFilters_.rlock();
     for (const auto& [filterId, vf] : *locked) {
-      if (vf.version > sinceVersion) {
-        snapshot.filters[filterId] = vf.domain;
+      if (vf.version > sinceVersion && vf.buffer != nullptr) {
+        snapshot.filters[filterId] = dpp::deserializeTupleDomain(
+            static_cast<const char*>(vf.buffer),
+            static_cast<size_t>(vf.bufferSize));
+        touched.push_back(filterId);
       }
     }
+  }
+  for (const auto& filterId : touched) {
+    dppFilterCache_->touch(this, filterId);
   }
   snapshot.version = dynamicFilterVersion_.load();
   snapshot.completedFilterIds = *flushedFilterIds_.rlock();
@@ -1143,6 +1249,10 @@ void PrestoTask::removeDynamicFiltersThrough(int64_t throughVersion) {
   auto locked = dynamicFilters_.wlock();
   for (auto it = locked->begin(); it != locked->end();) {
     if (it->second.version <= throughVersion) {
+      if (it->second.buffer != nullptr) {
+        dppPool_->free(it->second.buffer, it->second.bufferSize);
+      }
+      dppFilterCache_->forget(this, it->first);
       it = locked->erase(it);
     } else {
       ++it;
@@ -1174,9 +1284,27 @@ void PrestoTask::addExternalDynamicFilter(
     const std::string& filterId,
     const std::string& scanPlanNodeId,
     const protocol::TupleDomain<std::string>& tupleDomain) {
+  const auto bytes = dpp::serializeTupleDomain(tupleDomain);
+  void* buffer = nullptr;
+  try {
+    buffer = dppPool_->allocate(bytes.size());
+  } catch (const std::exception& e) {
+    ++dppFilterCachePushRejected_;
+    dppFilterCache_->incrementPushRejected();
+    throw dpp::DppFilterCacheFull(fmt::format(
+        "dppFilterCache at cap; rejecting push for filter '{}' on task {}: {}",
+        filterId,
+        id.toString(),
+        e.what()));
+  }
+  std::memcpy(buffer, bytes.data(), bytes.size());
+
   std::lock_guard<std::mutex> l(mutex);
   pendingExternalFilters_.push_back(
-      {filterId, scanPlanNodeId, tupleDomain});
+      {filterId,
+       scanPlanNodeId,
+       buffer,
+       static_cast<int64_t>(bytes.size())});
   externalDynamicFiltersQueued_++;
 }
 
@@ -1191,10 +1319,26 @@ void PrestoTask::applyPendingExternalFilters() {
   }
 
   for (auto& pf : pending) {
-    if (task->state() != exec::TaskState::kRunning) {
-      return;
+    if (task->state() == exec::TaskState::kRunning) {
+      protocol::TupleDomain<std::string> td;
+      try {
+        td = dpp::deserializeTupleDomain(
+            static_cast<const char*>(pf.buffer),
+            static_cast<size_t>(pf.bufferSize));
+      } catch (const std::exception& e) {
+        LOG(WARNING) << "Failed to deserialize pending external filter '"
+                     << pf.filterId << "' on task " << id.toString() << ": "
+                     << e.what();
+        if (pf.buffer != nullptr) {
+          dppPool_->free(pf.buffer, pf.bufferSize);
+        }
+        continue;
+      }
+      applyFilter(pf.filterId, pf.scanPlanNodeId, td);
     }
-    applyFilter(pf.filterId, pf.scanPlanNodeId, pf.tupleDomain);
+    if (pf.buffer != nullptr) {
+      dppPool_->free(pf.buffer, pf.bufferSize);
+    }
   }
 }
 

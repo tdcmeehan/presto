@@ -20,11 +20,16 @@
 #include "presto_cpp/main/http/HttpServer.h"
 #include "presto_cpp/main/types/PrestoTaskId.h"
 #include "presto_cpp/presto_protocol/core/presto_protocol_core.h"
+#include "velox/common/memory/Memory.h"
 #include "velox/exec/Task.h"
 
 namespace facebook::velox {
 struct RuntimeMetric;
 }
+
+namespace facebook::presto::dpp {
+class DppFilterCache;
+} // namespace facebook::presto::dpp
 
 namespace facebook::presto {
 
@@ -165,6 +170,8 @@ struct PrestoTask {
       const std::string& nodeId,
       long startProcessCpuTime = 0);
 
+  ~PrestoTask();
+
   /// Returns current task state, including 'planning'.
   /// If Velox task is null, it returns 'aborted'.
   PrestoTaskState taskState() const;
@@ -273,10 +280,13 @@ struct PrestoTask {
   }
 
  private:
-  // Dynamic filter storage.
+  // Pool-backed serialized filter entry. The buffer holds the JSON-encoded
+  // TupleDomain bytes allocated from `dppPool_`; the arbitrator's
+  // `dppFilterCache` root pool sees these bytes 1:1.
   struct VersionedFilter {
-    protocol::TupleDomain<std::string> domain;
-    int64_t version;
+    void* buffer{nullptr};
+    int64_t bufferSize{0};
+    int64_t version{0};
   };
   folly::Synchronized<std::map<std::string, VersionedFilter>> dynamicFilters_;
   std::atomic<int64_t> dynamicFilterVersion_{0};
@@ -288,6 +298,14 @@ struct PrestoTask {
 
   // Count of external dynamic filters queued before Velox task creation.
   std::atomic<int64_t> externalDynamicFiltersQueued_{0};
+
+  // Count of dynamic filter pushes rejected because the dppFilterCache pool
+  // was at cap. Surfaced as runtime stat `dppFilterCachePushRejected`.
+  std::atomic<int64_t> dppFilterCachePushRejected_{0};
+
+  // Count of build-side filters dropped because the pool was at cap.
+  // Surfaced as runtime stat `dppFilterCacheStoreRejected`.
+  std::atomic<int64_t> dppFilterCacheStoreRejected_{0};
 
   // Time (ms) spent in applyPendingExternalFilters (total across all calls).
   std::atomic<int64_t> externalDynamicFilterApplyTimeMs_{0};
@@ -302,12 +320,34 @@ struct PrestoTask {
 
   // Pending external dynamic filters that arrived before the Velox Task was
   // created. Applied when the task starts. Protected by PrestoTask::mutex.
+  // The serialized JSON bytes are owned by `dppPool_`; `applyPendingExternalFilters`
+  // deserializes and frees on drain.
   struct PendingExternalFilter {
     std::string filterId;
     std::string scanPlanNodeId;
-    protocol::TupleDomain<std::string> tupleDomain;
+    void* buffer{nullptr};
+    int64_t bufferSize{0};
   };
   std::vector<PendingExternalFilter> pendingExternalFilters_;
+
+  // Per-task leaf-child of the process-wide `dppFilterCache` root pool.
+  // All `dynamicFilters_` and `pendingExternalFilters_` buffer bytes are
+  // allocated from here so the memory arbitrator sees them. Initialized in
+  // the constructor; outlives the Velox `task` to allow late removals.
+  dpp::DppFilterCache* dppFilterCache_{nullptr};
+  std::shared_ptr<velox::memory::MemoryPool> dppPool_;
+
+  // Internal helpers, all assume the appropriate lock is held by caller
+  // unless documented otherwise.
+  void evictDynamicFilterEntryLocked(
+      std::map<std::string, VersionedFilter>& filters,
+      std::map<std::string, VersionedFilter>::iterator it);
+
+  // Eviction callback invoked from `DppFilterCacheReclaimer` on the
+  // arbitrator thread. Drops the named filter from `dynamicFilters_`,
+  // freeing its pool buffer. Returns true if the filter was found and
+  // evicted.
+  bool evictFilterFromCache(const std::string& filterId);
 
   // Long-poll support for dynamic filters.
   std::mutex dfMutex_;

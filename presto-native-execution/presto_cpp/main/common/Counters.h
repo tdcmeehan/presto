@@ -74,6 +74,20 @@ constexpr std::string_view kCounterNumQueryContexts{
 constexpr std::string_view kCounterMemoryManagerTotalBytes{
     "presto_cpp.memory_manager_total_bytes"};
 
+/// Bytes currently reserved by the dppFilterCache root pool (sum across
+/// all PrestoTasks).
+constexpr std::string_view kCounterDppFilterCacheCurrentBytes{
+    "presto_cpp.memory_dpp_filter_cache_current_bytes"};
+
+/// Configured maximum capacity of the dppFilterCache pool.
+constexpr std::string_view kCounterDppFilterCacheMaxBytes{
+    "presto_cpp.memory_dpp_filter_cache_max_bytes"};
+
+/// Cumulative count of dynamic filter pushes rejected with HTTP 503 because
+/// dppFilterCache was at cap and reclaim could not free enough space.
+constexpr std::string_view kCounterDppFilterCachePushRejected{
+    "presto_cpp.memory_dpp_filter_cache_push_rejected"};
+
 constexpr std::string_view kCounterNumTasks{"presto_cpp.num_tasks"};
 constexpr std::string_view kCounterNumTasksBytesProcessed{
     "presto_cpp.num_tasks_bytes_processed"};

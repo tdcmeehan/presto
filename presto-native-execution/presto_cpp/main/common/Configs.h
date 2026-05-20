@@ -664,6 +664,20 @@ class SystemConfig : public ConfigBase {
   static constexpr std::string_view kQueryMaxMemoryPerNode{
       "query.max-memory-per-node"};
 
+  /// Maximum process-wide capacity of the DPP filter cache root memory pool,
+  /// in bytes. All build-side and pushed dynamic filter contents stored on
+  /// PrestoTask charge against this pool. When the pool is at capacity, the
+  /// custom reclaimer evicts the oldest filters; if reclaim cannot free
+  /// enough space, incoming pushes are rejected with HTTP 503.
+  static constexpr std::string_view kDppFilterCacheMaxBytes{
+      "dpp.filter-cache.max-bytes"};
+
+  /// Maximum body size of a POST /v1/task/{id}/dynamicFilter/{filterId}
+  /// request, in bytes. Requests exceeding this are rejected with HTTP 413
+  /// before the body is materialized or parsed.
+  static constexpr std::string_view kDppFilterPushMaxBodyBytes{
+      "dpp.filter-push.max-body-bytes"};
+
   /// This system property is added for not crashing the cluster when memory
   /// leak is detected. The check should be disabled in production cluster.
   static constexpr std::string_view kEnableMemoryLeakCheck{
@@ -1154,6 +1168,10 @@ class SystemConfig : public ConfigBase {
   uint64_t httpMaxAllocateBytes() const;
 
   uint64_t queryMaxMemoryPerNode() const;
+
+  uint64_t dppFilterCacheMaxBytes() const;
+
+  uint64_t dppFilterPushMaxBodyBytes() const;
 
   bool enableMemoryLeakCheck() const;
 

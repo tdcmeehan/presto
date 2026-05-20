@@ -114,8 +114,11 @@ import static com.facebook.presto.SystemSessionProperties.isVerboseRuntimeStatsE
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_FAILURE_COUNT;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_HTTP_STATUS;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_LATENCY_MS;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_RETRIED_COUNT;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_RETRY_GAVE_UP_COUNT;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_SUCCESS_COUNT;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_TASK_NOT_FOUND_COUNT;
+import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PUSH_TO_WORKER_THROTTLED_COUNT;
 import static com.facebook.presto.common.RuntimeUnit.NONE;
 import static com.facebook.presto.execution.TaskInfo.createInitialTask;
 import static com.facebook.presto.execution.TaskState.ABORTED;
@@ -1506,6 +1509,9 @@ public final class HttpRemoteTaskWithEventLoop
         }
     }
 
+    private static final int MAX_DYNAMIC_FILTER_PUSH_ATTEMPTS = 3;
+    private static final long MAX_DYNAMIC_FILTER_PUSH_RETRY_DELAY_MS = 5_000;
+
     @Override
     public void pushDynamicFilter(PlanNodeId scanNodeId, String filterId, TupleDomain<String> constraint)
     {
@@ -1517,6 +1523,11 @@ public final class HttpRemoteTaskWithEventLoop
                 .appendPath(filterId)
                 .build();
 
+        sendDynamicFilterPush(uri, body, filterId, 1);
+    }
+
+    private void sendDynamicFilterPush(URI uri, byte[] body, String filterId, int attempt)
+    {
         Request request = preparePost()
                 .setUri(uri)
                 .setHeader("Content-Type", "application/json")
@@ -1542,6 +1553,25 @@ public final class HttpRemoteTaskWithEventLoop
                     runtimeStats.addMetricValue(DYNAMIC_FILTER_PUSH_TO_WORKER_TASK_NOT_FOUND_COUNT, NONE, 1);
                     log.warn("Dynamic filter push: task %s not found on worker (filter %s, latency %dms)", taskId, filterId, latencyMs);
                 }
+                else if (statusCode == 503) {
+                    runtimeStats.addMetricValue(DYNAMIC_FILTER_PUSH_TO_WORKER_THROTTLED_COUNT, NONE, 1);
+                    if (attempt >= MAX_DYNAMIC_FILTER_PUSH_ATTEMPTS) {
+                        runtimeStats.addMetricValue(DYNAMIC_FILTER_PUSH_TO_WORKER_RETRY_GAVE_UP_COUNT, NONE, 1);
+                        log.warn(
+                                "Dynamic filter push to task %s rejected with HTTP 503 (filter %s, attempt %d, latency %dms); giving up",
+                                taskId, filterId, attempt, latencyMs);
+                        return;
+                    }
+                    long retryDelayMs = Math.min(parseRetryAfterMs(result), MAX_DYNAMIC_FILTER_PUSH_RETRY_DELAY_MS);
+                    runtimeStats.addMetricValue(DYNAMIC_FILTER_PUSH_TO_WORKER_RETRIED_COUNT, NONE, 1);
+                    log.debug(
+                            "Dynamic filter push to task %s throttled by worker (filter %s, attempt %d); retrying after %dms",
+                            taskId, filterId, attempt, retryDelayMs);
+                    taskEventLoop.schedule(
+                            () -> sendDynamicFilterPush(uri, body, filterId, attempt + 1),
+                            retryDelayMs,
+                            TimeUnit.MILLISECONDS);
+                }
                 else {
                     runtimeStats.addMetricValue(DYNAMIC_FILTER_PUSH_TO_WORKER_FAILURE_COUNT, NONE, 1);
                     log.warn("Dynamic filter push to task %s returned HTTP %d (filter %s, latency %dms)", taskId, statusCode, filterId, latencyMs);
@@ -1557,6 +1587,20 @@ public final class HttpRemoteTaskWithEventLoop
                 log.warn("Failed to push dynamic filter %s to task %s (latency %dms): %s", filterId, taskId, latencyMs, throwable.getMessage());
             }
         }, taskEventLoop);
+    }
+
+    private static long parseRetryAfterMs(StatusResponse response)
+    {
+        String header = response.getHeader("Retry-After");
+        if (header == null) {
+            return 1_000;
+        }
+        try {
+            return Math.max(0, Long.parseLong(header.trim()) * 1_000);
+        }
+        catch (NumberFormatException e) {
+            return 1_000;
+        }
     }
 
     private void safeExecuteOnEventLoop(Runnable r, String methodName)

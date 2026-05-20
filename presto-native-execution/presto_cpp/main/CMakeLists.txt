@@ -17,6 +17,7 @@ add_subdirectory(thrift)
 add_subdirectory(connectors)
 add_subdirectory(functions)
 add_subdirectory(tool)
+add_subdirectory(dpp)
 
 add_library(presto_session_properties SessionProperties.cpp)
 
@@ -45,6 +46,7 @@ add_library(
 
 add_dependencies(
   presto_server_lib
+  presto_dpp
   presto_operators
   presto_protocol
   presto_types
@@ -60,6 +62,7 @@ target_link_libraries(
   $<TARGET_OBJECTS:presto_types>
   $<TARGET_OBJECTS:presto_protocol>
   presto_common
+  presto_dpp
   presto_exception
   presto_expression_optimizer
   presto_function_metadata

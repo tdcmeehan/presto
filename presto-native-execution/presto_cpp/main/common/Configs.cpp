@@ -238,6 +238,8 @@ SystemConfig::SystemConfig() {
           BOOL_PROP(kHttpEnableEndpointLatencyFilter, false),
           NUM_PROP(kHttpMaxAllocateBytes, 65536),
           STR_PROP(kQueryMaxMemoryPerNode, "4GB"),
+          STR_PROP(kDppFilterCacheMaxBytes, "2GB"),
+          STR_PROP(kDppFilterPushMaxBodyBytes, "16MB"),
           BOOL_PROP(kEnableMemoryLeakCheck, true),
           NONE_PROP(kRemoteFunctionServerThriftPort),
           BOOL_PROP(kSkipRuntimeStatsInRunningTaskInfo, true),
@@ -928,6 +930,18 @@ uint64_t SystemConfig::httpMaxAllocateBytes() const {
 uint64_t SystemConfig::queryMaxMemoryPerNode() const {
   return velox::config::toCapacity(
       optionalProperty(kQueryMaxMemoryPerNode).value(),
+      velox::config::CapacityUnit::BYTE);
+}
+
+uint64_t SystemConfig::dppFilterCacheMaxBytes() const {
+  return velox::config::toCapacity(
+      optionalProperty(kDppFilterCacheMaxBytes).value(),
+      velox::config::CapacityUnit::BYTE);
+}
+
+uint64_t SystemConfig::dppFilterPushMaxBodyBytes() const {
+  return velox::config::toCapacity(
+      optionalProperty(kDppFilterPushMaxBodyBytes).value(),
       velox::config::CapacityUnit::BYTE);
 }
 

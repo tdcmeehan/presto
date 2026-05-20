@@ -446,6 +446,42 @@ avoid exceeding memory limits for the query.
 
   Enables reading data in ``TEXTFILE`` format.
 
+Dynamic Filter Pushdown Properties
+----------------------------------
+
+These properties bound the memory used by the distributed dynamic filter
+pushdown (DPP) feature on Presto C++ workers. All build-side filter
+storage and coordinator-pushed filters charge against a process-wide
+memory pool named ``dppFilterCache``, which the Velox memory arbitrator
+tracks. When the pool reaches its configured cap, the worker first
+evicts the oldest filters; if reclamation cannot free enough space,
+incoming filter pushes are rejected with HTTP 503 so the coordinator can
+retry. This prevents unbounded growth of DPP state from driving the
+worker process into a kernel out-of-memory kill.
+
+``dpp.filter-cache.max-bytes``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``data size``
+* **Default value:** ``2GB``
+
+  Maximum capacity of the ``dppFilterCache`` root memory pool, summed
+  across all PrestoTasks on this worker. When the pool reaches this
+  capacity, the custom reclaimer evicts the oldest filters; if it
+  cannot free enough bytes, additional pushes are throttled and the
+  HTTP handler returns 503.
+
+``dpp.filter-push.max-body-bytes``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``data size``
+* **Default value:** ``16MB``
+
+  Maximum body size of a single ``POST /v1/task/{taskId}/dynamicFilter/{filterId}``
+  request. Requests larger than this are rejected with HTTP 413 before
+  the body is materialized or parsed, preventing transient memory
+  spikes caused by malformed or oversized filter pushes.
+
 Cache Properties
 ----------------
 

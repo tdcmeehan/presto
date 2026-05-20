@@ -16,6 +16,7 @@
 #include <presto_cpp/main/common/Exception.h>
 #include "presto_cpp/main/common/Configs.h"
 #include "presto_cpp/main/common/Utils.h"
+#include "presto_cpp/main/dpp/DppFilterCache.h"
 #include "presto_cpp/main/thrift/ProtocolToThrift.h"
 #include "presto_cpp/main/thrift/ThriftIO.h"
 #include "presto_cpp/main/thrift/gen-cpp2/PrestoThrift.h"
@@ -699,6 +700,26 @@ proxygen::RequestHandler* TaskResource::addExternalDynamicFilter(
           const std::vector<std::unique_ptr<folly::IOBuf>>& body,
           proxygen::ResponseHandler* downstream,
           std::shared_ptr<http::CallbackRequestHandlerState> handlerState) {
+        size_t bodyBytes = 0;
+        for (const auto& buf : body) {
+          if (buf != nullptr) {
+            bodyBytes += buf->computeChainDataLength();
+          }
+        }
+        const auto maxBodyBytes =
+            SystemConfig::instance()->dppFilterPushMaxBodyBytes();
+        if (bodyBytes > maxBodyBytes) {
+          if (!handlerState->requestExpired()) {
+            http::sendErrorResponse(
+                downstream,
+                fmt::format(
+                    "Dynamic filter push body of {} bytes exceeds dpp.filter-push.max-body-bytes={}",
+                    bodyBytes,
+                    maxBodyBytes),
+                http::kHttpPayloadTooLarge);
+          }
+          return;
+        }
         folly::via(
             httpSrvCpuExecutor_,
             [this,
@@ -727,6 +748,18 @@ proxygen::RequestHandler* TaskResource::addExternalDynamicFilter(
                 }
               }
             })
+            .thenError(
+                folly::tag_t<dpp::DppFilterCacheFull>{},
+                [downstream, handlerState](auto&& e) {
+                  if (handlerState->requestExpired()) {
+                    return;
+                  }
+                  proxygen::ResponseBuilder(downstream)
+                      .status(http::kHttpServiceUnavailable, "")
+                      .header("Retry-After", "1")
+                      .body(std::string{e.what()})
+                      .sendWithEOM();
+                })
             .thenError(
                 folly::tag_t<std::exception>{},
                 [downstream, handlerState](auto&& e) {

@@ -26,7 +26,9 @@ constexpr uint16_t kHttpBadRequest = 400;
 constexpr uint16_t kHttpUnauthorized = 401;
 constexpr uint16_t kHttpNotFound = 404;
 constexpr uint16_t kHttpUnprocessableContent = 422;
+constexpr uint16_t kHttpPayloadTooLarge = 413;
 constexpr uint16_t kHttpInternalServerError = 500;
+constexpr uint16_t kHttpServiceUnavailable = 503;
 
 constexpr char kMimeTypeApplicationJson[] = "application/json";
 constexpr char kMimeTypeApplicationThrift[] = "application/x-thrift+binary";
