@@ -554,11 +554,11 @@ filter
     ;
 
 mergeCase
-    : WHEN MATCHED THEN
+    : WHEN MATCHED (AND condition=expression)? THEN
         UPDATE SET targetColumns+=identifier EQ values+=expression
           (',' targetColumns+=identifier EQ values+=expression)*            #mergeUpdate
-    | WHEN MATCHED THEN DELETE                                              #mergeDelete
-    | WHEN NOT MATCHED THEN
+    | WHEN MATCHED (AND condition=expression)? THEN DELETE                  #mergeDelete
+    | WHEN NOT MATCHED (AND condition=expression)? THEN
         INSERT ('(' columns+=identifier (',' columns+=identifier)* ')')?
         VALUES '(' values+=expression (',' values+=expression)* ')'         #mergeInsert
     ;

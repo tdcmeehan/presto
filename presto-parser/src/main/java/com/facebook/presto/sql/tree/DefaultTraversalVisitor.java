@@ -498,6 +498,7 @@ public abstract class DefaultTraversalVisitor<R, C>
     @Override
     protected R visitMergeInsert(MergeInsert node, C context)
     {
+        node.getCondition().ifPresent(condition -> process(condition, context));
         node.getColumns().forEach(column -> process(column, context));
         node.getValues().forEach(expression -> process(expression, context));
         return null;
@@ -506,6 +507,7 @@ public abstract class DefaultTraversalVisitor<R, C>
     @Override
     protected R visitMergeUpdate(MergeUpdate node, C context)
     {
+        node.getCondition().ifPresent(condition -> process(condition, context));
         node.getAssignments().forEach(assignment -> {
             process(assignment.getTarget(), context);
             process(assignment.getValue(), context);
@@ -516,6 +518,7 @@ public abstract class DefaultTraversalVisitor<R, C>
     @Override
     protected R visitMergeDelete(MergeDelete node, C context)
     {
+        node.getCondition().ifPresent(condition -> process(condition, context));
         return null;
     }
 

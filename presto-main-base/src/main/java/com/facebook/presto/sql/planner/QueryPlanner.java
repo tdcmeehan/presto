@@ -555,6 +555,13 @@ public class QueryPlanner
             Expression mergeCondition = mergeCase instanceof MergeInsert ?
                     new IsNullPredicate(targetUniqueIdColumnSymbolReference) : new IsNotNullPredicate(targetUniqueIdColumnSymbolReference);
 
+            if (mergeCase.getCondition().isPresent()) {
+                Expression caseCondition = mergeCase.getCondition().get();
+                joinSubPlan = subqueryPlanner.handleSubqueries(joinSubPlan, caseCondition, mergeStmt, sqlPlannerContext);
+                Expression rewrittenCondition = coerceIfNecessary(analysis, caseCondition, joinSubPlan.rewrite(caseCondition));
+                mergeCondition = LogicalBinaryExpression.and(mergeCondition, rewrittenCondition);
+            }
+
             whenClauses.add(new WhenClause(mergeCondition, new Row(joinResultBuilder.build())));
         }
 

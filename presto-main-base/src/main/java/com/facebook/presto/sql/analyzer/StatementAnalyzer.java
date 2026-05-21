@@ -3545,6 +3545,21 @@ class StatementAnalyzer
 
             for (int caseCounter = 0; caseCounter < merge.getMergeCases().size(); caseCounter++) {
                 MergeCase mergeCase = merge.getMergeCases().get(caseCounter);
+
+                if (mergeCase.getCondition().isPresent()) {
+                    Expression caseCondition = mergeCase.getCondition().get();
+                    ExpressionAnalysis caseConditionAnalysis = analyzeExpression(caseCondition, joinScope);
+                    Type caseConditionType = caseConditionAnalysis.getType(caseCondition);
+                    if (!caseConditionType.equals(BOOLEAN)) {
+                        if (!caseConditionType.equals(UNKNOWN)) {
+                            throw new SemanticException(TYPE_MISMATCH, caseCondition, "The MERGE WHEN condition must evaluate to a boolean: actual type %s", caseConditionType);
+                        }
+                        analysis.addCoercion(caseCondition, BOOLEAN, false);
+                    }
+                    verifyNoAggregateWindowOrGroupingFunctions(analysis.getFunctionHandles(), functionAndTypeResolver, caseCondition, "MERGE WHEN clause");
+                    analysis.recordSubqueries(merge, caseConditionAnalysis);
+                }
+
                 List<String> setColumnNames = lowercaseIdentifierList(mergeCase.getSetColumns());
                 if (mergeCase instanceof MergeUpdate) {
                     allUpdateColumnNames.addAll(setColumnNames);

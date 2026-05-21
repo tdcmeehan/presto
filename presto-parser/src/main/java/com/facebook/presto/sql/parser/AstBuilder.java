@@ -532,6 +532,7 @@ class AstBuilder
     {
         return new MergeInsert(
                 getLocation(context),
+                visitIfPresent(context.condition, Expression.class),
                 visitIdentifiers(context.columns),
                 visit(context.values, Expression.class));
     }
@@ -553,13 +554,13 @@ class AstBuilder
                     (Expression) visit(context.values.get(i))));
         }
 
-        return new MergeUpdate(getLocation(context), assignments.build());
+        return new MergeUpdate(getLocation(context), visitIfPresent(context.condition, Expression.class), assignments.build());
     }
 
     @Override
     public Node visitMergeDelete(SqlBaseParser.MergeDeleteContext context)
     {
-        return new MergeDelete(getLocation(context));
+        return new MergeDelete(getLocation(context), visitIfPresent(context.condition, Expression.class));
     }
 
     @Override

@@ -4016,6 +4016,106 @@ public abstract class IcebergDistributedTestBase
     }
 
     @Test
+    public void testMergeWhenClausePredicates()
+    {
+        String targetTable = "merge_when_predicates_" + randomTableSuffix();
+        try {
+            assertUpdate(format("CREATE TABLE %s (id INT, count INT)", targetTable));
+            assertUpdate(format("INSERT INTO %s VALUES (1, 5), (2, 10), (3, 7)", targetTable), 3);
+
+            @Language("SQL") String mergeSql =
+                    format("MERGE INTO %s t USING ", targetTable) +
+                            "(VALUES (1, -3), (2, -10), (3, 0), (4, 8), (5, 0)) AS s(id, count_delta) " +
+                            "ON t.id = s.id " +
+                            "WHEN MATCHED AND t.count + s.count_delta > 0 THEN UPDATE SET count = t.count + s.count_delta " +
+                            "WHEN MATCHED AND t.count + s.count_delta = 0 THEN DELETE " +
+                            "WHEN NOT MATCHED AND s.count_delta <> 0 THEN INSERT (id, count) VALUES (s.id, s.count_delta)";
+
+            assertUpdate(mergeSql, 4);
+
+            assertQuery("SELECT * FROM " + targetTable, "VALUES (1, 2), (3, 7), (4, 8)");
+        }
+        finally {
+            assertUpdate("DROP TABLE " + targetTable);
+        }
+    }
+
+    @Test
+    public void testMergeWhenClauseOrderSensitivity()
+    {
+        String targetTable = "merge_when_order_" + randomTableSuffix();
+        try {
+            assertUpdate(format("CREATE TABLE %s (id INT, status VARCHAR)", targetTable));
+            assertUpdate(format("INSERT INTO %s VALUES (1, 'new'), (2, 'new')", targetTable), 2);
+
+            @Language("SQL") String mergeSql =
+                    format("MERGE INTO %s t USING ", targetTable) +
+                            "(VALUES (1, 100), (2, 5)) AS s(id, amount) " +
+                            "ON t.id = s.id " +
+                            "WHEN MATCHED AND s.amount > 50 THEN UPDATE SET status = 'big' " +
+                            "WHEN MATCHED AND s.amount <= 50 THEN UPDATE SET status = 'small'";
+
+            assertUpdate(mergeSql, 2);
+
+            assertQuery("SELECT * FROM " + targetTable, "VALUES (1, 'big'), (2, 'small')");
+        }
+        finally {
+            assertUpdate("DROP TABLE " + targetTable);
+        }
+    }
+
+    @Test
+    public void testMergeWhenClauseAllPredicatesFailIsNoOp()
+    {
+        String targetTable = "merge_when_noop_" + randomTableSuffix();
+        try {
+            assertUpdate(format("CREATE TABLE %s (id INT, value INT)", targetTable));
+            assertUpdate(format("INSERT INTO %s VALUES (1, 10), (2, 20)", targetTable), 2);
+
+            @Language("SQL") String mergeSql =
+                    format("MERGE INTO %s t USING ", targetTable) +
+                            "(VALUES (1, 100), (3, 0)) AS s(id, delta) " +
+                            "ON t.id = s.id " +
+                            "WHEN MATCHED AND s.delta < 0 THEN UPDATE SET value = t.value + s.delta " +
+                            "WHEN NOT MATCHED AND s.delta <> 0 THEN INSERT (id, value) VALUES (s.id, s.delta)";
+
+            assertUpdate(mergeSql, 0);
+
+            assertQuery("SELECT * FROM " + targetTable, "VALUES (1, 10), (2, 20)");
+        }
+        finally {
+            assertUpdate("DROP TABLE " + targetTable);
+        }
+    }
+
+    @Test
+    public void testMergeWhenClauseAnalyzerErrors()
+    {
+        String targetTable = "merge_when_errors_" + randomTableSuffix();
+        try {
+            assertUpdate(format("CREATE TABLE %s (id INT, value INT)", targetTable));
+
+            assertQueryFails(
+                    format("MERGE INTO %s t USING (VALUES (1, 10)) AS s(id, delta) ON t.id = s.id " +
+                            "WHEN MATCHED AND s.delta + 1 THEN UPDATE SET value = s.delta", targetTable),
+                    ".*The MERGE WHEN condition must evaluate to a boolean.*");
+
+            assertQueryFails(
+                    format("MERGE INTO %s t USING (VALUES (1, 10)) AS s(id, delta) ON t.id = s.id " +
+                            "WHEN MATCHED AND s.nonexistent > 0 THEN UPDATE SET value = s.delta", targetTable),
+                    ".*'s\\.nonexistent' cannot be resolved.*");
+
+            assertQueryFails(
+                    format("MERGE INTO %s t USING (VALUES (1, 10)) AS s(id, delta) ON t.id = s.id " +
+                            "WHEN MATCHED AND count(s.delta) > 0 THEN UPDATE SET value = s.delta", targetTable),
+                    ".*MERGE WHEN clause cannot contain aggregations.*");
+        }
+        finally {
+            assertUpdate("DROP TABLE " + targetTable);
+        }
+    }
+
+    @Test
     public void testMergeCasts()
     {
         String targetTable = "merge_cast_target_" + randomTableSuffix();

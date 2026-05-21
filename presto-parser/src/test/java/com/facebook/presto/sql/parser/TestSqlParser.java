@@ -1878,6 +1878,111 @@ public class TestSqlParser
     }
 
     @Test
+    public void testMergeWithConditions()
+    {
+        NodeLocation location = new NodeLocation(1, 1);
+
+        assertStatement("" +
+                        "MERGE INTO product_sales AS s\n" +
+                        "  USING monthly_sales AS ms\n" +
+                        "  ON s.product_id = ms.product_id\n" +
+                        "WHEN MATCHED AND s.sales + ms.sales > 0 THEN\n" +
+                        "  UPDATE SET\n" +
+                        "      sales = sales + ms.sales",
+                new Merge(
+                        location,
+                        new AliasedRelation(location, table(QualifiedName.of("product_sales")), new Identifier("s"), null),
+                        aliased(table(QualifiedName.of("monthly_sales")), "ms"),
+                        equal(nameReference("s", "product_id"), nameReference("ms", "product_id")),
+                        ImmutableList.of(
+                                new MergeUpdate(
+                                        location,
+                                        Optional.of(new ComparisonExpression(
+                                                ComparisonExpression.Operator.GREATER_THAN,
+                                                new ArithmeticBinaryExpression(
+                                                        ArithmeticBinaryExpression.Operator.ADD,
+                                                        nameReference("s", "sales"),
+                                                        nameReference("ms", "sales")),
+                                                new LongLiteral("0"))),
+                                        ImmutableList.of(
+                                                new MergeUpdate.Assignment(new Identifier("sales"), new ArithmeticBinaryExpression(
+                                                        ArithmeticBinaryExpression.Operator.ADD, nameReference("sales"), nameReference("ms", "sales"))))))));
+
+        assertStatement("" +
+                        "MERGE INTO product_sales AS s\n" +
+                        "  USING monthly_sales AS ms\n" +
+                        "  ON s.product_id = ms.product_id\n" +
+                        "WHEN MATCHED AND s.sales + ms.sales = 0 THEN\n" +
+                        "  DELETE",
+                new Merge(
+                        location,
+                        new AliasedRelation(location, table(QualifiedName.of("product_sales")), new Identifier("s"), null),
+                        aliased(table(QualifiedName.of("monthly_sales")), "ms"),
+                        equal(nameReference("s", "product_id"), nameReference("ms", "product_id")),
+                        ImmutableList.of(
+                                new MergeDelete(
+                                        location,
+                                        Optional.of(new ComparisonExpression(
+                                                ComparisonExpression.Operator.EQUAL,
+                                                new ArithmeticBinaryExpression(
+                                                        ArithmeticBinaryExpression.Operator.ADD,
+                                                        nameReference("s", "sales"),
+                                                        nameReference("ms", "sales")),
+                                                new LongLiteral("0")))))));
+
+        assertStatement("" +
+                        "MERGE INTO product_sales AS s\n" +
+                        "  USING monthly_sales AS ms\n" +
+                        "  ON s.product_id = ms.product_id\n" +
+                        "WHEN NOT MATCHED AND ms.sales <> 0 THEN\n" +
+                        "  INSERT (product_id, sales)\n" +
+                        "  VALUES (ms.product_id, ms.sales)",
+                new Merge(
+                        location,
+                        new AliasedRelation(location, table(QualifiedName.of("product_sales")), new Identifier("s"), null),
+                        aliased(table(QualifiedName.of("monthly_sales")), "ms"),
+                        equal(nameReference("s", "product_id"), nameReference("ms", "product_id")),
+                        ImmutableList.of(
+                                new MergeInsert(
+                                        location,
+                                        Optional.of(new ComparisonExpression(
+                                                ComparisonExpression.Operator.NOT_EQUAL,
+                                                nameReference("ms", "sales"),
+                                                new LongLiteral("0"))),
+                                        ImmutableList.of(new Identifier("product_id"), new Identifier("sales")),
+                                        ImmutableList.of(nameReference("ms", "product_id"), nameReference("ms", "sales"))))));
+
+        assertStatement("" +
+                        "MERGE INTO product_sales AS s\n" +
+                        "  USING monthly_sales AS ms\n" +
+                        "  ON s.product_id = ms.product_id\n" +
+                        "WHEN MATCHED AND s.sales + ms.sales > 0 THEN\n" +
+                        "  UPDATE SET\n" +
+                        "      sales = sales + ms.sales\n" +
+                        "WHEN MATCHED THEN\n" +
+                        "  DELETE",
+                new Merge(
+                        location,
+                        new AliasedRelation(location, table(QualifiedName.of("product_sales")), new Identifier("s"), null),
+                        aliased(table(QualifiedName.of("monthly_sales")), "ms"),
+                        equal(nameReference("s", "product_id"), nameReference("ms", "product_id")),
+                        ImmutableList.of(
+                                new MergeUpdate(
+                                        location,
+                                        Optional.of(new ComparisonExpression(
+                                                ComparisonExpression.Operator.GREATER_THAN,
+                                                new ArithmeticBinaryExpression(
+                                                        ArithmeticBinaryExpression.Operator.ADD,
+                                                        nameReference("s", "sales"),
+                                                        nameReference("ms", "sales")),
+                                                new LongLiteral("0"))),
+                                        ImmutableList.of(
+                                                new MergeUpdate.Assignment(new Identifier("sales"), new ArithmeticBinaryExpression(
+                                                        ArithmeticBinaryExpression.Operator.ADD, nameReference("sales"), nameReference("ms", "sales"))))),
+                                new MergeDelete(location))));
+    }
+
+    @Test
     public void testRenameTable()
     {
         assertStatement("ALTER TABLE a RENAME TO b", new RenameTable(QualifiedName.of("a"), QualifiedName.of("b"), false));
