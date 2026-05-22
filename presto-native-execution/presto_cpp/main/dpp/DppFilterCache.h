@@ -57,6 +57,13 @@ class DppFilterCache {
   /// if `initialize()` was never called (only meant for test paths).
   static DppFilterCache* getInstance();
 
+  /// Test-only: drops the singleton instance, releasing its rootPool_
+  /// reference against the current MemoryManager. Callers that follow this
+  /// with MemoryManager::testingSetInstance avoid the pool-outliving-
+  /// manager leak that otherwise trips Memory.cpp's destructor invariant
+  /// check across consecutive tests.
+  static void testingReset();
+
   velox::memory::MemoryPool* rootPool() const {
     return rootPool_.get();
   }

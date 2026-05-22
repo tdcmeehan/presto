@@ -13,6 +13,7 @@
  */
 #include "presto_cpp/main/PrestoTask.h"
 #include <gtest/gtest.h>
+#include "presto_cpp/main/dpp/DppFilterCache.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/Split.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -61,6 +62,15 @@ void addSplitToTask(PrestoTask& prestoTask, long sequenceId) {
 class PrestoTaskTest : public testing::Test {
   void SetUp() override {
     FLAGS_velox_memory_leak_check_enabled = true;
+    // Drop any DppFilterCache singleton left over from a previous test
+    // before replacing the MemoryManager — its rootPool_ would otherwise
+    // outlive the manager and trip ~MemoryManager's invariant check.
+    dpp::DppFilterCache::testingReset();
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+  }
+
+  void TearDown() override {
+    dpp::DppFilterCache::testingReset();
   }
 };
 
@@ -113,7 +123,6 @@ TEST_F(PrestoTaskTest, basic) {
 }
 
 TEST_F(PrestoTaskTest, updateStatus) {
-  memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   const std::string taskId{"20201107_130540_00011_wrpkw.1.2.3.4"};
   PrestoTask prestoTask{taskId, "node1", 0};
   long sequenceId{0};
@@ -183,7 +192,6 @@ TEST_F(PrestoTaskTest, updateStatus) {
 // DynamicFilterFetcher would long-poll until distributed_dynamic_filter_
 // max_wait_time elapses (5 minutes by default).
 TEST_F(PrestoTaskTest, dynamicFilterOperatorCompletedOnTerminalState) {
-  memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   const std::string taskId{"20201107_130540_00011_wrpkw.1.2.3.4"};
   PrestoTask prestoTask{taskId, "node1", 0};
   prestoTask.task = createExecTask(taskId, prestoTask);
@@ -220,7 +228,6 @@ TEST_F(PrestoTaskTest, dynamicFilterOperatorCompletedOnTerminalState) {
 TEST_F(
     PrestoTaskTest,
     dynamicFilterOperatorCompletedOnTerminalStateNoRegistered) {
-  memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   const std::string taskId{"20201107_130540_00011_wrpkw.1.2.3.4"};
   PrestoTask prestoTask{taskId, "node1", 0};
   prestoTask.task = createExecTask(taskId, prestoTask);
@@ -240,7 +247,6 @@ TEST_F(
 // still running. operatorCompleted should be true without relying on the
 // terminal-state fallback.
 TEST_F(PrestoTaskTest, dynamicFilterOperatorCompletedHappyPath) {
-  memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   const std::string taskId{"20201107_130540_00011_wrpkw.1.2.3.4"};
   PrestoTask prestoTask{taskId, "node1", 0};
   prestoTask.task = createExecTask(taskId, prestoTask);

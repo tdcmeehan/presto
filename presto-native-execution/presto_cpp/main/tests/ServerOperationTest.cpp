@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include "presto_cpp/main/PrestoServerOperations.h"
 #include "presto_cpp/main/common/tests/MutableConfigs.h"
+#include "presto_cpp/main/dpp/DppFilterCache.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/common/memory/Memory.h"
@@ -36,6 +37,10 @@ class ServerOperationTest : public exec::test::OperatorTestBase {
   }
 
   void TearDown() override {
+    // Drop the DppFilterCache singleton before OperatorTestBase::TearDown
+    // resets the MemoryManager, otherwise the singleton's rootPool_ would
+    // outlive its manager.
+    dpp::DppFilterCache::testingReset();
     exec::test::OperatorTestBase::TearDown();
   }
 };

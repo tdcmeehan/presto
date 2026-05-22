@@ -64,6 +64,13 @@ DppFilterCache* DppFilterCache::getInstance() {
   return state.instance.get();
 }
 
+void DppFilterCache::testingReset() {
+  auto& state = singletonState();
+  std::lock_guard<std::mutex> guard(state.mutex);
+  state.instance.reset();
+  state.maxBytes = 0;
+}
+
 DppFilterCache::DppFilterCache(int64_t maxBytes) {
   rootPool_ =
       velox::memory::MemoryManager::getInstance()->addRootPool(

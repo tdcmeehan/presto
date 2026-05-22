@@ -21,6 +21,7 @@
 #include "presto_cpp/main/common/Exception.h"
 #include "presto_cpp/main/common/tests/MutableConfigs.h"
 #include "presto_cpp/main/connectors/HivePrestoToVeloxConnector.h"
+#include "presto_cpp/main/dpp/DppFilterCache.h"
 #include "presto_cpp/main/connectors/PrestoToVeloxConnector.h"
 #include "presto_cpp/main/tests/HttpServerWrapper.h"
 #include "velox/common/base/Fs.h"
@@ -286,6 +287,11 @@ class TaskManagerTest : public exec::test::OperatorTestBase,
     dwrf::unregisterDwrfWriterFactory();
     dwrf::unregisterDwrfReaderFactory();
     taskManager_.reset();
+    // Drop the DppFilterCache singleton before OperatorTestBase::TearDown
+    // resets the MemoryManager, otherwise the singleton's rootPool_ would
+    // outlive its manager and trip SharedArbitrator's
+    // "alive participants on destruction" check.
+    dpp::DppFilterCache::testingReset();
     OperatorTestBase::TearDown();
   }
 
