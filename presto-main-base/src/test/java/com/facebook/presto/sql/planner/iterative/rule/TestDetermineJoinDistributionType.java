@@ -48,6 +48,7 @@ import java.util.Optional;
 
 import static com.facebook.presto.SystemSessionProperties.CONFIDENCE_BASED_BROADCAST_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.DISTRIBUTED_DYNAMIC_FILTER_CARDINALITY_RATIO_THRESHOLD;
+import static com.facebook.presto.SystemSessionProperties.DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS;
 import static com.facebook.presto.SystemSessionProperties.DISTRIBUTED_DYNAMIC_FILTER_STRATEGY;
 import static com.facebook.presto.SystemSessionProperties.JOIN_DISTRIBUTION_TYPE;
 import static com.facebook.presto.SystemSessionProperties.JOIN_MAX_BROADCAST_TABLE_SIZE;
@@ -2027,6 +2028,7 @@ public class TestDetermineJoinDistributionType
     {
         JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
                 .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
                 .on(p ->
                         p.join(
                                 INNER,
@@ -2045,6 +2047,7 @@ public class TestDetermineJoinDistributionType
     {
         JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
                 .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
                 .on(p ->
                         p.join(
                                 INNER,
@@ -2145,6 +2148,7 @@ public class TestDetermineJoinDistributionType
         int bRows = 100;
         JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
                 .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "COST_BASED")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
                 .overrideStats("valuesA", PlanNodeStatsEstimate.builder()
                         .setOutputRowCount(aRows)
                         .addVariableStatistics(ImmutableMap.of(new VariableReferenceExpression(Optional.empty(), "A1", BIGINT), VariableStatsEstimate.unknown()))
@@ -2170,6 +2174,7 @@ public class TestDetermineJoinDistributionType
     {
         JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
                 .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "COST_BASED")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
                 .overrideStats("valuesA", PlanNodeStatsEstimate.unknown())
                 .overrideStats("valuesB", PlanNodeStatsEstimate.unknown())
                 .on(p ->
@@ -2220,6 +2225,7 @@ public class TestDetermineJoinDistributionType
         RuntimeStats runtimeStats = new RuntimeStats();
         Session session = Session.builder(tester.getSession())
                 .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "COST_BASED")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
                 .setSystemProperty(VERBOSE_RUNTIME_STATS_ENABLED, "true")
                 .setRuntimeStats(runtimeStats)
                 .build();
@@ -2321,6 +2327,7 @@ public class TestDetermineJoinDistributionType
         int bRows = 100;
         JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
                 .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "COST_BASED")
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
                 .overrideStats("valuesA", PlanNodeStatsEstimate.builder()
                         .setOutputRowCount(aRows)
                         .addVariableStatistics(ImmutableMap.of(new VariableReferenceExpression(Optional.empty(), "A1", BIGINT), VariableStatsEstimate.unknown()))
@@ -2341,6 +2348,66 @@ public class TestDetermineJoinDistributionType
                                 Optional.empty()))
                 .get();
         assertEquals(result.getDynamicFilters().size(), 2);
+    }
+
+    @Test
+    public void testDynamicFilterSkipsReplicatedJoinByDefault()
+    {
+        JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, JoinDistributionType.BROADCAST.name())
+                .on(p ->
+                        p.join(
+                                INNER,
+                                p.values(new PlanNodeId("valuesA"), 10_000, p.variable("A1", BIGINT)),
+                                p.values(new PlanNodeId("valuesB"), 100, p.variable("B1", BIGINT)),
+                                ImmutableList.of(new EquiJoinClause(p.variable("A1", BIGINT), p.variable("B1", BIGINT))),
+                                ImmutableList.of(p.variable("A1", BIGINT), p.variable("B1", BIGINT)),
+                                Optional.empty()))
+                .get();
+        assertEquals(result.getDistributionType(), Optional.of(REPLICATED));
+        assertTrue(result.getDynamicFilters().isEmpty());
+    }
+
+    @Test
+    public void testDynamicFilterCreatesOnReplicatedJoinWhenEnabled()
+    {
+        JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, JoinDistributionType.BROADCAST.name())
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
+                .on(p ->
+                        p.join(
+                                INNER,
+                                p.values(new PlanNodeId("valuesA"), 10_000, p.variable("A1", BIGINT)),
+                                p.values(new PlanNodeId("valuesB"), 100, p.variable("B1", BIGINT)),
+                                ImmutableList.of(new EquiJoinClause(p.variable("A1", BIGINT), p.variable("B1", BIGINT))),
+                                ImmutableList.of(p.variable("A1", BIGINT), p.variable("B1", BIGINT)),
+                                Optional.empty()))
+                .get();
+        assertEquals(result.getDistributionType(), Optional.of(REPLICATED));
+        assertEquals(result.getDynamicFilters().size(), 1);
+        assertTrue(result.getDynamicFilters().values().iterator().next().getName().equals("B1"));
+    }
+
+    @Test
+    public void testDynamicFilterCreatesOnPartitionedJoinByDefault()
+    {
+        JoinNode result = (JoinNode) assertDetermineJoinDistributionType()
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_STRATEGY, "ALWAYS")
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, JoinDistributionType.PARTITIONED.name())
+                .on(p ->
+                        p.join(
+                                INNER,
+                                p.values(new PlanNodeId("valuesA"), 10_000, p.variable("A1", BIGINT)),
+                                p.values(new PlanNodeId("valuesB"), 100, p.variable("B1", BIGINT)),
+                                ImmutableList.of(new EquiJoinClause(p.variable("A1", BIGINT), p.variable("B1", BIGINT))),
+                                ImmutableList.of(p.variable("A1", BIGINT), p.variable("B1", BIGINT)),
+                                Optional.empty()))
+                .get();
+        assertEquals(result.getDistributionType(), Optional.of(PARTITIONED));
+        assertEquals(result.getDynamicFilters().size(), 1);
+        assertTrue(result.getDynamicFilters().values().iterator().next().getName().equals("B1"));
     }
 
     private RuleAssert assertDetermineJoinDistributionType()

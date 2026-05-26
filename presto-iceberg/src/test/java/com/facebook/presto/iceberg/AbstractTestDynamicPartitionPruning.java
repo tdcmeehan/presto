@@ -75,6 +75,7 @@ public abstract class AbstractTestDynamicPartitionPruning
     private static final String DISTRIBUTED_DYNAMIC_FILTER_STRATEGY = "distributed_dynamic_filter_strategy";
     private static final String DISTRIBUTED_DYNAMIC_FILTER_MAX_WAIT_TIME = "distributed_dynamic_filter_max_wait_time";
     private static final String DISTRIBUTED_DYNAMIC_FILTER_MAX_SIZE = "distributed_dynamic_filter_max_size";
+    private static final String DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS = "distributed_dynamic_filter_on_replicated_joins";
 
     private static final String DYNAMIC_FILTER_COORDINATOR_FALLBACK_TO_RANGE_TEMPLATE = DYNAMIC_FILTER_COORDINATOR_FALLBACK_TO_RANGE + "[%s]";
 
@@ -2341,6 +2342,18 @@ public abstract class AbstractTestDynamicPartitionPruning
     /**
      * DPP disabled — baseline for result comparison.
      */
+    // This suite predates the REPLICATED-join placement reform and exercises the DPP runtime
+    // pipeline (collection, push, split pruning) on broadcast dimension joins. Distributed
+    // filters are no longer created for REPLICATED joins by default, so enable them here to keep
+    // covering that pipeline; PARTITIONED tests are unaffected since the property only gates REPL.
+    @Override
+    protected Session getSession()
+    {
+        return Session.builder(super.getSession())
+                .setSystemProperty(DISTRIBUTED_DYNAMIC_FILTER_ON_REPLICATED_JOINS, "true")
+                .build();
+    }
+
     private Session dppDisabledSession()
     {
         return Session.builder(getSession())

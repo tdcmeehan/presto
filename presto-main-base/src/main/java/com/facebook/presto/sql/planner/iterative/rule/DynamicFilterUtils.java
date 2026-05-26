@@ -24,14 +24,17 @@ import com.facebook.presto.spi.relation.VariableReferenceExpression;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 
 import static com.facebook.presto.SystemSessionProperties.getDistributedDynamicFilterCardinalityRatioThreshold;
 import static com.facebook.presto.SystemSessionProperties.getDistributedDynamicFilterStrategy;
 import static com.facebook.presto.SystemSessionProperties.isDistributedDynamicFilterEnabled;
+import static com.facebook.presto.SystemSessionProperties.isDistributedDynamicFilterOnReplicatedJoins;
 import static com.facebook.presto.SystemSessionProperties.isVerboseRuntimeStatsEnabled;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PLAN_CREATED_FAVORABLE_RATIO;
 import static com.facebook.presto.common.RuntimeMetricName.DYNAMIC_FILTER_PLAN_SKIPPED_HIGH_CARDINALITY;
 import static com.facebook.presto.common.RuntimeUnit.NONE;
+import static com.facebook.presto.spi.plan.JoinDistributionType.REPLICATED;
 import static com.facebook.presto.spi.plan.JoinType.INNER;
 import static com.facebook.presto.spi.plan.JoinType.RIGHT;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.DistributedDynamicFilterStrategy.COST_BASED;
@@ -46,8 +49,9 @@ public final class DynamicFilterUtils
     /**
      * If distributed DPP is enabled, adds a dynamic filter entry per equi-join
      * clause to the given JoinNode. Returns the original node unchanged when
-     * DPP is disabled, the join type is unsupported, or cost-based filtering
-     * rejects all clauses.
+     * DPP is disabled, the join type is unsupported, the join is REPLICATED and
+     * {@code distributed_dynamic_filter_on_replicated_joins} is false, or
+     * cost-based filtering rejects all clauses.
      */
     public static JoinNode addApplicableDynamicFilters(Session session, JoinNode node, StatsProvider statsProvider, PlanNodeIdAllocator idAllocator)
     {
@@ -59,6 +63,12 @@ public final class DynamicFilterUtils
         }
         verify(node.getDynamicFilters().isEmpty(), "JoinNode already has dynamic filters");
         if (node.getCriteria().isEmpty()) {
+            return node;
+        }
+        // Velox's in-fragment HashProbe -> TableScan pushdown already filters REPLICATED (broadcast)
+        // joins with a full-precision hash set and no coordinator round-trip, so distributed DPP is
+        // redundant there. PARTITIONED (cross-fragment) joins are the only case Velox cannot reach.
+        if (!isDistributedDynamicFilterOnReplicatedJoins(session) && node.getDistributionType().equals(Optional.of(REPLICATED))) {
             return node;
         }
 

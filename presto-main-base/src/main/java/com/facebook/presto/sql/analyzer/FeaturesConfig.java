@@ -185,6 +185,7 @@ public class FeaturesConfig
     private DataSize distributedDynamicFilterMaxSize = new DataSize(1, MEGABYTE);
 
     private double distributedDynamicFilterCardinalityRatioThreshold = 0.1;
+    private boolean distributedDynamicFilterOnReplicatedJoins;
 
     private boolean fragmentResultCachingEnabled;
 
@@ -1681,6 +1682,19 @@ public class FeaturesConfig
     public FeaturesConfig setDistributedDynamicFilterCardinalityRatioThreshold(double distributedDynamicFilterCardinalityRatioThreshold)
     {
         this.distributedDynamicFilterCardinalityRatioThreshold = distributedDynamicFilterCardinalityRatioThreshold;
+        return this;
+    }
+
+    public boolean isDistributedDynamicFilterOnReplicatedJoins()
+    {
+        return distributedDynamicFilterOnReplicatedJoins;
+    }
+
+    @Config("distributed-dynamic-filter.on-replicated-joins")
+    @ConfigDescription("Add distributed dynamic filters to REPLICATED (broadcast) joins. Disabled by default because Velox's in-fragment pushdown already covers them")
+    public FeaturesConfig setDistributedDynamicFilterOnReplicatedJoins(boolean distributedDynamicFilterOnReplicatedJoins)
+    {
+        this.distributedDynamicFilterOnReplicatedJoins = distributedDynamicFilterOnReplicatedJoins;
         return this;
     }
 

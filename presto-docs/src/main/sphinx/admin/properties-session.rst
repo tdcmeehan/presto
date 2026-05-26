@@ -631,6 +631,27 @@ filter).
 The corresponding configuration property is
 :ref:`admin/properties:\`\`distributed-dynamic-filter.max-wait-extensions\`\``.
 
+``distributed_dynamic_filter_on_replicated_joins``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* **Type:** ``boolean``
+* **Default value:** ``false``
+
+Whether to add distributed dynamic filters to REPLICATED (broadcast) joins.
+When ``false`` (the default), distributed dynamic filters are created only for
+PARTITIONED (cross-fragment) joins. REPLICATED joins are skipped because the
+build side is broadcast to every probe worker, where the in-fragment scan
+already applies a full-precision filter without a coordinator round-trip, so a
+distributed filter on the same join is redundant. Set to ``true`` to also
+create distributed dynamic filters on REPLICATED joins, which restores the
+behavior from before this property was introduced.
+
+To observe how many filters a query creates and on which joins, enable
+``iceberg.dynamic_filter_extended_metrics``.
+
+The corresponding configuration property is
+``distributed-dynamic-filter.on-replicated-joins``.
+
 
 JDBC Properties
 ---------------

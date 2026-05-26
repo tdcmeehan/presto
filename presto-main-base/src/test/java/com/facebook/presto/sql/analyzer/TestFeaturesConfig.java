@@ -132,6 +132,7 @@ public class TestFeaturesConfig
                 .setDistributedDynamicFilterMaxSize(new DataSize(1, MEGABYTE))
 
                 .setDistributedDynamicFilterCardinalityRatioThreshold(0.1)
+                .setDistributedDynamicFilterOnReplicatedJoins(false)
                 .setFragmentResultCachingEnabled(false)
                 .setEnableStatsCalculator(true)
                 .setEnableStatsCollectionForTemporaryTable(false)
@@ -322,6 +323,7 @@ public class TestFeaturesConfig
                 .put("distributed-dynamic-filter.max-size", "2MB")
 
                 .put("distributed-dynamic-filter.cardinality-ratio-threshold", "0.3")
+                .put("distributed-dynamic-filter.on-replicated-joins", "true")
                 .put("fragment-result-cache.enabled", "true")
                 .put("experimental.enable-stats-calculator", "false")
                 .put("experimental.enable-stats-collection-for-temporary-table", "true")
@@ -562,6 +564,7 @@ public class TestFeaturesConfig
                 .setDistributedDynamicFilterMaxSize(new DataSize(2, MEGABYTE))
 
                 .setDistributedDynamicFilterCardinalityRatioThreshold(0.3)
+                .setDistributedDynamicFilterOnReplicatedJoins(true)
                 .setFragmentResultCachingEnabled(true)
                 .setEnableStatsCalculator(false)
                 .setEnableStatsCollectionForTemporaryTable(true)
