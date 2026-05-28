@@ -166,6 +166,7 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
+import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
 import static com.facebook.presto.hive.BaseHiveColumnHandle.ColumnType.REGULAR;
 import static com.facebook.presto.hive.BaseHiveColumnHandle.ColumnType.SYNTHESIZED;
@@ -277,6 +278,8 @@ import static com.facebook.presto.spi.StandardErrorCode.COLUMN_NOT_FOUND;
 import static com.facebook.presto.spi.StandardErrorCode.INVALID_VIEW;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_FOUND;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
+import static com.facebook.presto.spi.connector.ConnectorTableVersion.VersionOperator.EQUAL;
+import static com.facebook.presto.spi.connector.ConnectorTableVersion.VersionType.VERSION;
 import static com.facebook.presto.spi.connector.RowChangeParadigm.DELETE_ROW_AND_INSERT_ROW;
 import static com.facebook.presto.spi.statistics.TableStatisticType.ROW_COUNT;
 import static com.facebook.presto.spi.transaction.IsolationLevel.SERIALIZABLE;
@@ -1773,7 +1776,7 @@ public abstract class IcebergAbstractMetadata
                 if (table.snapshot(snapshotId) == null) {
                     throw new PrestoException(ICEBERG_INVALID_SNAPSHOT_ID, "Iceberg snapshot ID does not exists: " + snapshotId);
                 }
-                if (tableVersion.getVersionOperator() == VersionOperator.EQUAL) { // AS OF Case
+                if (tableVersion.getVersionOperator() == EQUAL) { // AS OF Case
                     return snapshotId;
                 }
                 else { // BEFORE Case
@@ -2172,6 +2175,7 @@ public abstract class IcebergAbstractMetadata
         OptionalInt maxSnapshotsPerRefresh = resolveMaxSnapshotsPerRefresh(session, props);
 
         ImmutableMap.Builder<SchemaTableName, MaterializedViewStatus.MaterializedDataPredicates> predicatesByBase = ImmutableMap.builder();
+        Map<SchemaTableName, ConnectorTableHandle> recordedBaseTableHandles = new HashMap<>();
         for (SchemaTableName baseTable : definition.get().getBaseTables()) {
             Table baseIcebergTable = getIcebergTable(session, baseTable);
             long currentSnapshotId = baseIcebergTable.currentSnapshot() != null
@@ -2233,13 +2237,15 @@ public abstract class IcebergAbstractMetadata
                     partitionConstraints.get(),
                     ImmutableList.of(),
                     incrementalRefreshPredicate));
+
+            recordedBaseTableHandles.put(baseTable, getTableHandle(session, baseTable).withSnapshotId(recordedSnapshotId));
         }
 
         Map<SchemaTableName, MaterializedViewStatus.MaterializedDataPredicates> staleBases = predicatesByBase.build();
         if (staleBases.isEmpty()) {
             return new MaterializedViewStatus(FULLY_MATERIALIZED, ImmutableMap.of(), lastFreshTime);
         }
-        return new MaterializedViewStatus(PARTIALLY_MATERIALIZED, staleBases, lastFreshTime);
+        return new MaterializedViewStatus(PARTIALLY_MATERIALIZED, staleBases, recordedBaseTableHandles, lastFreshTime);
     }
 
     private Optional<List<TupleDomain<String>>> detectChangedPartitions(
@@ -2441,6 +2447,13 @@ public abstract class IcebergAbstractMetadata
                 .collect(toImmutableSet());
 
         return !fromSpecIds.equals(toSpecIds);
+    }
+
+    @Override
+    public Optional<ConnectorTableVersion> getTableVersion(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
+        return handle.getIcebergTableName().getSnapshotId().map(snapshotId -> new ConnectorTableVersion(VERSION, EQUAL, BIGINT, snapshotId));
     }
 
     @Override

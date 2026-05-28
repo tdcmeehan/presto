@@ -177,6 +177,11 @@ public interface Metadata
     Map<String, ColumnHandle> getColumnHandles(Session session, TableHandle tableHandle);
 
     /**
+     * Returns the version embedded in the given table handle, if the connector tracks table versions.
+     */
+    Optional<ConnectorTableVersion> getTableVersion(Session session, TableHandle tableHandle);
+
+    /**
      * Gets the metadata for the specified table column.
      *
      * @throws RuntimeException if table or column handles are no longer valid

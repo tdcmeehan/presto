@@ -87,6 +87,7 @@ public class MaterializedViewStatus
 
     private final MaterializedViewState materializedViewState;
     private final Map<SchemaTableName, MaterializedDataPredicates> partitionsFromBaseTables;
+    private final Map<SchemaTableName, ConnectorTableHandle> recordedBaseTableHandles;
     private final Optional<Long> lastFreshTime;
 
     public MaterializedViewStatus(MaterializedViewState materializedViewState)
@@ -104,8 +105,18 @@ public class MaterializedViewStatus
             Map<SchemaTableName, MaterializedDataPredicates> partitionsFromBaseTables,
             Optional<Long> lastFreshTime)
     {
+        this(materializedViewState, partitionsFromBaseTables, emptyMap(), lastFreshTime);
+    }
+
+    public MaterializedViewStatus(
+            MaterializedViewState materializedViewState,
+            Map<SchemaTableName, MaterializedDataPredicates> partitionsFromBaseTables,
+            Map<SchemaTableName, ConnectorTableHandle> recordedBaseTableHandles,
+            Optional<Long> lastFreshTime)
+    {
         this.materializedViewState = requireNonNull(materializedViewState, "materializedViewState is null");
         this.partitionsFromBaseTables = requireNonNull(partitionsFromBaseTables, "partitionsFromBaseTables is null");
+        this.recordedBaseTableHandles = requireNonNull(recordedBaseTableHandles, "recordedBaseTableHandles is null");
         this.lastFreshTime = requireNonNull(lastFreshTime, "lastFreshTime is null");
     }
 
@@ -137,6 +148,11 @@ public class MaterializedViewStatus
     public Map<SchemaTableName, MaterializedDataPredicates> getPartitionsFromBaseTables()
     {
         return partitionsFromBaseTables;
+    }
+
+    public Map<SchemaTableName, ConnectorTableHandle> getRecordedBaseTableHandles()
+    {
+        return recordedBaseTableHandles;
     }
 
     public Optional<Long> getLastFreshTime()

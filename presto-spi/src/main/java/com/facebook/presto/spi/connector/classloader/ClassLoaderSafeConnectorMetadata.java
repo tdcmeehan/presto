@@ -308,6 +308,14 @@ public class ClassLoaderSafeConnectorMetadata
     }
 
     @Override
+    public Optional<ConnectorTableVersion> getTableVersion(ConnectorSession session, ConnectorTableHandle table)
+    {
+        try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {
+            return delegate.getTableVersion(session, table);
+        }
+    }
+
+    @Override
     public ColumnMetadata getColumnMetadata(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle columnHandle)
     {
         try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {

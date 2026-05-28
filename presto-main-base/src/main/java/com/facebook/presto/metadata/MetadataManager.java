@@ -616,6 +616,14 @@ public class MetadataManager
     }
 
     @Override
+    public Optional<ConnectorTableVersion> getTableVersion(Session session, TableHandle tableHandle)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        ConnectorMetadata metadata = getMetadata(session, connectorId);
+        return metadata.getTableVersion(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle());
+    }
+
+    @Override
     public ColumnMetadata getColumnMetadata(Session session, TableHandle tableHandle, ColumnHandle columnHandle)
     {
         requireNonNull(tableHandle, "tableHandle is null");

@@ -15,6 +15,17 @@ package com.facebook.presto.iceberg;
 
 import com.facebook.airlift.http.server.testing.TestingHttpServer;
 import com.facebook.presto.Session;
+import com.facebook.presto.common.QualifiedObjectName;
+import com.facebook.presto.common.predicate.TupleDomain;
+import com.facebook.presto.common.transaction.TransactionId;
+import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.ConnectorTableHandle;
+import com.facebook.presto.spi.MaterializedViewStatus;
+import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.TableHandle;
+import com.facebook.presto.spi.analyzer.MetadataResolver;
+import com.facebook.presto.spi.connector.ConnectorTableVersion;
+import com.facebook.presto.spi.security.AllowAllAccessControl;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
 import com.google.common.collect.ImmutableMap;
@@ -34,6 +45,7 @@ import java.io.File;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Function;
 
 import static com.facebook.presto.iceberg.CatalogType.REST;
 import static com.facebook.presto.iceberg.IcebergAbstractMetadata.CURRENT_MATERIALIZED_VIEW_FORMAT_VERSION;
@@ -166,6 +178,78 @@ public class TestIcebergMaterializedViewMetadata
 
         assertUpdate("DROP MATERIALIZED VIEW test_snapshot_mv");
         assertUpdate("DROP TABLE test_snapshot_base");
+    }
+
+    @Test
+    public void testGetTableVersionReflectsCurrentSnapshot()
+    {
+        assertUpdate("CREATE TABLE current_version_base (id BIGINT)");
+        assertUpdate("INSERT INTO current_version_base VALUES 1, 2, 3", 3);
+        try {
+            inTransaction(session -> {
+                Metadata metadata = getQueryRunner().getMetadata();
+                TableHandle handle = metadata.getMetadataResolver(session)
+                        .getTableHandle(qualifiedName("current_version_base"))
+                        .orElseThrow(() -> new AssertionError("base table handle missing"));
+                Optional<ConnectorTableVersion> version = metadata.getTableVersion(session, handle);
+                assertTrue(version.isPresent(), "a live Iceberg table handle should carry its current snapshot version");
+                assertEquals(version.get().getVersionType(), ConnectorTableVersion.VersionType.VERSION);
+                return null;
+            });
+        }
+        finally {
+            assertUpdate("DROP TABLE current_version_base");
+        }
+    }
+
+    @Test
+    public void testRecordedBaseTableHandlesRoundTripThroughGetTableVersion()
+    {
+        assertUpdate("CREATE TABLE recorded_handle_base (id BIGINT, ds VARCHAR) WITH (partitioning = ARRAY['ds'])");
+        assertUpdate("INSERT INTO recorded_handle_base VALUES (1, '2024-01-01')", 1);
+        assertUpdate("CREATE MATERIALIZED VIEW recorded_handle_mv WITH (partitioning = ARRAY['ds']) AS SELECT id, ds FROM recorded_handle_base");
+        assertUpdate("REFRESH MATERIALIZED VIEW recorded_handle_mv", 1);
+        assertUpdate("INSERT INTO recorded_handle_base VALUES (2, '2024-01-02')", 1);
+
+        try {
+            inTransaction(session -> {
+                Metadata metadata = getQueryRunner().getMetadata();
+                MetadataResolver resolver = metadata.getMetadataResolver(session);
+                SchemaTableName baseTable = new SchemaTableName("test_schema", "recorded_handle_base");
+
+                MaterializedViewStatus status = resolver.getMaterializedViewStatus(qualifiedName("recorded_handle_mv"), TupleDomain.all());
+                assertFalse(status.isFullyMaterialized());
+
+                ConnectorTableHandle recordedHandle = status.getRecordedBaseTableHandles().get(baseTable);
+                assertNotNull(recordedHandle, "recordedBaseTableHandles should carry the stale base table");
+                TableHandle currentHandle = resolver.getTableHandle(qualifiedName("recorded_handle_base"))
+                        .orElseThrow(() -> new AssertionError("base table handle missing"));
+                Optional<ConnectorTableVersion> recordedVersion = metadata.getTableVersion(session, currentHandle.cloneWithConnectorHandle(recordedHandle));
+                assertTrue(recordedVersion.isPresent(), "recorded version should round-trip through getTableVersion");
+                return null;
+            });
+        }
+        finally {
+            assertUpdate("DROP MATERIALIZED VIEW recorded_handle_mv");
+            assertUpdate("DROP TABLE recorded_handle_base");
+        }
+    }
+
+    private QualifiedObjectName qualifiedName(String tableName)
+    {
+        return new QualifiedObjectName(getSession().getCatalog().get(), "test_schema", tableName);
+    }
+
+    private <T> T inTransaction(Function<Session, T> callback)
+    {
+        TransactionId transactionId = getQueryRunner().getTransactionManager().beginTransaction(false);
+        Session session = getSession().beginTransactionId(transactionId, getQueryRunner().getTransactionManager(), new AllowAllAccessControl());
+        try {
+            return callback.apply(session);
+        }
+        finally {
+            getQueryRunner().getTransactionManager().asyncAbort(transactionId);
+        }
     }
 
     @Test

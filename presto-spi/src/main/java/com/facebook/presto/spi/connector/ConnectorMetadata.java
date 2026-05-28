@@ -820,6 +820,14 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Returns the version the given table handle is pinned to, or empty if the connector does not track table versions.
+     */
+    default Optional<ConnectorTableVersion> getTableVersion(ConnectorSession session, ConnectorTableHandle table)
+    {
+        return Optional.empty();
+    }
+
+    /**
      * Begin refresh materialized view
      */
     default ConnectorInsertTableHandle beginRefreshMaterializedView(ConnectorSession session, ConnectorTableHandle tableHandle)

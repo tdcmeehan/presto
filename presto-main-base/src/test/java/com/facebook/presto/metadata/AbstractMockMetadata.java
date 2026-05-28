@@ -248,6 +248,12 @@ public abstract class AbstractMockMetadata
     }
 
     @Override
+    public Optional<ConnectorTableVersion> getTableVersion(Session session, TableHandle tableHandle)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public ColumnMetadata getColumnMetadata(Session session, TableHandle tableHandle, ColumnHandle columnHandle)
     {
         throw new UnsupportedOperationException();

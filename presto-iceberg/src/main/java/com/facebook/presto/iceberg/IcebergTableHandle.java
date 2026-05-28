@@ -147,6 +147,27 @@ public class IcebergTableHandle
                 materializedViewName);
     }
 
+    public IcebergTableHandle withSnapshotId(long snapshotId)
+    {
+        return new IcebergTableHandle(
+                getSchemaName(),
+                new IcebergTableName(
+                        icebergTableName.getTableName(),
+                        icebergTableName.getTableType(),
+                        Optional.of(snapshotId),
+                        icebergTableName.getBranchName(),
+                        icebergTableName.getChangelogEndSnapshot()),
+                true,
+                outputPath,
+                storageProperties,
+                tableSchemaJson,
+                partitionFieldIds,
+                equalityFieldIds,
+                sortOrder,
+                updatedColumns,
+                materializedViewName);
+    }
+
     @Override
     public boolean equals(Object o)
     {
