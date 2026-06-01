@@ -22,6 +22,7 @@ import com.facebook.presto.common.predicate.Domain;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.predicate.ValueSet;
 import com.facebook.presto.common.type.TimeZoneKey;
+import com.facebook.presto.cost.StatsAndCosts;
 import com.facebook.presto.cost.StatsProvider;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.metadata.Metadata;
@@ -120,6 +121,7 @@ import static com.facebook.presto.sql.planner.plan.ExchangeNode.Scope.LOCAL;
 import static com.facebook.presto.sql.planner.plan.ExchangeNode.Scope.REMOTE_STREAMING;
 import static com.facebook.presto.sql.planner.plan.ExchangeNode.Type.GATHER;
 import static com.facebook.presto.sql.planner.plan.ExchangeNode.Type.REPARTITION;
+import static com.facebook.presto.sql.planner.planPrinter.PlanPrinter.textLogicalPlan;
 import static com.facebook.presto.tests.sql.TestTable.randomTableSuffix;
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -130,6 +132,7 @@ import static java.lang.String.format;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
@@ -2730,9 +2733,9 @@ public class TestIcebergLogicalPlanner
                     "Plan with WHEN NOT MATCHED predicate should mention marker " + notMatchedMarker + " but was:\n" + planWithConditions);
 
             String planWithoutConditions = planText(withoutConditions, sessionWithoutSubfieldPushdown);
-            assertTrue(!planWithoutConditions.contains(matchedMarker),
+            assertFalse(planWithoutConditions.contains(matchedMarker),
                     "Plan without WHEN predicates should not mention marker " + matchedMarker + " but was:\n" + planWithoutConditions);
-            assertTrue(!planWithoutConditions.contains(notMatchedMarker),
+            assertFalse(planWithoutConditions.contains(notMatchedMarker),
                     "Plan without WHEN predicates should not mention marker " + notMatchedMarker + " but was:\n" + planWithoutConditions);
         }
         finally {
@@ -2743,10 +2746,10 @@ public class TestIcebergLogicalPlanner
     private String planText(@Language("SQL") String sql, Session session)
     {
         Plan actualPlan = plan(sql, session);
-        return com.facebook.presto.sql.planner.planPrinter.PlanPrinter.textLogicalPlan(
+        return textLogicalPlan(
                 actualPlan.getRoot(),
                 actualPlan.getTypes(),
-                com.facebook.presto.cost.StatsAndCosts.empty(),
+                StatsAndCosts.empty(),
                 getQueryRunner().getMetadata().getFunctionAndTypeManager(),
                 session,
                 0);

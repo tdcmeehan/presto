@@ -4109,6 +4109,11 @@ public abstract class IcebergDistributedTestBase
                     format("MERGE INTO %s t USING (VALUES (1, 10)) AS s(id, delta) ON t.id = s.id " +
                             "WHEN MATCHED AND count(s.delta) > 0 THEN UPDATE SET value = s.delta", targetTable),
                     ".*MERGE WHEN clause cannot contain aggregations.*");
+
+            assertQueryFails(
+                    format("MERGE INTO %s t USING (VALUES (1, 10)) AS s(id, delta) ON t.id = s.id " +
+                            "WHEN MATCHED AND row_number() OVER (ORDER BY s.delta) > 0 THEN UPDATE SET value = s.delta", targetTable),
+                    ".*MERGE WHEN clause cannot contain aggregations, window functions or grouping operations.*");
         }
         finally {
             assertUpdate("DROP TABLE " + targetTable);
