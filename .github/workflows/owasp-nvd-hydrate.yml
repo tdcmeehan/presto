@@ -1,0 +1,74 @@
+name: OWASP NVD Database Hydration
+permissions:
+  contents: read
+# Builds/refreshes the OWASP dependency-check NVD database and publishes it to the
+# Actions cache. The PR-triggered owasp-dependency-check workflow then runs with
+# -DautoUpdate=false against this cache, so PR runs (including those from forks)
+# never contact the rate-limited NVD API. Isolating the NVD pull here means a
+# transient NVD outage retries/reruns on a schedule instead of failing PRs.
+on:
+  schedule:
+    # Twice daily keeps the cache inside the 7-day Actions cache retention window.
+    - cron: '0 */12 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    # Hard backstop so a persistent NVD outage can never burn a full 6h runner.
+    timeout-minutes: 180
+    env:
+      OWASP_VERSION: 12.1.3
+      OWASP_DATA_DIRECTORY: /tmp/.owasp/dependency-check-data
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      # Restore the previous database so the update is incremental, not a full pull.
+      - name: Restore previous NVD database
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/.owasp/dependency-check-data
+          restore-keys: |
+            owasp-nvd-db-${{ runner.os }}-v${{ env.OWASP_VERSION }}-
+          key: owasp-nvd-db-${{ runner.os }}-v${{ env.OWASP_VERSION }}-restore-only
+
+      # Retry the NVD update many times so a transient NVD outage (503/524, rate
+      # limiting) clears without anyone re-running the job by hand. The job-level
+      # timeout-minutes above is the hard backstop.
+      - name: Update NVD database
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        env:
+          # Optional: speeds up and stabilizes updates (50 vs 5 requests / 30s).
+          # Available here because scheduled runs execute in a trusted context.
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        with:
+          max_attempts: 30
+          timeout_minutes: 40
+          retry_wait_seconds: 120
+          retry_on: error
+          warning_on_retry: true
+          shell: bash
+          command: |
+            mvn -B org.owasp:dependency-check-maven:$OWASP_VERSION:update-only \
+              -DnvdValidForHours=0 \
+              ${NVD_API_KEY:+-DnvdApiKey=$NVD_API_KEY} \
+              -DdataDirectory=$OWASP_DATA_DIRECTORY
+
+      # Unique key per run; PR runs select the newest via the shared restore-keys
+      # prefix. Cache keys are immutable, so a rotating suffix is required.
+      - name: Save NVD database cache
+        if: always() && hashFiles('/tmp/.owasp/dependency-check-data/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/.owasp/dependency-check-data
+          key: owasp-nvd-db-${{ runner.os }}-v${{ env.OWASP_VERSION }}-${{ github.run_id }}

@@ -13,6 +13,13 @@ inputs:
     description: OWASP data directory path
     required: false
     default: /tmp/.owasp/dependency-check-data
+  auto-update:
+    description: >-
+      Whether dependency-check may update the NVD database from the NVD API.
+      PR scans set this to false and rely on a pre-hydrated, cached database
+      (see owasp-nvd-hydrate.yml) so they never hit the rate-limited NVD API.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -21,6 +28,7 @@ runs:
       env:
         OWASP_VERSION: ${{ inputs.owasp-version }}
         OWASP_DATA_DIRECTORY: ${{ inputs.data-directory }}
+        OWASP_AUTO_UPDATE: ${{ inputs.auto-update }}
       working-directory: ${{ inputs.working-directory }}
       shell: bash
       run: |
@@ -29,8 +37,8 @@ runs:
           -Dformat=JSON \
           -DprettyPrint=true \
           -DfailOnError=false \
+          -DautoUpdate=$OWASP_AUTO_UPDATE \
           -DossindexAnalyzerEnabled=true \
-          -DnvdApiAnalyzerEnabled=false \
           -DnodeAnalyzerEnabled=false \
           -DassemblyAnalyzerEnabled=false \
           -DcentralAnalyzerEnabled=false \
