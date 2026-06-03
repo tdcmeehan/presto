@@ -46,6 +46,7 @@ jobs:
       # limiting) clears without anyone re-running the job by hand. The job-level
       # timeout-minutes above is the hard backstop.
       - name: Update NVD database
+        id: nvd_update
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
         env:
           # Optional: speeds up and stabilizes updates (50 vs 5 requests / 30s).
@@ -66,8 +67,10 @@ jobs:
 
       # Unique key per run; PR runs select the newest via the shared restore-keys
       # prefix. Cache keys are immutable, so a rotating suffix is required.
+      # Guard on the update step's outcome rather than hashFiles(): hashFiles can
+      # only see files under GITHUB_WORKSPACE, and the data dir lives in /tmp.
       - name: Save NVD database cache
-        if: always() && hashFiles('/tmp/.owasp/dependency-check-data/**') != ''
+        if: steps.nvd_update.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: /tmp/.owasp/dependency-check-data
