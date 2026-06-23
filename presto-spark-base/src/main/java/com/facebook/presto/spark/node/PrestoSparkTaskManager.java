@@ -130,4 +130,10 @@ public class PrestoSparkTaskManager
     {
         throw new UnsupportedOperationException();
     }
+
+    @Override
+    public java.util.Map<String, com.facebook.presto.common.predicate.TupleDomain<String>> getDynamicFiltersSince(TaskId taskId, long sinceVersion)
+    {
+        return com.google.common.collect.ImmutableMap.of();
+    }
 }
